@@ -21,9 +21,12 @@ import { homedir } from "os";
 import { join } from "path";
 import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { stripJsonc, hermesHome } from "./utils.js";
 
 const HOME = homedir();
+const execFileAsync = promisify(execFile);
 
 // PLUGIN_VERSION: single-sourced from _meta.json (the skill registry metadata);
 // package.json only declares the module type and is not read here.
@@ -256,6 +259,129 @@ function getWorkledCandidates(clientPrefix) {
   candidatesExpiry = now + CANDIDATES_TTL_MS;
   if (!clientPrefix) return candidates;
   return candidates.filter((c) => c.client.startsWith(clientPrefix));
+}
+
+// Best-effort host-side Bluetooth diagnostic. Returns { available, powered,
+// devicePaired, deviceName, error }. On unsupported platforms or missing
+// adapters the fields degrade gracefully so the caller never throws.
+async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+  const result = {
+    available: false,
+    powered: false,
+    devicePaired: false,
+    deviceName: null,
+    error: null,
+  };
+
+  try {
+    if (process.platform === "win32") {
+      try {
+        const { stdout: adapterOut } = await execFileAsync(
+          "powershell",
+          [
+            "-Command",
+            "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status",
+          ],
+          { timeout: timeoutMs }
+        );
+        const statuses = adapterOut.trim().split(/\r?\n/).filter(Boolean);
+        result.available = statuses.length > 0;
+        result.powered = statuses.some((s) => s.toLowerCase() === "ok");
+
+        try {
+          const { stdout: hidOut } = await execFileAsync(
+            "powershell",
+            [
+              "-Command",
+              "Get-PnpDevice -Class 'HIDClass' -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'keyboard|hid|bluetooth' } | Select-Object -First 1 -ExpandProperty FriendlyName",
+            ],
+            { timeout: timeoutMs }
+          );
+          if (hidOut.trim()) {
+            result.devicePaired = true;
+            result.deviceName = hidOut.trim();
+          }
+        } catch {
+          // no HID keyboard found
+        }
+      } catch {
+        result.error = "Failed to query Bluetooth devices";
+      }
+    } else if (process.platform === "darwin") {
+      try {
+        const { stdout } = await execFileAsync("blueutil", ["--power"], { timeout: timeoutMs });
+        result.powered = stdout.trim() === "1";
+        result.available = true;
+
+        try {
+          const { stdout: pairedOut } = await execFileAsync("blueutil", ["--paired"], {
+            timeout: timeoutMs,
+          });
+          const lines = pairedOut.trim().split(/\r?\n/).filter(Boolean);
+          const hidLine = lines.find((l) => /keyboard|hid/i.test(l));
+          if (hidLine) {
+            result.devicePaired = true;
+            const m = hidLine.match(/address:\s*([^\s,]+)/i);
+            result.deviceName = m ? m[1] : hidLine.split(",")[0]?.trim() || null;
+          }
+        } catch {
+          // no paired devices
+        }
+      } catch {
+        try {
+          const { stdout } = await execFileAsync(
+            "system_profiler",
+            ["SPBluetoothDataType", "-json"],
+            { timeout: timeoutMs }
+          );
+          const data = JSON.parse(stdout);
+          result.available = true;
+          result.powered = true;
+
+          const devices =
+            data.SPBluetoothDataType?.[0]?.device_connected ||
+            data.SPBluetoothDataType?.[0]?.device_paired ||
+            [];
+          const hidDevice = devices.find((d) =>
+            /keyboard|hid/i.test(d.device_name || "") || /keyboard|hid/i.test(d.device_type || "")
+          );
+          if (hidDevice) {
+            result.devicePaired = true;
+            result.deviceName = hidDevice.device_name || null;
+          }
+        } catch {
+          result.error = "Bluetooth not available (install blueutil or enable system_profiler)";
+        }
+      }
+    } else if (process.platform === "linux") {
+      try {
+        const { stdout } = await execFileAsync("bluetoothctl", ["show"], { timeout: timeoutMs });
+        result.available = stdout.includes("Controller");
+        result.powered = stdout.includes("Powered: yes");
+
+        try {
+          const { stdout: devOut } = await execFileAsync("bluetoothctl", ["devices"], {
+            timeout: timeoutMs,
+          });
+          const lines = devOut.trim().split(/\r?\n/).filter(Boolean);
+          if (lines.length > 0) {
+            result.devicePaired = true;
+            result.deviceName = lines[0].split(/\s+/).slice(2).join(" ") || null;
+          }
+        } catch {
+          // no paired devices
+        }
+      } catch {
+        result.error = "bluetoothctl not available";
+      }
+    } else {
+      result.error = `Unsupported platform: ${process.platform}`;
+    }
+  } catch {
+    result.error = "Bluetooth probe failed";
+  }
+
+  return result;
 }
 
 // Helper: extract JSON object or array from response text
@@ -1093,6 +1219,15 @@ async function runStatusMode() {
     return;
   }
 
+  const bluetooth = await probeBluetooth().catch(() => ({
+    available: false,
+    powered: false,
+    devicePaired: false,
+    deviceName: null,
+    error: "Bluetooth probe failed",
+  }));
+  out.bluetooth = bluetooth;
+
   // Probe each unique URL once.
   const results = new Map();
   for (const e of entries) {
@@ -1118,15 +1253,24 @@ async function runStatusMode() {
   if (out.clients.some((c) => c.reachable)) {
     out.ok = true;
     out.exitCode = 0;
-    out.hint =
-      'workled server reachable. If the LED stays off, run set_brightness("128") or use the device switch.';
+    if (bluetooth && !bluetooth.devicePaired) {
+      const deviceName = bluetooth.deviceName || "the workled device";
+      out.hint = `Macro requires Bluetooth. Pair the device as a BLE HID keyboard (device name: ${deviceName}) and ensure it is connected.`;
+    } else {
+      out.hint =
+        'workled server reachable. If the LED stays off, run set_brightness("128") or use the device switch.';
+    }
   } else if (out.clients.some((c) => c.enabled === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
   } else if (out.clients.some((c) => !c.url)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
   } else {
-    out.hint =
-      "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
+    if (bluetooth && !bluetooth.available) {
+      out.hint = `Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name. Bluetooth is also unavailable: ${bluetooth.error || "no Bluetooth adapter detected"}.`;
+    } else {
+      out.hint =
+        "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
+    }
   }
 
   console.log(JSON.stringify(out, null, 2));

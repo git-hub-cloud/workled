@@ -23,13 +23,13 @@ A fresh device broadcasts its own hotspot. Connect your computer to that hotspot
 Open the device's web page in a browser (device status / provisioning):
 
 ```
-http://<device-name>.local:18791
+http://<device-name>.local
 ```
 
 - `<device-name>` is the name configured when connecting the device (e.g.
   `HomeAnt-1234`); it varies per device.
 - On the same LAN you can also use the device's IP address directly (e.g.
-  `http://192.168.31.146:18791`).
+  `http://192.168.31.146`).
 
 ## MCP endpoint
 
@@ -39,10 +39,8 @@ Once the device is on the same network, its MCP endpoint is:
 http://<device-name>.local:18791/mcp
 ```
 
-## opencode Configuration
-
-Add the server to your `opencode.json` (global `~/.config/opencode/opencode.json`
-or project-level `opencode.json`):
+Add the server to your agent config. For opencode, edit `opencode.json`
+(global `~/.config/opencode/opencode.json` or project-level `opencode.json`):
 
 ```jsonc
 {
@@ -55,6 +53,19 @@ or project-level `opencode.json`):
   }
 }
 ```
+
+Other clients follow the same pattern — see `## Installation & Uninstallation`
+for per-client config paths and keys.
+
+## Bluetooth pairing (required for macro)
+
+The device appears as a BLE HID keyboard. Pair it with your computer:
+
+- **Windows**: Settings → Bluetooth & devices → Add device → Bluetooth → select `<device-name>`.
+- **macOS**: System Settings → Bluetooth → select `<device-name>`.
+- **Linux**: `bluetoothctl` → `scan on` → `pair <device-name>` → `trust <device-name>` → `connect <device-name>`.
+
+After pairing, the device stays connected while in range. If it disconnects, re-pair or trigger reconnection.
 
 ## Installation & Uninstallation
 
@@ -135,7 +146,7 @@ node <skill-dir>/index.js status --client opencode
 
 After installing, run `node <skill-dir>/index.js status` and surface the JSON
 `hint` to the user. A `hint` of "No `workled` server configured" means the
-client's MCP is not set up — guide the user through the opencode Configuration
+client's MCP is not set up — guide the user through the MCP endpoint
 above.
 
 ## Verify
@@ -185,7 +196,7 @@ agy/gemini, openclaw, pi), takes the first server named `workled`
   Run `set_brightness("128")`, or use the device's manual on/off switch.
 - **No MCP config found at all** — neither `WORKLED_MCP_URL` nor any config
   source declares the server. Add it under `mcp` in your agent config (see
-  "opencode Configuration" above) or set the environment variable.
+  "MCP endpoint" above) or set the environment variable.
 
 ## Environment Variables
 
