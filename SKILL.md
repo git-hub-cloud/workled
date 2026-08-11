@@ -1,6 +1,6 @@
 ---
 name: workled
-description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, input, error). Describes workled MCP peripheral tools: set_agent_state, and touch pad macro sequence configuration. Use when connected to a workled device via MCP, controlling the state indicator, or configuring HID macros."
+description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, input, error). Use when connected to a workled device via MCP, controlling the agents state indicator, or configuring HID macros."
 ---
 
 # workled MCP Controller
