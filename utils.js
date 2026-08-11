@@ -3,6 +3,12 @@
 import { homedir } from "os";
 import { join } from "path";
 
+// Shared async delay, used by index.js (retry/discovery backoff) and
+// skill-install.mjs (openclaw config-stabilisation polling).
+export function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Resolve the hermes home directory (single source of truth, shared by
 // index.js and skill-install.mjs):
 //   $HERMES_HOME env wins; otherwise Windows uses %LOCALAPPDATA%\hermes,

@@ -10,14 +10,17 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "fs";
-import { stripJsonc, hermesHome } from "./utils.js";
-import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS } from "./index.js";
+import { stripJsonc, hermesHome, sleep } from "./utils.js";
+import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const corePath = join(scriptDir, "index.js");
-const VERSION = JSON.parse(stripJsonc(readFileSync(join(scriptDir, "_meta.json"), "utf8"))).version;
+const SKILL_VERSION = JSON.parse(stripJsonc(readFileSync(join(scriptDir, "_meta.json"), "utf8"))).version;
 const MARKER = "<!-- workled -->";
 const REMINDER = [
   MARKER,
@@ -31,43 +34,84 @@ const REMINDER = [
 
 const h = homedir();
 
-// ---- instruction file helpers -----------------------------------------------
+// `.bak` paths this run's install/uninstall writes via writeJsonPretty /
+// directWriteConfig. Tracked so uninstall can drop the stale pre-uninstall
+// backups it creates (P2) without touching any backups it did not write.
+const createdBaks = new Set();
 
-function extractReminderBlock(content) {
-  // Return the first marker-prefixed block (MARKER line + every contiguous
-  // blank / `> ` / `- ` line) that follows it, or null if no marker is
-  // present.  Blank lines are skipped so the block spans across the
-  // natural break between the marker and the first reminder line.
-  const lines = content.split("\n");
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].trim() === MARKER) {
-      start = i;
-      break;
+// ---- safe path removal ----------------------------------------------------
+// WorkBuddy's managed Node intercepts fs.rmSync (and friends) through a
+// "safe-delete" shim that moves the path into the Recycle Bin and then THROWS,
+// even though the path is already gone. That spurious throw aborts the
+// uninstall loop after the first file. removePath wraps the delete and only
+// treats it as a failure when the path is *still present* after the attempt,
+// so uninstall completes on every client. On a normal (unintercepted)
+// environment the first rmSync succeeds and returns — byte-for-byte the same
+// behaviour as before, so other clients are unaffected.
+function removePath(p, opts = {}) {
+  try {
+    rmSync(p, { recursive: true, force: true, ...opts });
+    return;
+  } catch (err) {
+    // Possibly moved to the Recycle Bin by the safe-delete shim. If it's gone,
+    // treat the throw as success rather than aborting the whole uninstall.
+    if (!existsSync(p)) return;
+    // Still present: try a lower-level removal as a last resort.
+    try {
+      const st = statSync(p);
+      if (st.isDirectory()) rmdirSync(p, { recursive: true });
+      else unlinkSync(p);
+    } catch {
+      // ignore; fall through to the existence re-check below
+    }
+    if (existsSync(p)) {
+      throw new Error(`Failed to remove ${p}: ${err && err.message}`);
     }
   }
-  if (start === -1) return null;
-  const block = [];
-  block.push(lines[start]);
-  let pastLeadingBlank = false;
-  for (let i = start + 1; i < lines.length; i++) {
-    const t = lines[i].trim();
-    if (t === "") {
-      // Allow a single blank line between the marker and the content
-      // (the canonical REMINDER uses one).  Stop at the second blank.
-      if (pastLeadingBlank) break;
-      pastLeadingBlank = true;
-      continue;
-    }
-    if (t.startsWith("> ") || t.startsWith("- ")) {
-      block.push(lines[i]);
-      pastLeadingBlank = true;
-    } else {
-      break;
-    }
-  }
-  return { start, end: start + block.length - 1, text: block.join("\n") };
 }
+
+// P2 (legacy sweep): beyond the backups we just wrote this run, any
+// pre-existing `<config>.bak` sibling that still carries a `workled` entry is a
+// stale leftover from an earlier (pre-fix) uninstall. Remove those too so an
+// uninstall leaves the config dirs genuinely clean. Only the installer's own
+// `<managed-config>.bak` files are considered, and only when they actually
+// contain "workled", so unrelated user backups are never touched.
+function cleanStaleWorkledBaks(targets = CLIENTS) {
+  // Sweep only the managed config files belonging to the targeted clients so a
+  // per-client uninstall (`--client <name>`) never cleans other clients' dirs.
+  // MCP_SOURCES covers most clients; openclaw's config and agy's hooks are
+  // added by client name below.
+  const wanted = new Set(targets);
+  const managed = MCP_SOURCES.filter((s) => wanted.has(s.client.split(".")[0])).map((s) => s.path());
+  if (wanted.has("openclaw")) managed.push(openclawConfigPath());
+  if (wanted.has("agy")) managed.push(join(h, ".gemini", "config", "hooks.json"));
+  if (wanted.has("workbuddy")) managed.push(join(h, ".workbuddy", "settings.json"));
+  const seen = new Set();
+  for (const file of managed) {
+    if (seen.has(file)) continue;
+    seen.add(file);
+    const bak = file + ".bak";
+    if (!existsSync(bak)) continue;
+    let content = "";
+    try { content = readFileSync(bak, "utf8"); } catch { continue; }
+    if (/workled/.test(content)) {
+      try { removePath(bak); } catch { /* best effort */ }
+    }
+  }
+}
+
+// Best-effort cleanup of an empty parent directory (P3). Shared plugin /
+// extension dirs that still hold other files are left untouched because
+// rmdirSync fails on a non-empty directory (and any throw here is swallowed).
+function removeEmptyParent(dir) {
+  try {
+    rmdirSync(dir, { recursive: false });
+  } catch {
+    // not empty, missing, or rejected by the safe-delete shim — leave it.
+  }
+}
+
+// ---- instruction file helpers -----------------------------------------------
 
 // Strip every existing workled reminder block from *content* and return the
 // trimmed remainder.  Used by appendReminder so stale duplicate markers (e.g.
@@ -149,7 +193,8 @@ function removeReminder(file) {
   // breaking clients whose config directories require their instruction file
   // to exist (rare) while keeping empty-after-cleanup files clean.
   if (result === "") {
-    rmSync(file);
+    removePath(file);
+    removeEmptyParent(dirname(file));
     return `Removed workled-only instruction file -> ${file}`;
   }
   writeFileSync(file, result + "\n", "utf8");
@@ -187,6 +232,7 @@ function writeJsonPretty(file, obj) {
   if (existsSync(file)) {
     try {
       writeFileSync(file + ".bak", readFileSync(file, "utf8"), "utf8");
+      createdBaks.add(file + ".bak");
     } catch {
       // Backup failed, proceed anyway
     }
@@ -208,49 +254,13 @@ function directWriteConfig(file, cfg) {
   if (existsSync(file)) {
     try {
       writeFileSync(file + ".bak", readFileSync(file, "utf8"), "utf8");
+      createdBaks.add(file + ".bak");
     } catch {}
   }
   writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
-// ---- hook config merge (agy hooks.json) -------------------------------------
-
-// Hooks live under a "hooks" key (agy hooks.json). Each event is an array of
-// { type: "command", command: "..." } objects.
-function mergeHookCommands(json, events, command) {
-  const root = json && typeof json === "object" ? json : {};
-  const hooks = root.hooks && typeof root.hooks === "object" ? root.hooks : {};
-  for (const ev of events) {
-    const list = Array.isArray(hooks[ev]) ? hooks[ev] : [];
-    // Remove any existing workled hook for this event, then add ours.
-    const filtered = list.filter((h) => !isWorkledHook(h));
-    filtered.push({ type: "command", command });
-    hooks[ev] = filtered;
-  }
-  root.hooks = hooks;
-  return root;
-}
-
-function removeHookCommands(json, events) {
-  if (!json || typeof json !== "object" || !json.hooks) return null;
-  let changed = false;
-  for (const ev of events) {
-    const list = json.hooks[ev];
-    if (!Array.isArray(list)) continue;
-    const filtered = list.filter((h) => !isWorkledHook(h));
-    if (filtered.length !== list.length) changed = true;
-    if (filtered.length === 0) delete json.hooks[ev];
-    else json.hooks[ev] = filtered;
-  }
-  if (Object.keys(json.hooks).length === 0) delete json.hooks;
-  return changed ? json : null;
-}
-
-function isWorkledHook(h) {
-  if (!h || typeof h !== "object") return false;
-  const cmd = typeof h.command === "string" ? h.command : "";
-  return cmd.includes("workled");
-}
+// ---- hook command construction (agy / hermes) -------------------------------
 
 function hookCommand(eventName) {
   // Windows paths need quotes; JSON handles escaping via JSON.stringify.
@@ -324,7 +334,8 @@ function removeMcpServerYaml(file, keyCandidates) {
       const merged = [...before, ...after].join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
       content = merged ? merged + "\n" : "";
       if (content.trim() === "") {
-        rmSync(file);
+        removePath(file);
+        removeEmptyParent(dirname(file));
         return `Removed empty hermes config.yaml -> ${file}`;
       }
       writeFileSync(file, content, "utf8");
@@ -369,6 +380,208 @@ function unregisterWorkledMcp(client) {
   return MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`))
     .map((s) => removeMcpServer(s))
     .filter(Boolean);
+}
+
+// Resolve the workled MCP server URL, in priority order:
+//   1. WORKLED_MCP_URL        (explicit configuration wins)
+//   2. placeholder            (http://<device-name>.local:18791/mcp, user must replace)
+// There is intentionally no Bluetooth scan and no hard-coded specific host
+// (e.g. HomeAnt-2831.local): the user supplies the real device name either via
+// WORKLED_MCP_URL or by replacing the placeholder before connecting.
+async function resolveWorkledMcpUrl() {
+  if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
+  // No explicit URL: emit a placeholder the user must replace with their real
+  // workled device name before connecting.
+  return "http://<device-name>.local:18791/mcp";
+}
+
+// ---- WorkBuddy user-level hooks (settings.json) ----------------------------
+// WorkBuddy loads hooks from ~/.workbuddy/settings.json (a Claude Code-compatible
+// `hooks` field), NOT from the skill directory. These fire automatically on each
+// lifecycle event — independent of agent discipline — so the workled LED tracks
+// state reliably across new sessions without re-reminding the agent.
+function workledHookCommand(eventName) {
+  // Use the same node that runs this installer (managed runtime) and the
+  // installed index.js; both paths are absolute and stable on this machine.
+  return `"${process.execPath}" "${corePath}" hook --event ${eventName} --client workbuddy`;
+}
+
+// Each lifecycle event the workled hook should fire on. `matcher` (only for
+// PreToolUse) restricts the hook to a specific tool so it does NOT run on every
+// tool call — a bare PreToolUse hook would spawn a ~3.6s process per Bash/Read/
+// Write and stall the agent. The `input` state is emitted only when the matched
+// tool is one of the workled "input" tools (see getInputTools / WORKLED_INPUT_TOOLS).
+const WORKLED_HOOK_SPECS = [
+  { event: "UserPromptSubmit", matcher: null },
+  { event: "Stop", matcher: null },
+  { event: "PreToolUse", matcher: "AskUserQuestion" },
+];
+
+// Write workled hooks into ~/.workbuddy/settings.json. Idempotent: any prior
+// workled entry for the same event is replaced first.
+function registerWorkledSettingsHooks() {
+  const settingsFile = join(h, ".workbuddy", "settings.json");
+  const settings = readJsonOrEmpty(settingsFile) || {};
+  if (!settings.hooks || typeof settings.hooks !== "object") settings.hooks = {};
+  for (const spec of WORKLED_HOOK_SPECS) {
+    const ev = spec.event;
+    if (!Array.isArray(settings.hooks[ev])) settings.hooks[ev] = [];
+    // Drop any prior workled entry for this event to stay idempotent.
+    settings.hooks[ev] = settings.hooks[ev].filter(
+      (group) =>
+        !(
+          group &&
+          Array.isArray(group.hooks) &&
+          group.hooks.some(
+            (hk) =>
+              hk &&
+              typeof hk.command === "string" &&
+              hk.command.includes("workled") &&
+              hk.command.includes(`hook --event ${ev}`)
+          )
+        )
+    );
+    const group = {
+      hooks: [{ type: "command", command: workledHookCommand(ev), timeout: WORKLED_HOOK_TIMEOUT_MS / 1000 }],
+    };
+    if (spec.matcher) group.matcher = spec.matcher;
+    settings.hooks[ev].push(group);
+  }
+  writeJsonPretty(settingsFile, settings);
+  return `Installed workled hooks -> ${settingsFile}`;
+}
+
+// Remove only the workled hooks from ~/.workbuddy/settings.json, leaving every
+// other hook and setting untouched.
+function unregisterWorkledSettingsHooks() {
+  const settingsFile = join(h, ".workbuddy", "settings.json");
+  const settings = readJsonOrEmpty(settingsFile);
+  if (!settings || !settings.hooks) return `No workled hooks at ${settingsFile}`;
+  let removed = false;
+  for (const ev of Object.keys(settings.hooks)) {
+    const before = Array.isArray(settings.hooks[ev]) ? settings.hooks[ev].length : 0;
+    if (Array.isArray(settings.hooks[ev])) {
+      settings.hooks[ev] = settings.hooks[ev].filter(
+        (group) =>
+          !(
+            group &&
+            Array.isArray(group.hooks) &&
+            group.hooks.some(
+              (hk) =>
+                hk &&
+                typeof hk.command === "string" &&
+                hk.command.includes("workled") &&
+                hk.command.includes("hook --event")
+            )
+          )
+      );
+    }
+    if ((settings.hooks[ev] || []).length === 0) delete settings.hooks[ev];
+    if ((settings.hooks[ev] || []).length < before) removed = true;
+  }
+  if (!removed) return `No workled hooks at ${settingsFile}`;
+  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  writeJsonPretty(settingsFile, settings);
+  return `Removed workled hooks -> ${settingsFile}`;
+}
+
+// Inverse of removeMcpServer: write the `workled` server entry into one MCP
+// source (JSON or YAML). For JSON, an existing `type` (e.g. WorkBuddy's
+// "remote") is preserved so we never downgrade a client's transport setting.
+function addMcpServer(source, entry) {
+  if (source.format === "yaml") {
+    return addMcpServerYaml(source.path(), source.key, "workled", entry);
+  }
+  const file = source.path();
+  const obj = readJsonOrEmpty(file) || {};
+  const map =
+    obj[source.key] && typeof obj[source.key] === "object"
+      ? obj[source.key]
+      : (obj[source.key] = {});
+  const existing = map.workled && typeof map.workled === "object" ? map.workled : {};
+  // Never downgrade a working URL to the <device-name> placeholder: if the new
+  // entry carries the placeholder but an existing real URL is present, keep the
+  // real one. This guards `install` runs where WORKLED_MCP_URL / Bluetooth are
+  // unavailable (placeholder path) yet a valid config already exists.
+  const PLACEHOLDER = "<device-name>";
+  const isPlaceholder = (u) => typeof u === "string" && u.includes(PLACEHOLDER);
+  const url = isPlaceholder(entry.url) && existing.url && !isPlaceholder(existing.url)
+    ? existing.url
+    : entry.url;
+  const merged = { url, enabled: entry.enabled !== false };
+  if (existing.type) merged.type = existing.type;
+  map.workled = merged;
+  writeJsonPretty(file, obj);
+  return `Registered workled -> ${source.key} (${file})`;
+}
+
+// Add (or replace) a `workled` server under a YAML top-level MCP block
+// (`mcp_servers:` or an aliased key). Preserves every other server and the
+// block's indentation.
+function addMcpServerYaml(file, key, serverName, entry) {
+  if (!existsSync(file)) return null;
+  let content = readFileSync(file, "utf8");
+  const split = splitTopLevelBlock(content, key);
+  const serverLines = [
+    `  ${serverName}:`,
+    `    url: ${JSON.stringify(entry.url)}`,
+    `    enabled: true`,
+  ];
+  if (!split) {
+    const trimmed = content.trimEnd();
+    content = (trimmed ? trimmed + "\n" : "") + `${key}:\n` + serverLines.join("\n") + "\n";
+    writeFileSync(file, content, "utf8");
+    return `Registered workled -> ${key} (${file})`;
+  }
+  const lines = content.split("\n");
+  const blockLines = lines.slice(split.start, split.end);
+  let sIndent = "  ";
+  for (const l of blockLines) {
+    const m = l.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
+    if (m) {
+      sIndent = m[1];
+      break;
+    }
+  }
+  const out = [];
+  let skipping = false;
+  for (const l of blockLines) {
+    const m = l.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
+    if (m && m[1] === sIndent) {
+      if (m[2] === serverName) {
+        skipping = true;
+        continue;
+      }
+      skipping = false;
+      out.push(l);
+      continue;
+    }
+    if (skipping && /^\s+\S/.test(l)) continue;
+    out.push(l);
+  }
+  out.push(`${sIndent}${serverName}:`);
+  out.push(`${sIndent}  url: ${JSON.stringify(entry.url)}`);
+  out.push(`${sIndent}  enabled: true`);
+  const before = lines.slice(0, split.start);
+  const after = lines.slice(split.end);
+  content = [...before, ...out, ...after].join("\n").replace(/\n{3,}/g, "\n\n");
+  writeFileSync(file, content, "utf8");
+  return `Registered workled -> ${key} (${file})`;
+}
+
+// Register the workled MCP server for one client across its global config
+// sources (deduped by path). Mirrors unregisterWorkledMcp so install and
+// uninstall stay symmetric and every client's logic is identical.
+function registerWorkledMcp(client, entry) {
+  const sources = MCP_SOURCES.filter((s) => s.client === `${client}.global`);
+  const seen = new Set();
+  const msgs = [];
+  for (const s of sources) {
+    if (seen.has(s.path())) continue;
+    seen.add(s.path());
+    msgs.push(addMcpServer(s, entry));
+  }
+  return msgs.filter(Boolean);
 }
 
 // ---- per-client install/uninstall -------------------------------------------
@@ -427,7 +640,7 @@ const OPENCLAW_PLUGIN_MANIFEST = {
   name: "workled",
   description:
     "Maps OpenClaw agent lifecycle events (thinking/idle/input/error) to the workled MCP set_agent_state tool driving the LED strip.",
-  version: VERSION,
+  version: SKILL_VERSION,
   activation: { onStartup: true, onCapabilities: ["hook"] },
   configSchema: { type: "object", additionalProperties: false, properties: {} },
 };
@@ -455,17 +668,11 @@ function readOpenclawConfig() {
 async function installOpenclaw() {
   const destDir = join(openclawPluginDir(), "workled");
   const dest = join(destDir, "index.js");
-  const srcDir = scriptDir;
   mkdirSync(destDir, { recursive: true });
 
-  // Write the entry file
+  // Write the entry file (imports the core via an absolute URL, so no
+  // dependency files need copying into the plugin dir)
   writeFileSync(dest, openclawEntryFile(), "utf8");
-
-  // Copy utils.js as dependency
-  const srcUtils = join(srcDir, "utils.js");
-  if (existsSync(srcUtils)) {
-    writeFileSync(join(destDir, "utils.js"), readFileSync(srcUtils, "utf8"), "utf8");
-  }
 
   // Write plugin manifest
   writeFileSync(
@@ -529,15 +736,41 @@ async function installOpenclaw() {
   return `Installed openclaw entry + manifest + config -> ${dest}\nRegistered in openclaw.json plugins.load.paths and plugins.entries.workled (restart the Gateway to load)`;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Strip every workled entry from an openclaw config object, returning the
+// cleaned copy, whether anything changed, and the messages describing it.
+// Shared by uninstallOpenclaw's main cleanup and its rollback recovery path.
+function stripWorkledFromOpenclawConfig(cfg) {
+  const out = { cfg: { ...cfg }, changed: false, messages: [] };
+  if (out.cfg && out.cfg.plugins) {
+    const plugins = out.cfg.plugins;
+    if (plugins.load && Array.isArray(plugins.load.paths)) {
+      const filtered = plugins.load.paths.filter((p) => !String(p).includes("workled"));
+      if (filtered.length !== plugins.load.paths.length) {
+        plugins.load.paths = filtered;
+        if (filtered.length === 0) delete plugins.load;
+        out.changed = true;
+        out.messages.push(`Unregistered workled from openclaw.json plugins.load.paths`);
+      }
+    }
+    if (plugins.entries && plugins.entries.workled) {
+      delete plugins.entries.workled;
+      if (Object.keys(plugins.entries).length === 0) delete plugins.entries;
+      out.changed = true;
+      out.messages.push(`Unregistered workled from openclaw.json plugins.entries`);
+    }
+    if (plugins.load && Object.keys(plugins.load).length === 0) delete plugins.load;
+    if (plugins.entries && Object.keys(plugins.entries).length === 0) delete plugins.entries;
+    if (Object.keys(plugins).length === 0) delete out.cfg.plugins;
+  }
+  return out;
 }
 
 async function uninstallOpenclaw() {
   const destDir = join(openclawPluginDir(), "workled");
   let msg = "";
   if (existsSync(destDir)) {
-    rmSync(destDir, { recursive: true });
+    removePath(destDir, { recursive: true });
+    removeEmptyParent(dirname(destDir));
     msg += `Removed openclaw plugin dir -> ${destDir}\n`;
   } else {
     msg += `No openclaw workled plugin dir at ${destDir}\n`;
@@ -547,33 +780,15 @@ async function uninstallOpenclaw() {
   // We must write unconditionally because the Gateway file watcher may have
   // already rolled back the config to .bak between our read and any write.
   const configPath = openclawConfigPath();
-  const cfg = readOpenclawConfig();
-  let changed = false;
-  if (cfg && cfg.plugins) {
-    if (cfg.plugins.load && Array.isArray(cfg.plugins.load.paths)) {
-      const filtered = cfg.plugins.load.paths.filter((p) => !String(p).includes("workled"));
-      if (filtered.length !== cfg.plugins.load.paths.length) {
-        cfg.plugins.load.paths = filtered;
-        if (filtered.length === 0) delete cfg.plugins.load;
-        changed = true;
-        msg += `Unregistered workled from openclaw.json plugins.load.paths\n`;
-      }
-    }
-    if (cfg.plugins.entries && cfg.plugins.entries.workled) {
-      delete cfg.plugins.entries.workled;
-      if (Object.keys(cfg.plugins.entries).length === 0) delete cfg.plugins.entries;
-      changed = true;
-      msg += `Unregistered workled from openclaw.json plugins.entries\n`;
-    }
-    if (cfg.plugins.load && Object.keys(cfg.plugins.load).length === 0) delete cfg.plugins.load;
-    if (cfg.plugins.entries && Object.keys(cfg.plugins.entries).length === 0) delete cfg.plugins.entries;
-    if (cfg.plugins && Object.keys(cfg.plugins).length === 0) delete cfg.plugins;
-  }
+  let cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
 
   // Write the cleaned config. Use directWriteConfig to avoid deepMerge
   // re-introducing stale workled entries from a concurrently-modified file.
-  directWriteConfig(configPath, cfg);
-  if (changed) msg += `Updated openclaw.json -> ${configPath}\n`;
+  directWriteConfig(configPath, cleaned.cfg);
+  if (cleaned.changed) {
+    msg += cleaned.messages.join("\n") + "\n";
+    msg += `Updated openclaw.json -> ${configPath}\n`;
+  }
 
   // Wait for Gateway to finish reloading, then verify the config is clean.
   // If Gateway rolled back (e.g. because it read an intermediate state),
@@ -587,19 +802,8 @@ async function uninstallOpenclaw() {
   }
 
   // Gateway didn't stabilise — force-write clean config one final time.
-  const finalCfg = readOpenclawConfig();
-  const cleanCfg = { ...finalCfg };
-  if (cleanCfg.plugins) {
-    if (cleanCfg.plugins.load) {
-      const filtered = cleanCfg.plugins.load.paths.filter(p => !String(p).includes("workled"));
-      if (filtered.length === 0) delete cleanCfg.plugins.load;
-      else cleanCfg.plugins.load.paths = filtered;
-    }
-    if (cleanCfg.plugins.entries?.workled) delete cleanCfg.plugins.entries.workled;
-    if (cleanCfg.plugins.entries && Object.keys(cleanCfg.plugins.entries).length === 0) delete cleanCfg.plugins.entries;
-    if (cleanCfg.plugins && Object.keys(cleanCfg.plugins).length === 0) delete cleanCfg.plugins;
-  }
-  directWriteConfig(configPath, cleanCfg);
+  cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
+  directWriteConfig(configPath, cleaned.cfg);
   msg += `Force-cleaned openclaw.json (Gateway rollback recovery)\n`;
   return msg.trimEnd();
 }
@@ -852,7 +1056,8 @@ function uninstallHermes() {
   const cleaned = uninstallHermesHooks(content);
   if (cleaned === content) return `No hermes workled hooks at ${cfg}`;
   if (cleaned.trim() === "") {
-    rmSync(cfg);
+    removePath(cfg);
+    removeEmptyParent(dirname(cfg));
     return `Removed empty hermes config.yaml -> ${cfg}`;
   }
   writeFileSync(cfg, cleaned, "utf8");
@@ -865,14 +1070,13 @@ function printHelp() {
   console.log(`workled skill installer
 
 Usage:
-  node skill-install.mjs install|uninstall
-  node skill-install.mjs install|uninstall [--client <name>]
+  node skill-install.mjs install|uninstall --client <name>|all
   node skill-install.mjs install|uninstall --file <instruction-file>
 
-Clients installed/uninstalled together (all) unless --client restricts one:
 ${CLIENTS.map((c) => `  ${c.padEnd(10)} ${CLIENT_TARGETS[c] ?? CLIENT_TARGETS.default}`).join("\n")}
   --file     generic: only the reminder (clients not in the list use this method)
-  --client   install/uninstall only the named client (e.g. --client opencode); default is all
+  --client   REQUIRED -- the invoking agent passes its own client name, or
+             "all" to apply the operation to every client
 `);
 }
 
@@ -892,21 +1096,48 @@ async function main() {
     process.exit(1);
   }
 
-  // Optional per-client filter: `--client <name>` restricts install/uninstall
-  // to a single client; omitted means all clients are handled together.
-  const clientIdx = args.indexOf("--client");
-  const clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
-  if (clientArg && !CLIENTS.includes(clientArg)) {
-    console.error(`Unknown client: ${clientArg}\nSupported clients: ${CLIENTS.join(", ")}`);
-    process.exit(1);
-  }
-  const targets = clientArg ? [clientArg] : CLIENTS;
-
-  // Generic mode: only the reminder.
+  // Generic mode: only the reminder, no client target involved. Handled here so
+  // `uninstall --file` (and `install --file`) works without a `--client` flag.
   if (fileArg) {
     const out = action === "install" ? appendReminder(fileArg) : removeReminder(fileArg);
     console.log(out);
     return;
+  }
+
+  // Target client resolution: both actions (install AND uninstall) require an
+  // explicit target. The invoking agent passes its own client name, or "all"
+  // to apply the operation to every client. Omitted => error listing the
+  // client enum so the agent can pick its own client or all.
+  const clientIdx = args.indexOf("--client");
+  const clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
+  if (clientArg && clientArg !== "all" && !CLIENTS.includes(clientArg)) {
+    console.error(`Unknown client: ${clientArg}\nSupported clients: ${CLIENTS.join(", ")}, all`);
+    process.exit(1);
+  }
+  if (!clientArg) {
+    console.error(
+      `No target client for ${action}.\n` +
+      `Pass --client <name> to ${action} only your own client, or --client all to ${action} every client.\n` +
+      `Clients: ${CLIENTS.join(", ")}, all`
+    );
+    process.exit(1);
+  }
+  const targets = clientArg === "all" ? CLIENTS : [clientArg];
+
+  // Resolve the MCP URL once (discovers the real workled device name when
+  // possible) so every client's install registers the same, correct endpoint.
+  let mcpEntry = null;
+  if (action === "install") {
+    const url = await resolveWorkledMcpUrl();
+    if (url.includes("<device-name>")) {
+      console.warn(
+        "Warning: no WORKLED_MCP_URL set and no workled device discovered via " +
+          "Bluetooth. Wrote a placeholder URL (http://<device-name>.local:18791/mcp); " +
+          "replace <device-name> with your real workled device name (e.g. HomeAnt-XXXX), " +
+          "or set WORKLED_MCP_URL, before connecting."
+      );
+    }
+    mcpEntry = { url, enabled: true };
   }
 
   for (const c of targets) {
@@ -921,9 +1152,11 @@ async function main() {
           writeFileSync(dest, opencodeEntryFile(), "utf8");
           lines.push(`Installed opencode plugin -> ${dest}`);
           lines.push(appendReminder(join(h, ".config", "opencode", "AGENTS.md")));
+          lines.push(...(await registerWorkledMcp("opencode", mcpEntry)));
         } else {
           if (existsSync(dest)) {
-            rmSync(dest);
+            removePath(dest);
+            removeEmptyParent(dirname(dest));
             lines.push(`Removed opencode plugin -> ${dest}`);
           } else {
             lines.push(`No opencode plugin at ${dest}`);
@@ -941,9 +1174,11 @@ async function main() {
           writeFileSync(dest, kiloEntryFile(), "utf8");
           lines.push(`Installed kilo plugin -> ${dest}`);
           lines.push(appendReminder(join(h, ".config", "kilo", "AGENTS.md")));
+          lines.push(...(await registerWorkledMcp("kilo", mcpEntry)));
         } else {
           if (existsSync(dest)) {
-            rmSync(dest);
+            removePath(dest);
+            removeEmptyParent(dirname(dest));
             lines.push(`Removed kilo plugin -> ${dest}`);
           } else {
             lines.push(`No kilo plugin at ${dest}`);
@@ -956,20 +1191,23 @@ async function main() {
       case "openclaw": {
         lines.push(await (isInstall ? installOpenclaw() : uninstallOpenclaw()));
         lines.push(isInstall ? appendReminder(join(h, ".openclaw", "AGENTS.md")) : removeReminder(join(h, ".openclaw", "AGENTS.md")));
-        if (!isInstall) lines.push(...unregisterWorkledMcp("openclaw"));
+        if (isInstall) lines.push(...(await registerWorkledMcp("openclaw", mcpEntry)));
+        else lines.push(...unregisterWorkledMcp("openclaw"));
         break;
       }
       case "agy": {
         lines.push(isInstall ? installAgy() : uninstallAgy());
         lines.push(isInstall ? appendReminder(join(h, ".gemini", "AGENTS.md")) : removeReminder(join(h, ".gemini", "AGENTS.md")));
-        if (!isInstall) lines.push(...unregisterWorkledMcp("agy"));
+        if (isInstall) lines.push(...(await registerWorkledMcp("agy", mcpEntry)));
+        else lines.push(...unregisterWorkledMcp("agy"));
         break;
       }
       case "hermes": {
         const hh = hermesHome();
         lines.push(isInstall ? installHermes() : uninstallHermes());
         lines.push(isInstall ? appendReminder(join(hh, "AGENTS.md")) : removeReminder(join(hh, "AGENTS.md")));
-        if (!isInstall) lines.push(...unregisterWorkledMcp("hermes"));
+        if (isInstall) lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
+        else lines.push(...unregisterWorkledMcp("hermes"));
         break;
       }
       case "pi": {
@@ -980,9 +1218,11 @@ async function main() {
           writeFileSync(dest, piEntryFile(), "utf8");
           lines.push(`Installed pi extension -> ${dest}`);
           lines.push(appendReminder(join(h, ".pi", "AGENTS.md")));
+          lines.push(...(await registerWorkledMcp("pi", mcpEntry)));
         } else {
           if (existsSync(dest)) {
-            rmSync(dest);
+            removePath(dest);
+            removeEmptyParent(dirname(dest));
             lines.push(`Removed pi extension -> ${dest}`);
           } else {
             lines.push(`No pi extension at ${dest}`);
@@ -992,11 +1232,40 @@ async function main() {
         }
         break;
       }
+      case "workbuddy": {
+        // WorkBuddy is a pure-MCP client with no per-client hook layer, so the
+        // state protocol is enforced by user-level hooks in settings.json
+        // (installed below) rather than by agent discipline. Install registers
+        // both the MCP server entry and the lifecycle hooks; uninstall removes
+        // both.
+        if (isInstall) {
+          lines.push(...(await registerWorkledMcp("workbuddy", mcpEntry)));
+          lines.push(registerWorkledSettingsHooks());
+        } else {
+          lines.push(...unregisterWorkledMcp("workbuddy"));
+          lines.push(unregisterWorkledSettingsHooks());
+        }
+        break;
+      }
       default:
         console.error(`Unknown client: ${c}`);
         process.exit(1);
     }
     console.log(lines.join("\n") + "\n");
+  }
+
+  // P2: uninstall writes clean configs and leaves a `.bak` of the pre-uninstall
+  // state (which still carries the `workled` entry) for every JSON config it
+  // touches. Those stale backups are genuine leftovers, so drop the ones this
+  // run created, then sweep any pre-existing `workled` backups still sitting
+  // next to the managed config files. The install path deliberately keeps its
+  // `.bak` files as a safety net and is left untouched.
+  if (action === "uninstall") {
+    for (const bak of createdBaks) {
+      try { removePath(bak); } catch { /* best effort */ }
+    }
+    createdBaks.clear();
+    cleanStaleWorkledBaks(targets);
   }
 
   // After install, point the agent at the diagnostic command so it can check

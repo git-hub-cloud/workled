@@ -23,18 +23,18 @@ import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome } from "./utils.js";
+import { stripJsonc, hermesHome, sleep } from "./utils.js";
 
 const HOME = homedir();
 const execFileAsync = promisify(execFile);
 
-// PLUGIN_VERSION: single-sourced from _meta.json (the skill registry metadata);
+// SKILL_VERSION: single-sourced from _meta.json (the skill registry metadata);
 // package.json only declares the module type and is not read here.
-let PLUGIN_VERSION = "1.0.0";
+let SKILL_VERSION = "";
 try {
   const metaPath = join(import.meta.dirname, "_meta.json");
   if (existsSync(metaPath)) {
-    PLUGIN_VERSION = JSON.parse(stripJsonc(readFileSync(metaPath, "utf8"))).version || "1.0.0";
+    SKILL_VERSION = JSON.parse(stripJsonc(readFileSync(metaPath, "utf8"))).version || "";
   }
 } catch {
   // fallback to default
@@ -66,6 +66,8 @@ export const MCP_SOURCES = [
   { client: "openclaw.global", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
   // pi
   { client: "pi.global", key: "mcp", format: "json", path: () => join(HOME, ".pi", "mcp.json") },
+  // workbuddy (JSON, mcpServers key, ~/.workbuddy/mcp.json)
+  { client: "workbuddy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".workbuddy", "mcp.json") },
   // hermes (YAML)
   { client: "hermes.global", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
 ];
@@ -89,6 +91,7 @@ export const CLIENT_TARGETS = {
   hermes:
     "hooks  -> <hermes-home>/config.yaml (~/.hermes on unix, %LOCALAPPDATA%\\hermes on Windows) + reminder in AGENTS.md",
   pi: "entry  -> ~/.pi/agent/extensions/workled.ts      + reminder in AGENTS.md",
+  workbuddy: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
   default: "installed (targets: see SKILL.md)",
 };
 
@@ -97,6 +100,7 @@ const DEFAULT_RPC_TIMEOUT_MS = 5000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 500;
+const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Monotonic counter for unique JSON-RPC IDs (batch mode)
 let nextRpcId = 1;
@@ -111,10 +115,6 @@ function getInputTools() {
     .filter(Boolean);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function sleepWithJitter(baseMs, attempt) {
   // Exponential backoff with jitter: base * 2^attempt * (0.5 ~ 1.5)
   const expDelay = baseMs * Math.pow(2, attempt);
@@ -122,7 +122,26 @@ function sleepWithJitter(baseMs, attempt) {
   return sleep(Math.floor(jitter));
 }
 
+// Run a child command, retrying once on failure (transient errors, sandbox
+// flakiness, or a briefly-blocked powershell). Returns the execFileAsync result
+// and only throws after all attempts are exhausted.
+async function execWithRetry(cmd, args, opts, maxAttempts = 2) {
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await execFileAsync(cmd, args, opts);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts - 1) {
+        await sleep(300);
+      }
+    }
+  }
+  throw lastErr;
+}
+
 let workledUrl = null;
+let workledUrlExpiry = 0;
 let hookClientPrefix = null;
 let projectDir = process.cwd();
 const seenUserMessages = new Set();
@@ -264,9 +283,21 @@ function getWorkledCandidates(clientPrefix) {
 // Best-effort host-side Bluetooth diagnostic. Returns { available, powered,
 // devicePaired, deviceName, error }. On unsupported platforms or missing
 // adapters the fields degrade gracefully so the caller never throws.
-async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+//
+// `available` is tri-state:
+//   true  - a Bluetooth adapter was found
+//   false - the probe ran and definitively found no adapter
+//   null  - the probe could not be executed (powershell missing/blocked, a
+//           sandbox restriction, or a command failure after retries). We report
+//           "unknown" instead of falsely claiming "no adapter", so a blocked
+//           probe never masquerades as a missing adapter.
+//
+// `devicePaired` / `deviceName` are workled-specific: they report the workled
+// device (name matches HomeAnt|workled) rather than any HID/keyboard device,
+// so the macro-readiness hint is accurate.
+export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const result = {
-    available: false,
+    available: null,
     powered: false,
     devicePaired: false,
     deviceName: null,
@@ -276,9 +307,10 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   try {
     if (process.platform === "win32") {
       try {
-        const { stdout: adapterOut } = await execFileAsync(
+        const { stdout: adapterOut } = await execWithRetry(
           "powershell",
           [
+            "-NoProfile",
             "-Command",
             "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status",
           ],
@@ -289,11 +321,14 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
         result.powered = statuses.some((s) => s.toLowerCase() === "ok");
 
         try {
-          const { stdout: hidOut } = await execFileAsync(
+          // Workled-specific: match the device name (HomeAnt-* or workled),
+          // not any generic HID/keyboard/bluetooth device.
+          const { stdout: hidOut } = await execWithRetry(
             "powershell",
             [
+              "-NoProfile",
               "-Command",
-              "Get-PnpDevice -Class 'HIDClass' -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'keyboard|hid|bluetooth' } | Select-Object -First 1 -ExpandProperty FriendlyName",
+              "Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'HomeAnt|workled' } | Select-Object -First 1 -ExpandProperty FriendlyName",
             ],
             { timeout: timeoutMs }
           );
@@ -302,10 +337,12 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             result.deviceName = hidOut.trim();
           }
         } catch {
-          // no HID keyboard found
+          // workled device not found among PnP devices (not paired yet)
         }
       } catch {
-        result.error = "Failed to query Bluetooth devices";
+        result.available = null;
+        result.error =
+          "Bluetooth probe could not run (powershell unavailable or blocked)";
       }
     } else if (process.platform === "darwin") {
       try {
@@ -318,7 +355,7 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = pairedOut.trim().split(/\r?\n/).filter(Boolean);
-          const hidLine = lines.find((l) => /keyboard|hid/i.test(l));
+          const hidLine = lines.find((l) => /homeant|workled|keyboard|hid/i.test(l));
           if (hidLine) {
             result.devicePaired = true;
             const m = hidLine.match(/address:\s*([^\s,]+)/i);
@@ -343,14 +380,17 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             data.SPBluetoothDataType?.[0]?.device_paired ||
             [];
           const hidDevice = devices.find((d) =>
-            /keyboard|hid/i.test(d.device_name || "") || /keyboard|hid/i.test(d.device_type || "")
+            /homeant|workled|keyboard|hid/i.test(d.device_name || "") ||
+            /homeant|workled|keyboard|hid/i.test(d.device_type || "")
           );
           if (hidDevice) {
             result.devicePaired = true;
             result.deviceName = hidDevice.device_name || null;
           }
         } catch {
-          result.error = "Bluetooth not available (install blueutil or enable system_profiler)";
+          result.available = null;
+          result.error =
+            "Bluetooth not available (install blueutil or enable system_profiler)";
         }
       }
     } else if (process.platform === "linux") {
@@ -364,7 +404,11 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = devOut.trim().split(/\r?\n/).filter(Boolean);
-          if (lines.length > 0) {
+          const wlLine = lines.find((l) => /homeant|workled/i.test(l));
+          if (wlLine) {
+            result.devicePaired = true;
+            result.deviceName = wlLine.split(/\s+/).slice(2).join(" ") || null;
+          } else if (lines.length > 0) {
             result.devicePaired = true;
             result.deviceName = lines[0].split(/\s+/).slice(2).join(" ") || null;
           }
@@ -372,12 +416,14 @@ async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
           // no paired devices
         }
       } catch {
+        result.available = null;
         result.error = "bluetoothctl not available";
       }
     } else {
       result.error = `Unsupported platform: ${process.platform}`;
     }
   } catch {
+    result.available = null;
     result.error = "Bluetooth probe failed";
   }
 
@@ -405,6 +451,46 @@ function extractJson(text) {
   }
 }
 
+// Initialize an MCP session (handshake + initialized notification) and return
+// the session id. Shared by ensureSession and hasTool so the two never diverge.
+async function initializeSession(url, signal, clientInfoName = "workled") {
+  const initRes = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    },
+    signal,
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: nextRpcIdFn(),
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: clientInfoName, version: SKILL_VERSION },
+      },
+    }),
+  });
+  await initRes.arrayBuffer();
+  const sid = initRes.headers.get("mcp-session-id");
+  if (!sid) throw new Error("No session ID from initialize");
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Mcp-Session-Id": sid,
+      },
+      signal,
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    });
+  } catch {
+    // best effort; some servers don't require this
+  }
+  return sid;
+}
+
 // Does the server know our session? (guarded by initLock for concurrent initialize)
 async function ensureSession(url, signal) {
   const now = Date.now();
@@ -424,45 +510,11 @@ async function ensureSession(url, signal) {
     if (cachedUrl === url && cachedSessionId && now2 < sessionExpiry) {
       return;
     }
-    const initRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-      },
-      signal,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: nextRpcIdFn(),
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "workled", version: PLUGIN_VERSION },
-        },
-      }),
-    });
-    await initRes.arrayBuffer();
-    const sid = initRes.headers.get("mcp-session-id");
+    const sid = await initializeSession(url, signal, "workled");
     if (sid) {
       cachedSessionId = sid;
       cachedUrl = url;
       sessionExpiry = now2 + SESSION_TTL_MS;
-      // notifications/initialized must carry the session id header.
-      try {
-        await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-            "Mcp-Session-Id": sid,
-          },
-          signal,
-          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-        });
-      } catch {
-        // best effort; server that no-ops the notification is fine
-      }
     }
   });
 
@@ -501,15 +553,19 @@ async function postJson(url, method, params, controller, extraHeaders = {}) {
 // answer 200 with a -32600 "initialize must be first interaction" error, which
 // also means we must start a session first.
 function requiresSession(status, text) {
-  if (status === 400 || status === 401 || status === 403) return true;
+  // Any HTTP error status: the server refused the sessionless request, so we
+  // must fall back to a real session (initialize + Mcp-Session-Id). This
+  // covers every non-2xx response (405/500/...), not just the classic ones.
+  if (status >= 400) return true;
   try {
     const out = JSON.parse(text);
     const code = out && out.error && out.error.code;
     if (SESSION_REQUIRED_CODES.has(code)) return true;
-    if (code === -32600) {
-      const reason = JSON.stringify(out.error.data || out.error.message || "");
-      if (/initialize|session/i.test(reason)) return true;
-    }
+    // -32600 is JSON-RPC "Invalid Request". For a stateless-first MCP server it
+    // always means "initialize must be first interaction", regardless of the
+    // human-readable message (the standard text "Invalid Request" carries no
+    // initialize/session keyword, so it must not gate the fallback).
+    if (code === -32600) return true;
   } catch {
     // not JSON; only the HTTP status above can signal a session requirement
   }
@@ -578,8 +634,10 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
       clearTimeout(timer);
     }
   }
-  // Unreachable (loop always returns or throws), kept to satisfy the linter.
-  return null;
+  // The auth-retry loop above always returns or throws, so this is a safety
+  // net rather than a reachable path. Throw instead of returning null so a
+  // future regression surfaces instead of silently reporting success.
+  throw new Error("workled rpc: session fallback exited without a result");
 }
 
 // Does this server host the tool? Stateless-first, then the session fallback.
@@ -601,46 +659,11 @@ async function hasTool(url, toolName, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS) 
     }
   }
 
-  // Session fallback: initialize first, then tools/list.
+  // Session fallback: initialize first (shared helper), then tools/list.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const initRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: nextRpcIdFn(),
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "workled-discover", version: PLUGIN_VERSION },
-        },
-      }),
-    });
-    await initRes.arrayBuffer();
-    const sessionId = initRes.headers.get("mcp-session-id");
-    if (!sessionId) throw new Error("No session ID from initialize");
-
-    // Send initialized notification (required before tools/list)
-    try {
-      await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Mcp-Session-Id": sessionId,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-      });
-    } catch {
-      // Best effort; some servers don't require this
-    }
+    const sessionId = await initializeSession(url, controller.signal, "workled-discover");
 
     // Call tools/list with session ID
     const listRes = await fetch(url, {
@@ -669,7 +692,7 @@ async function hasTool(url, toolName, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS) 
 
 async function discoverWorkledUrl(clientPrefix) {
   if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
-  if (workledUrl) return workledUrl;
+  if (workledUrl && Date.now() < workledUrlExpiry) return workledUrl;
   const candidates = getWorkledCandidates(clientPrefix);
   if (candidates.length === 0) return null;
 
@@ -685,6 +708,7 @@ async function discoverWorkledUrl(clientPrefix) {
   for (const res of results) {
     if (res.status === "fulfilled" && res.value) {
       workledUrl = res.value;
+      workledUrlExpiry = Date.now() + WORKLED_URL_TTL_MS;
       return res.value;
     }
   }
@@ -1056,6 +1080,8 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 // serves all of them. Tool events map to "input" only when the payload
 // references an input tool (checked by extractToolName below).
 const HOOK_MAP = {
+  // WorkBuddy (Claude Code-compatible hooks in ~/.workbuddy/settings.json)
+  UserPromptSubmit: "thinking",
   // agy / gemini (camelCase)
   Stop: "idle",
   PreInvocation: "thinking",
@@ -1086,60 +1112,95 @@ function extractToolName(payload) {
   );
 }
 
+function toolIsInput(toolName) {
+  const lowered = (toolName || "").toLowerCase();
+  if (!lowered) return false;
+  return getInputTools().some((t) => {
+    const needle = t.toLowerCase();
+    // Match on exact name OR substring: a default token like "question" should
+    // also catch "AskUserQuestion", while explicit exact names still work.
+    return needle === lowered || lowered.includes(needle);
+  });
+}
+
 function resolveHookState(event, payload) {
   const target = HOOK_MAP[event];
   if (!target) return null;
   if (target === "tool") {
     const toolName = extractToolName(payload);
-    if (!toolName || !getInputTools().includes(toolName)) return null;
+    if (!toolIsInput(toolName)) return null;
     return "input";
   }
   return target;
 }
 
+// Single shared hook timeout budget (milliseconds), used directly by the internal
+// flush cap below. skill-install.mjs converts it to seconds for the host's hook
+// `timeout` in settings.json. This is the one tunable for the whole hook budget.
+export const WORKLED_HOOK_TIMEOUT_MS = 10000;
+
 async function runHookMode() {
-  const argv = process.argv.slice(2);
-  const eventIdx = argv.indexOf("--event");
-  const eventArg = eventIdx >= 0 ? argv[eventIdx + 1] : null;
-  const clientIdx = argv.indexOf("--client");
-  const clientArg = clientIdx >= 0 ? argv[clientIdx + 1] : null;
-  if (clientArg) hookClientPrefix = clientArg;
+  try {
+    const argv = process.argv.slice(2);
+    const eventIdx = argv.indexOf("--event");
+    const eventArg = eventIdx >= 0 ? argv[eventIdx + 1] : null;
+    const clientIdx = argv.indexOf("--client");
+    const clientArg = clientIdx >= 0 ? argv[clientIdx + 1] : null;
+    if (clientArg) hookClientPrefix = clientArg;
 
-  // Read the hook JSON payload from stdin (agy may pass the event name via
-  // --event instead).
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
-  let payload = {};
-  if (raw) {
-    try {
-      payload = JSON.parse(stripJsonc(raw));
-    } catch {
-      payload = {};
-    }
-  }
-
-  const event = eventArg || payload.hook_event_name || payload.event || null;
-  if (!event) {
-    process.stdout.write("{}\n");
-    return;
-  }
-  const state = resolveHookState(event, payload);
-  if (state) {
-    setAgentState(state);
-    try {
-      // Await the flush so the short-lived process does not exit before the
-      // MCP call completes. flushState has a 15s internal timeout.
-      const result = await flushState();
-      if (!result.sent && !result.superseded) {
-        console.warn(`[workled] hook: state ${result.state} not sent: ${result.error && result.error.message}`);
+    // Read the hook JSON payload from stdin (agy may pass the event name via
+    // --event instead). Never block on stdin: if the host never closes it
+    // (e.g. a hook event with no payload), proceed after a short grace period
+    // so this short-lived process always exits and never stalls the host's
+    // tool call / turn.
+    const chunks = [];
+    const stdinDone = (async () => {
+      for await (const chunk of process.stdin) chunks.push(chunk);
+    })();
+    await Promise.race([stdinDone, sleep(500)]);
+    const raw = Buffer.concat(chunks).toString("utf8").trim();
+    let payload = {};
+    if (raw) {
+      try {
+        payload = JSON.parse(stripJsonc(raw));
+      } catch {
+        payload = {};
       }
-    } catch (err) {
-      console.warn(`[workled] hook flush error: ${err && err.message}`);
     }
+
+    const event = eventArg || payload.hook_event_name || payload.event || null;
+    if (!event) {
+      return;
+    }
+    const state = resolveHookState(event, payload);
+    if (state) {
+      setAgentState(state);
+      try {
+        const result = await Promise.race([
+          flushState(),
+          sleep(WORKLED_HOOK_TIMEOUT_MS).then(() => ({ state, sent: false, superseded: false, timeout: true })),
+        ]);
+        if (!result.sent && !result.superseded && !result.timeout) {
+          console.warn(`[workled] hook: state ${result.state} not sent: ${result.error && result.error.message}`);
+        }
+      } catch (err) {
+        console.warn(`[workled] hook flush error: ${err && err.message}`);
+      }
+    }
+  } catch (err) {
+    // Never propagate: the hook process must always exit cleanly (stdout {}
+    // + status 0) so the host's tool call is never denied or delayed.
+    console.warn(`[workled] hook error: ${err && err.message}`);
+  } finally {
+    // Always print an empty JSON object so the hook never blocks or denies.
+    // Do NOT hard-exit while a state send may still be in flight: process.exit
+    // would abort the in-flight HTTP request before the device receives it
+    // (the first call after a fresh process does initialize + tools/list +
+    // tools/call, which exceeds the flush cap). Let the event loop drain — the
+    // pending socket keeps the process alive until the send settles — then exit.
+    process.stdout.write("{}\n");
+    setTimeout(() => process.exit(0), 50).unref();
   }
-  // Always print an empty JSON object so the hook never blocks or denies.
-  process.stdout.write("{}\n");
 }
 
 // ---- status mode (diagnostics) ---------------------------------------------
@@ -1163,7 +1224,7 @@ async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
         params: {
           protocolVersion: "2025-03-26",
           capabilities: {},
-          clientInfo: { name: "workled-status", version: PLUGIN_VERSION },
+          clientInfo: { name: "workled-status", version: SKILL_VERSION },
         },
       }),
       signal: controller.signal,
@@ -1196,7 +1257,7 @@ async function runStatusMode() {
   const entries = [];
   const envUrl = process.env.WORKLED_MCP_URL;
   if (envUrl) {
-    // WORKLED_MED_URL override wins and is reported first.
+    // WORKLED_MCP_URL override wins and is reported first.
     entries.push({ client: "env", path: "WORKLED_MCP_URL", enabled: true, url: envUrl });
   }
   for (const s of loadMcpServers()) {
@@ -1253,7 +1314,7 @@ async function runStatusMode() {
   if (out.clients.some((c) => c.reachable)) {
     out.ok = true;
     out.exitCode = 0;
-    if (bluetooth && !bluetooth.devicePaired) {
+    if (bluetooth && bluetooth.available === true && !bluetooth.devicePaired) {
       const deviceName = bluetooth.deviceName || "the workled device";
       out.hint = `Macro requires Bluetooth. Pair the device as a BLE HID keyboard (device name: ${deviceName}) and ensure it is connected.`;
     } else {
@@ -1265,7 +1326,7 @@ async function runStatusMode() {
   } else if (out.clients.some((c) => !c.url)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
   } else {
-    if (bluetooth && !bluetooth.available) {
+    if (bluetooth && bluetooth.available === false) {
       out.hint = `Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name. Bluetooth is also unavailable: ${bluetooth.error || "no Bluetooth adapter detected"}.`;
     } else {
       out.hint =
@@ -1282,9 +1343,10 @@ if (process.argv[1]) {
   if (isMain) {
     const sub = process.argv[2];
     if (sub === "hook") {
+      // runHookMode never rejects (internal try/catch/finally guarantees a
+      // single "{}" on stdout + status 0); this catch is only a safety net.
       runHookMode().catch((err) => {
         console.warn(`[workled] hook error: ${err && err.message}`);
-        process.stdout.write("{}\n");
       });
     } else if (sub === "status") {
       runStatusMode().catch((err) => {

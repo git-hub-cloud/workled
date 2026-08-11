@@ -1,126 +1,261 @@
 # Macro Format Reference
 
-This document details the macro key sequence format used by the workled device.
+This document details the macro JSON array format used by the workled device.
 
 ## Syntax
 
-Format: Key1+Key2;Key3
-- + = simultaneous keys
-- ; = sequential keystrokes
+A macro is a JSON array of segments. Each segment is an object with **exactly
+one key**: the key names the segment type and the value carries its parameters.
+
+```json
+[
+  {"combo": "ctrl+c"},
+  {"delay": 500},
+  {"text": "Hello World"}
+]
+```
+
+- Scalar types (`combo`, `press`, `release`, `delay`, `text`, `password`) take
+  a plain value (string or number).
+- Multi-field types (`delay_rand`, `mouse_move`, `mouse_scroll`,
+  `mouse_button`) take a nested object.
+- `[]` is a valid empty macro (no-op).
 
 ## Segment Overview
 
-- Key combo like: `a` / `ctrl+shift+a` ...
-- `press` / `release`: hold and release a key combo
-- `delay` / `delay_rand`: wait fixed or random ms
-- `text "..."`: type ASCII text (double quotes required)
-- `password "..."`: type a password stored in encrypted NVS (double quotes required)
-- `mouse_move x y`: relative cursor move
-- `mouse_scroll w [pan]`: wheel scroll
-- `mouse_button left|right|middle click|down|up`: click or hold a mouse button
-- Media keys like `volume_up` / `play_pause` ...
+| type | parameter | description |
+|---|---|---|
+| `combo` | string | press and release a key combo |
+| `press` | string | hold a key combo down |
+| `release` | string | release a held key combo |
+| `delay` | int (ms) | wait a fixed time |
+| `delay_rand` | object `{min, max}` | wait a random time between MIN-MAX ms |
+| `text` | string | type ASCII text |
+| `password` | string | type a password stored in encrypted NVS |
+| `mouse_move` | object `{x, y}` | relative cursor move |
+| `mouse_scroll` | object `{wheel, pan?}` | wheel scroll |
+| `mouse_button` | object `{button, gesture?}` | click or hold a mouse button |
 
-### Key Combo
-Press and release a key combination
-- `a` - press key and release
-- `shift+ctrl+a` - press key and release
+### combo
+
+Press and release a key combination.
+- `{"combo": "a"}` - press key and release
+- `{"combo": "shift+ctrl+a"}` - press key and release
 
 ### press
-Press and hold
-- `press space` - press key and not release
+
+Press and hold.
+- `{"press": "space"}` - press key and not release
 
 ### release
-Release a key
-- `release shift+a; release ctrl+b` - release key
+
+Release a key.
+- `{"release": "shift"}` - release key
+- `{"release": "ctrl+b"}` - release key
 
 ### delay
-Wait N ms
-- `delay 50` - delay ms
+
+Wait N ms (min 20).
+- `{"delay": 50}` - delay 50 ms
 
 ### delay_rand
-Random wait between MIN-MAX ms
-- `delay_rand 100 500` - delay rand ms
+
+Random wait between MIN-MAX ms (min 20, MAX >= MIN).
+- `{"delay_rand": {"min": 100, "max": 500}}` - delay 100-500 ms
 
 ### text
-Type ASCII text. Text MUST be wrapped in double quotes. Escape sequences `\"` and `\\` only; `;` inside double quotes is literal.
 
-- `text "hello"` - quoted text
-- `text "Abc123"` - mixed case digits
-- `text "hello world"` - quoted with spaces
-- `text "hello;world"` - semicolon literal inside quotes
-- `text "hello\\world"` - escaped backslash
-- `text "hello\"world"` - escaped quote
-- `text "a\\\"b"` - double escape (backslash then quote)
-- `text "hello,world!"` - punctuation supported
+Type ASCII text. JSON string escaping handles quotes, backslashes and
+whitespace automatically.
+
+- `{"text": "hello"}` - plain text
+- `{"text": "Abc123"}` - mixed case digits
+- `{"text": "hello world"}` - with spaces
+- `{"text": "hello\"world"}` - escaped quote
+- `{"text": "hello\\world"}` - escaped backslash
+- `{"text": "hello,world!"}` - punctuation supported
 
 ### password
-Type password text. Password MUST be wrapped in double quotes. Escape sequences `\"` and `\\` only; `;` inside double quotes is literal.
-Password is lcoal hardware encrypted, and the stored/queried macro shows `*`. A macro may contain multiple `password` segments;
 
-- `password "Abc123"` - quoted password
-- `password "p@ss w0rd"` - spaces and symbols supported
-- `password "a\\\"b"` - escaped quote inside password
+Type password text. The password is stored in encrypted hardware NVS; the
+stored/queried macro shows `*` of identical length. A macro may contain
+multiple `password` segments.
+
+- `{"password": "Abc123"}` - plain password
+- `{"password": "p@ss w0rd"}` - spaces and symbols supported
 
 ### mouse_move
-Move the mouse cursor by a relative delta. Both x and y are required and must be in -128..127.
-- `mouse_move 30 0` - move right 30 px
-- `mouse_move 0 -40` - move up 40 px
+
+Move the mouse cursor by a relative delta. Both `x` and `y` are required and
+must be in -128..127.
+- `{"mouse_move": {"x": 30, "y": 0}}` - move right 30 px
+- `{"mouse_move": {"x": 0, "y": -40}}` - move up 40 px
 
 ### mouse_scroll
-Scroll the mouse wheel. Wheel is required; optional pan (horizontal) defaults to 0. Both in -128..127.
-- `mouse_scroll -3` - scroll down 3 notches
-- `mouse_scroll 0 3` - pan right
+
+Scroll the mouse wheel. `wheel` is required; `pan` (horizontal) is optional
+and defaults to 0. Both in -128..127.
+- `{"mouse_scroll": {"wheel": -3}}` - scroll down 3 notches
+- `{"mouse_scroll": {"wheel": 0, "pan": 3}}` - pan right
 
 ### mouse_button
-Click or hold a mouse button. Button: left, right, middle. Gesture: click (default), down, up.
-- `mouse_button left click` - left click
-- `mouse_button right click` - right click
-- `mouse_button left down` - press and hold left button
-- `mouse_button left up` - release left button
 
-### Media keys
-Click media keys.
-- `volume_up` - volume up one step
-- `volume_down` - volume down one step
-- `mute` - toggle mute
-- `play_pause` - play or pause media
-- `next_track` - next track
-- `previous_track` - previous track
+Click or hold a mouse button. `button`: left, right, middle. `gesture`:
+click (default), down, up.
+- `{"mouse_button": {"button": "left"}}` - left click
+- `{"mouse_button": {"button": "right", "gesture": "click"}}` - right click
+- `{"mouse_button": {"button": "left", "gesture": "down"}}` - press and hold left button
+- `{"mouse_button": {"button": "left", "gesture": "up"}}` - release left button
 
 ## Key Names (case-insensitive)
 
-Letters: a-z
-Digits: 0-9
-Function: f1-f12
-Navigation: enter, esc, tab, space, backspace, delete, insert, home, end, page_up, page_down
-Arrows: up, down, left, right
-Lock: caps_lock, num_lock, scroll_lock
-System: print_screen, pause, menu
-Media: mute, volume_up, volume_down, play_pause, next_track, previous_track
+### Letters
 
-## Modifiers
+| `a` | `b` | `c` | `d` | `e` | `f` | `g` | `h` | `i` | `j` | `k` | `l` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `m` | `n` | `o` | `p` | `q` | `r` | `s` | `t` | `u` | `v` | `w` | `x` | `y` | `z` |
 
-Control: ctrl, left_ctrl, right_ctrl
-Shift: shift, left_shift, right_shift
-Alt: alt, left_alt, right_alt
-GUI: gui, left_gui, right_gui, command, cmd, meta, win
+### Digits
+
+| `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` |
+|---|---|---|---|---|---|---|---|---|---|
+
+### Function Keys
+
+| `f1` | `f2` | `f3` | `f4` | `f5` | `f6` |
+|---|---|---|---|---|---|
+| `f7` | `f8` | `f9` | `f10` | `f11` | `f12` |
+
+### Navigation
+
+| `enter` | `esc` | `tab` | `space` | `backspace` | `delete` |
+|---|---|---|---|---|---|
+| `insert` | `home` | `end` | `page_up` | `page_down` |
+
+### Arrows
+
+| `up` | `down` | `left` | `right` |
+|---|---|---|---|
+
+### Lock Keys
+
+| `caps_lock` | `num_lock` | `scroll_lock` |
+|---|---|---|
+
+### System Keys
+
+| `print_screen` | `pause` | `menu` |
+|---|---|---|
+
+### Media Keys
+
+| `mute` | `volume_up` | `volume_down` | `play_pause` | `next_track` | `previous_track` |
+|---|---|---|---|---|---|
+
+### Modifier Keys
+
+| Modifier | Aliases |
+|---|---|
+| `ctrl` | `left_ctrl`, `right_ctrl` |
+| `shift` | `left_shift`, `right_shift` |
+| `alt` | `left_alt`, `right_alt` |
+| `gui` | `left_gui`, `right_gui`, `command`, `cmd`, `meta`, `win` |
+
+Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `ctrl+alt+delete`.
 
 ## Examples
 
-- `text "Hello"; delay 500; text "World"` - type with delay
-- `text "Hello"; delay_rand 100 200; text "World"` - type with random delay
-- `press shift; text "abc"; release shift` - type uppercase ABC (external SHIFT)
-- `press shift; text "ABC"; release shift` - type uppercase ABC (SHIFT mask merge, no double shift)
-- `press shift; text "aBc"; release shift` - type uppercase ABC (case ignored while shift held)
-- `press ctrl; text "cv"; release ctrl` - copy and paste
-- `ctrl+c; ctrl+v` - copy and paste
-- `text "Line 1"; enter; text "Line 2"` - multi-line input
-- `text "Tab"; tab; text "After tab"` - using tab key
-- `text "Arrow"; up; down; left; right` - arrow keys
-- `press ctrl; press a; release a; release ctrl` - type ctrl+A (press/release)
-- `volume_up; delay 100; volume_down` - Volume sequence
-- `mouse_button left down; mouse_move 40 10; mouse_move -30 -50; mouse_button left up` - drag left button
-- `mouse_button right click; down; enter` - context menu then confirm
-- `press gui; r; release gui; delay 100; text "notepad"; enter` - Windows open Application notepad
-- `gui+l; delay 1000; enter; password "hello"; enter` - Windows unlock: lock screen, wait for display wake time, then type
-- `ctrl+cmd+q; delay 1000; enter; password "hello"; enter` - Mac unlock: lock screen, wait for display wake time, then type
+### type with delay:
+```json
+[
+  {"text": "Hello"},
+  {"delay": 500},
+  {"text": "World"}
+]
+```
+
+### type with random delay:
+```json
+[
+  {"text": "Hello"},
+  {"delay_rand": {"min": 100, "max": 200}},
+  {"text": "World"}
+]
+```
+
+### type uppercase ABC (external SHIFT):
+```json
+[
+  {"press": "shift"},
+  {"text": "abc"},
+  {"release": "shift"}
+]
+```
+
+### copy and paste:
+```json
+[
+  {"combo": "ctrl+c"},
+  {"combo": "ctrl+v"}
+]
+```
+
+### multi-line input:
+```json
+[
+  {"text": "Line 1"},
+  {"combo": "enter"},
+  {"text": "Line 2"}
+]
+```
+
+### Volume sequence:
+```json
+[
+  {"combo": "volume_up"},
+  {"delay": 100},
+  {"combo": "volume_down"}
+]
+```
+
+### drag with the left button:
+```json
+[
+  {"mouse_button": {"button": "left", "gesture": "down"}},
+  {"mouse_move": {"x": 40, "y": 10}},
+  {"mouse_move": {"x": -30, "y": -50}},
+  {"mouse_button": {"button": "left", "gesture": "up"}}
+]
+```
+
+### Windows: open Application notepad:
+```json
+[
+  {"combo": "gui+r"},
+  {"delay": 100},
+  {"text": "notepad"},
+  {"combo": "enter"}
+]
+```
+
+### Windows unlock: lock screen, wait for display wake time, then type:
+```json
+[
+  {"combo": "gui+l"},
+  {"delay": 1000},
+  {"combo": "enter"},
+  {"password": "hello"},
+  {"combo": "enter"}
+]
+```
+
+### Mac unlock: lock screen, wait for display wake time, then type:
+```json
+[
+  {"combo": "ctrl+cmd+q"},
+  {"delay": 1000},
+  {"combo": "enter"},
+  {"password": "hello"},
+  {"combo": "enter"}
+]
+```

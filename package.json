@@ -1,5 +1,5 @@
 {
     "name":  "workled",
     "type":  "module",
-    "description":  "workled MCP controller core - loaded by opencode, openclaw, pi, and as a CLI hook for agy/hermes"
+    "description":  "workled MCP controller core - drives the device LED state and touch-pad macros via adapters for multiple AI coding clients"
 }

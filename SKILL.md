@@ -1,6 +1,6 @@
 ---
 name: workled
-description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, input, error). Describes workled MCP peripheral tools: set_agent_state (LED indicator), and touch pad macro sequence configuration (single/double click, long press start/hold/up). Use when connected to a workled device via MCP, controlling the LED state indicator, or configuring HID macros."
+description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, input, error). Describes workled MCP peripheral tools: set_agent_state, and touch pad macro sequence configuration. Use when connected to a workled device via MCP, controlling the state indicator, or configuring HID macros."
 ---
 
 # workled MCP Controller
@@ -16,12 +16,17 @@ Call `set_agent_state` via MCP on every state transition:
 | `input` | **Any time the agent is waiting on the user** — calling an input tool (`question`/`ask`/`confirm`), sitting inside a client-side modal (hermes `_confirm_destructive_slash`, etc.), or after rendering a plain-text choice list / multi-option question and waiting for the user's pick |
 | `error` | Runtime error occurred |
 
-**Timing rule** (apply on every turn, in order):
+**Per-turn procedure (execute every turn, in order):**
 
-1. Before rendering options / choices / opening any modal → `set_agent_state("input")`
-2. User responds, next turn starting → `set_agent_state("thinking")` (or let `pre_llm_call` fire)
-3. End of turn, done working, no more output pending → `set_agent_state("idle")`
-4. Runtime error / failed tool call → `set_agent_state("error")`
+1. Turn starting / user message received → `set_agent_state("thinking")` — **first action, before any other tool call**.
+2. Before rendering options / choices / opening any modal / asking a question → `set_agent_state("input")`.
+3. End of turn, work done, no more output pending → `set_agent_state("idle")`.
+4. Runtime error / failed tool call → `set_agent_state("error")`.
+
+**Pre-Reply Gate — check BEFORE emitting your final visible message:**
+- [ ] Did I call `set_agent_state` at least once this turn?
+- [ ] Does the LED state match what I'm about to show (idle if done, input if asking, thinking if still working)?
+- If either is **NO**, emit the correct `set_agent_state` call **first**, then the reply.
 
 ## MCP Tool Reference
 
@@ -31,8 +36,8 @@ Call `set_agent_state` via MCP on every state transition:
 | set_brightness | brightness: string | LED brightness 0-255 | `set_brightness("128")` |
 | set_effect | effect_name: string, effect_json: string | effect_name ∈ `led`(manual effect)/`idle`/`thinking`/`input`/`error`; effect_json is a JSON string `{"type","hue","saturation","value","speed"}`. Map natural-language colors to HSV (see table below). | `set_effect("led", '{"type":"breathe","hue":180,"speed":50}')` |
 | get_effect | effect_name: string | Get effect_name config as JSON | `get_effect("thinking")` |
-| set_macro | macro_name: string, macro_string: string | Set the macro for a touch pad gesture; macro_name ∈ `single_click`/`double_click`/`long_press_start`/`long_press_hold`/`long_press_up`; empty macro_string resets | `set_macro("single_click", "ctrl+c")` |
-| get_macro | macro_name: string | Returns the macro string, or empty string if unset | `get_macro("single_click")` |
+| set_macro | macro_name: string, macro_json: string | Set the macro for a touch pad gesture; macro_name ∈ `single_click`/`double_click`/`long_press_start`; macro_json is a JSON array of segments (see Macro Format); empty macro_json resets | `set_macro("single_click", '[{"combo":"ctrl+c"}]')` |
+| get_macro | macro_name: string | Returns the macro as a JSON array string, or empty string if unset (password values masked) | `get_macro("single_click")` |
 
 ### Mapping natural-language colors to `set_effect`
 
@@ -64,3 +69,8 @@ Full macro reference [macro_format.md](references/macro_format.md)
 If the device is not responding, run `node <skill-dir>/index.js status`
 and follow the JSON `hint` it prints. Full install / deployment /
 troubleshooting reference: [device_setup.md](references/device_setup.md)
+
+## Contributing
+
+- Repository: https://github.com/git-hub-cloud/workled
+- Issues: https://github.com/git-hub-cloud/workled/issues

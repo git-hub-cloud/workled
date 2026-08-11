@@ -69,7 +69,7 @@ After pairing, the device stays connected while in range. If it disconnects, re-
 
 ## Installation & Uninstallation
 
-All clients are installed with `skill-install.mjs`.
+All clients are installed / uninstalled with `skill-install.mjs`.
 
 `index.js` exports adapters, all with the same entry shape `{id,name,description,register}`:
 
@@ -85,15 +85,20 @@ Each client gets a **thin generated entry file** that exposes exactly one adapte
 - pi loads extensions by **default export** → the installed `.ts` does `export default (pi) => piEntry.register(pi)`.
 - openclaw requires a `definePluginEntry`-shaped default export → the installed entry imports the SDK and wraps `openclawEntry`.
 
-### One-click install (all clients)
+### One-click install / uninstall (all clients)
 
-Fully global: every target path is derived from `homedir()`, never from cwd, so the same command runs from any directory on any shell. Every supported client is installed/uninstalled together.
+Fully global: every target path is derived from `homedir()`, never from cwd, so the same command runs from any directory on any shell. Every supported client is handled together once you pass `--client all`.
 
 ```
-node <skill-dir>/skill-install.mjs install      # all clients (opencode, kilo, openclaw, agy, hermes, pi)
-node <skill-dir>/skill-install.mjs uninstall
+node <skill-dir>/skill-install.mjs install --client all        # install to all clients (opencode, kilo, openclaw, agy, hermes, pi, workbuddy)
+node <skill-dir>/skill-install.mjs uninstall --client all       # uninstall from all clients
 node <skill-dir>/skill-install.mjs install --file <any-instruction-file>   # generic clients (reminder only)
 ```
+
+> **Targets are explicit.** Both `install` and `uninstall` without `--client`
+> fail with the client enum (and `all`) and a hint to pass `--client <name>`
+> (your own client) or `--client all`. Omitted never means "all" — that would
+> touch / wipe every client's integration by accident.
 
 What every client's install flow does:
 
@@ -111,6 +116,7 @@ Per-client targets:
 | agy      | `~/.gemini/config/hooks.json` (`workled` key)          | `~/.gemini/AGENTS.md`     | event name read from stdin or `--event` argv |
 | hermes   | `hooks:` block in `<hermes-home>/config.yaml` (shell hooks) | `<hermes-home>/AGENTS.md` | home = `$HERMES_HOME` → `%LOCALAPPDATA%\hermes` (Windows) → `~/.hermes` (unix); YAML config; only workled entries are replaced, user hooks are preserved |
 | pi       | `~/.pi/agent/extensions/workled.ts`                    | `~/.pi/AGENTS.md`         | default-export wraps `piEntry.register` |
+| workbuddy | `~/.workbuddy/mcp.json` (`mcpServers.workled`)         | SKILL.md (loaded by WorkBuddy) | MCP-only; SKILL.md carries the protocol — no hook/plugin/reminder file to manage |
 | generic  | none (reminder only)                                   | any `--file`              | clients not listed use manual `set_agent_state` calls only |
 
 ### Event mapping per client
@@ -134,15 +140,23 @@ Per-client targets:
 
 ## Installing for one client
 
-`skill-install.mjs install` / `uninstall` and `index.js status` accept an
-optional `--client <name>` (opencode, kilo, openclaw, agy,
-hermes, pi); default is **all clients**.
+`skill-install.mjs install` / `uninstall` both **require** an explicit target:
+`--client <name>` (opencode, kilo, openclaw, agy, hermes, pi, workbuddy) for one
+client, or `--client all` for every client. `index.js status` accepts the same
+optional `--client <name>` filter; default is **all clients**.
 
 ```
 node <skill-dir>/skill-install.mjs install --client opencode
 node <skill-dir>/skill-install.mjs uninstall --client opencode
+node <skill-dir>/skill-install.mjs uninstall --client all
 node <skill-dir>/index.js status --client opencode
 ```
+
+> **Agent-facing guidance:** always pass your own client name —
+> `node <skill-dir>/skill-install.mjs install|uninstall --client <your-client>`.
+> A bare `install` / `uninstall` errors with the client enum (opencode, kilo,
+> openclaw, agy, hermes, pi, workbuddy, all); deliberately pass `--client all`
+> only when you intend to apply the operation to every client.
 
 After installing, run `node <skill-dir>/index.js status` and surface the JSON
 `hint` to the user. A `hint` of "No `workled` server configured" means the
@@ -172,7 +186,7 @@ node <skill-dir>/index.js status
 ```
 
 The command scans the MCP config of every client (opencode global and project,
-agy/gemini, openclaw, pi), takes the first server named `workled`
+agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
 (`WORKLED_MCP_URL` override wins), and checks reachability via an MCP
 `initialize` handshake — tools are not probed. Fields:
 
