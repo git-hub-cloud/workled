@@ -96,11 +96,14 @@ export const CLIENT_TARGETS = {
 };
 
 const TOOL_NAME = "set_agent_state";
-const DEFAULT_RPC_TIMEOUT_MS = 5000;
-const DEFAULT_DISCOVERY_TIMEOUT_MS = 5000;
+const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 500;
 const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// Single shared hook timeout budget (milliseconds), used directly by the internal
+// flush cap below. skill-install.mjs converts it to seconds for the host's hook
+// `timeout` in settings.json. This is the one tunable for the whole hook budget.
+export const WORKLED_HOOK_TIMEOUT_MS = 10000;
 
 // Monotonic counter for unique JSON-RPC IDs (batch mode)
 let nextRpcId = 1;
@@ -295,7 +298,7 @@ function getWorkledCandidates(clientPrefix) {
 // `devicePaired` / `deviceName` are workled-specific: they report the workled
 // device (name matches HomeAnt|workled) rather than any HID/keyboard device,
 // so the macro-readiness hint is accurate.
-export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+export async function probeBluetooth(timeoutMs = DEFAULT_TIMEOUT_MS) {
   const result = {
     available: null,
     powered: false,
@@ -575,7 +578,7 @@ function requiresSession(status, text) {
 // Send a JSON-RPC request, stateless-first with a session fallback. Session
 // negotiation is per-url (urlMode) so once a server is known stateless we never
 // pay the initialize round-trip again.
-async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+async function rpc(url, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
   if ((urlMode.get(url) || "stateless") === "stateless") {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -641,7 +644,7 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 }
 
 // Does this server host the tool? Stateless-first, then the session fallback.
-async function hasTool(url, toolName, timeoutMs = DEFAULT_DISCOVERY_TIMEOUT_MS) {
+async function hasTool(url, toolName, timeoutMs = DEFAULT_TIMEOUT_MS) {
   if ((urlMode.get(url) || "stateless") === "stateless") {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1134,11 +1137,6 @@ function resolveHookState(event, payload) {
   return target;
 }
 
-// Single shared hook timeout budget (milliseconds), used directly by the internal
-// flush cap below. skill-install.mjs converts it to seconds for the host's hook
-// `timeout` in settings.json. This is the one tunable for the whole hook budget.
-export const WORKLED_HOOK_TIMEOUT_MS = 10000;
-
 async function runHookMode() {
   try {
     const argv = process.argv.slice(2);
@@ -1207,7 +1205,7 @@ async function runHookMode() {
 
 // Reachability probe: a bare MCP initialize handshake. Unlike ensureSession it
 // does not require a session id, so it reports HTTP-level reachability only.
-async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+async function probeReachable(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
