@@ -78,38 +78,60 @@ export const MCP_SOURCES = [
 // matching install/uninstall branch in skill-install.mjs + SKILL.md.
 export const CLIENTS = [...new Set(MCP_SOURCES.map((s) => s.client.split(".")[0]))];
 
-// Per-client install target summary shown by `skill-install.mjs --help`.
-// Free-form help text (not derivable from MCP_SOURCES), kept here so all
-// client knowledge lives in one file. Keys must match CLIENTS; the `default`
-// key is the fallback used by --help for any client not explicitly listed.
+// Per-client install targets — the single source of truth for where each
+// client's workled integration lives. skill-install.mjs derives both the
+// `--help` text and the plugin-file install logic from it, so a client's
+// paths are maintained exactly once. Keys match CLIENTS (itself derived from
+// MCP_SOURCES); `default` is the fallback used by --help.
+//
+//   plugin clients (opencode/kilo/pi): carry `dest` + `agents` + `label`;
+//     install = write generated entry file to dest + AGENTS.md reminder.
+//   other clients: carry only free-form `help` text (their install logic is
+//     bespoke and lives in skill-install.mjs).
 export const CLIENT_TARGETS = {
-  opencode: "plugin -> ~/.config/opencode/plugins/workled.js  + reminder in AGENTS.md",
-  kilo: "plugin -> ~/.config/kilo/plugin/workled.js       + reminder in AGENTS.md",
-  openclaw:
-    "entry  -> ~/.openclaw/plugins/workled/ + openclaw.plugin.json + openclaw.json (load.paths + entries) + reminder in AGENTS.md",
-  agy: "hooks  -> ~/.gemini/config/hooks.json            + reminder in AGENTS.md",
-  hermes:
-    "hooks  -> <hermes-home>/config.yaml (~/.hermes on unix, %LOCALAPPDATA%\\hermes on Windows) + reminder in AGENTS.md",
-  pi: "entry  -> ~/.pi/agent/extensions/workled.ts      + reminder in AGENTS.md",
-  workbuddy: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
-  default: "installed (targets: see SKILL.md)",
+  opencode: {
+    label: "plugin",
+    dest: () => join(HOME, ".config", "opencode", "plugins", "workled.js"),
+    agents: () => join(HOME, ".config", "opencode", "AGENTS.md"),
+  },
+  kilo: {
+    label: "plugin",
+    dest: () => join(HOME, ".config", "kilo", "plugin", "workled.js"),
+    agents: () => join(HOME, ".config", "kilo", "AGENTS.md"),
+  },
+  openclaw: {
+    help: "entry  -> ~/.openclaw/plugins/workled/ + openclaw.plugin.json + openclaw.json (load.paths + entries) + reminder in AGENTS.md",
+  },
+  agy: {
+    help: "hooks  -> ~/.gemini/config/hooks.json            + reminder in AGENTS.md",
+  },
+  hermes: {
+    help: "hooks  -> <hermes-home>/config.yaml (~/.hermes on unix, %LOCALAPPDATA%\\hermes on Windows) + reminder in AGENTS.md",
+  },
+  pi: {
+    label: "extension",
+    dest: () => join(HOME, ".pi", "agent", "extensions", "workled.ts"),
+    agents: () => join(HOME, ".pi", "AGENTS.md"),
+  },
+  workbuddy: {
+    help: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
+  },
+  default: {
+    help: "installed (targets: see SKILL.md)",
+  },
 };
 
-const TOOL_NAME = "set_agent_state";
-const DEFAULT_TIMEOUT_MS = 5000;
+const DEFAULT_RPC_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAY_MS = 500;
 const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
-// Single shared hook timeout budget (milliseconds), used directly by the internal
-// flush cap below. skill-install.mjs converts it to seconds for the host's hook
-// `timeout` in settings.json. This is the one tunable for the whole hook budget.
-export const WORKLED_HOOK_TIMEOUT_MS = 10000;
 
-// Monotonic counter for unique JSON-RPC IDs (batch mode)
+// Monotonic counter for JSON-RPC request ids. JSON-RPC 2.0 requires a valid
+// id on every request (the server echoes it back and rejects a missing or
+// null id with -32600), and the firmware rejects duplicate ids within a
+// session, so keep ids unique per process even though requests are currently
+// single-flight and stateless.
 let nextRpcId = 1;
-function nextRpcIdFn() {
-  return nextRpcId++;
-}
 
 function getInputTools() {
   return (process.env.WORKLED_INPUT_TOOLS || "question")
@@ -155,22 +177,6 @@ const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 let cachedCandidates = null;
 let candidatesExpiry = 0;
 const CANDIDATES_TTL_MS = 60 * 1000; // 1 minute
-
-// Session cache for connection reuse (lightweight: one initialize per process,
-// then reuse the session id until it expires, avoiding a new session per call).
-let cachedSessionId = null;
-let cachedUrl = null;
-let sessionExpiry = 0;
-const SESSION_TTL_MS = 5 * 60 * 1000; // 5 minutes
-
-// Mutex to prevent concurrent initialize (race when several calls detect an expired cache)
-let initLock = Promise.resolve();
-
-function withInitLock(fn) {
-  const p = initLock.then(fn);
-  initLock = p.catch(() => {}); // never reject the lock chain
-  return p;
-}
 
 // Minimal YAML reader for the `mcp_servers:` block in hermes config.yaml.
 // Top-level `mcp_servers:` then `  <name>:` then `    key: value` scalars;
@@ -255,14 +261,6 @@ function loadMcpServers() {
   return servers;
 }
 
-function loadMcpConfig() {
-  const merged = {};
-  for (const s of loadMcpServers()) {
-    merged[s.name] = s.server;
-  }
-  return merged;
-}
-
 function getWorkledCandidates(clientPrefix) {
   const now = Date.now();
   if (cachedCandidates && now < candidatesExpiry) {
@@ -298,7 +296,7 @@ function getWorkledCandidates(clientPrefix) {
 // `devicePaired` / `deviceName` are workled-specific: they report the workled
 // device (name matches HomeAnt|workled) rather than any HID/keyboard device,
 // so the macro-readiness hint is accurate.
-export async function probeBluetooth(timeoutMs = DEFAULT_TIMEOUT_MS) {
+export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const result = {
     available: null,
     powered: false,
@@ -433,11 +431,20 @@ export async function probeBluetooth(timeoutMs = DEFAULT_TIMEOUT_MS) {
   return result;
 }
 
-// Helper: extract JSON object or array from response text
+// Parse a JSON-RPC response body. Accepts a plain JSON object/array (stateless
+// JSON transport) or an SSE stream (`data:` lines). On failure it throws with
+// the offending snippet so rpc()/probeReachable surface a diagnosable error
+// instead of a raw JSON.parse exception.
 function extractJson(text) {
-  const trimmed = text.trim();
-  // Direct JSON object
-  if (trimmed.startsWith("{")) return JSON.parse(trimmed);
+  const trimmed = (text || "").trim();
+  // Direct JSON object/array
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      throw new Error(`Invalid JSON: ${trimmed.substring(0, 100)}`);
+    }
+  }
   // SSE data lines
   const data = trimmed
     .split("\n")
@@ -445,95 +452,12 @@ function extractJson(text) {
     .map((l) => l.slice(5).trim())
     .join("");
   if (!data) throw new Error("No JSON data found in response");
-  // Try object first, then array (batch mode)
   try {
     return JSON.parse(data);
   } catch {
-    // Not valid JSON
     throw new Error(`Invalid JSON: ${data.substring(0, 100)}`);
   }
 }
-
-// Initialize an MCP session (handshake + initialized notification) and return
-// the session id. Shared by ensureSession and hasTool so the two never diverge.
-async function initializeSession(url, signal, clientInfoName = "workled") {
-  const initRes = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "application/json, text/event-stream",
-    },
-    signal,
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: nextRpcIdFn(),
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: clientInfoName, version: SKILL_VERSION },
-      },
-    }),
-  });
-  await initRes.arrayBuffer();
-  const sid = initRes.headers.get("mcp-session-id");
-  if (!sid) throw new Error("No session ID from initialize");
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Mcp-Session-Id": sid,
-      },
-      signal,
-      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-    });
-  } catch {
-    // best effort; some servers don't require this
-  }
-  return sid;
-}
-
-// Does the server know our session? (guarded by initLock for concurrent initialize)
-async function ensureSession(url, signal) {
-  const now = Date.now();
-  if (cachedUrl === url && cachedSessionId && now < sessionExpiry) {
-    return cachedSessionId;
-  }
-  // Invalidate stale cache for this url before re-initializing
-  if (cachedUrl === url) {
-    cachedSessionId = null;
-    cachedUrl = null;
-    sessionExpiry = 0;
-  }
-
-  await withInitLock(async () => {
-    // Double-check after acquiring the lock (another caller may have initialized)
-    const now2 = Date.now();
-    if (cachedUrl === url && cachedSessionId && now2 < sessionExpiry) {
-      return;
-    }
-    const sid = await initializeSession(url, signal, "workled");
-    if (sid) {
-      cachedSessionId = sid;
-      cachedUrl = url;
-      sessionExpiry = now2 + SESSION_TTL_MS;
-    }
-  });
-
-  if (!cachedSessionId) {
-    throw new Error(`MCP initialize did not return a session id: ${url}`);
-  }
-  return cachedSessionId;
-}
-
-// JSON-RPC error codes that signal a server requires (or lost) a session.
-const SESSION_REQUIRED_CODES = new Set([-32005, -32006, -32020]);
-// Per-URL negotiated transport mode: "stateless" (default) or "session".
-// We prefer the stateless mode from the 2026-07-28 spec: never keep/mirror a
-// session id. If a server rejects a sessionless request, we fall back to a
-// classic session (initialize + Mcp-Session-Id) for that URL and remember it.
-const urlMode = new Map();
 
 // POST a single JSON-RPC request without any session header.
 async function postJson(url, method, params, controller, extraHeaders = {}) {
@@ -545,149 +469,30 @@ async function postJson(url, method, params, controller, extraHeaders = {}) {
       ...extraHeaders,
     },
     signal: controller.signal,
-    body: JSON.stringify({ jsonrpc: "2.0", id: nextRpcIdFn(), method, params }),
+    body: JSON.stringify({ jsonrpc: "2.0", id: nextRpcId++, method, params }),
   });
   return { status: res.status, headers: res.headers, text: await res.text() };
 }
 
-// Does this response mean "this server requires a session id"? A standalone
-// sessionless request is refused with HTTP 400 (spec) or a JSON-RPC error in
-// the session codes above. Some servers (e.g. this workled device) instead
-// answer 200 with a -32600 "initialize must be first interaction" error, which
-// also means we must start a session first.
-function requiresSession(status, text) {
-  // Any HTTP error status: the server refused the sessionless request, so we
-  // must fall back to a real session (initialize + Mcp-Session-Id). This
-  // covers every non-2xx response (405/500/...), not just the classic ones.
-  if (status >= 400) return true;
-  try {
-    const out = JSON.parse(text);
-    const code = out && out.error && out.error.code;
-    if (SESSION_REQUIRED_CODES.has(code)) return true;
-    // -32600 is JSON-RPC "Invalid Request". For a stateless-first MCP server it
-    // always means "initialize must be first interaction", regardless of the
-    // human-readable message (the standard text "Invalid Request" carries no
-    // initialize/session keyword, so it must not gate the fallback).
-    if (code === -32600) return true;
-  } catch {
-    // not JSON; only the HTTP status above can signal a session requirement
-  }
-  return false;
-}
-
-// Send a JSON-RPC request, stateless-first with a session fallback. Session
-// negotiation is per-url (urlMode) so once a server is known stateless we never
-// pay the initialize round-trip again.
-async function rpc(url, method, params, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  if ((urlMode.get(url) || "stateless") === "stateless") {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const { status, text } = await postJson(url, method, params, controller);
-      if (requiresSession(status, text)) {
-        // Fall through: re-issue via the session transport below.
-        urlMode.set(url, "session");
-      } else {
-        return extractJson(text);
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Session fallback (or forced session transport for this url).
-  const maxAuthRetries = 1;
-  for (let authAttempt = 0; authAttempt <= maxAuthRetries; authAttempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const sessionId = await ensureSession(url, controller.signal);
-      const headers = {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "Mcp-Session-Id": sessionId,
-      };
-      const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: nextRpcIdFn(),
-          method,
-          params,
-        }),
-        signal: controller.signal,
-      });
-
-      // Session expired / unauthorized: drop the cached session and retry once.
-      if (res.status === 401 || res.status === 403) {
-        cachedSessionId = null;
-        cachedUrl = null;
-        sessionExpiry = 0;
-        if (authAttempt < maxAuthRetries) {
-          continue;
-        }
-        throw new Error(`MCP session auth failed (${res.status}): ${url}`);
-      }
-
-      const text = await res.text();
-      return extractJson(text);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  // The auth-retry loop above always returns or throws, so this is a safety
-  // net rather than a reachable path. Throw instead of returning null so a
-  // future regression surfaces instead of silently reporting success.
-  throw new Error("workled rpc: session fallback exited without a result");
-}
-
-// Does this server host the tool? Stateless-first, then the session fallback.
-async function hasTool(url, toolName, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  if ((urlMode.get(url) || "stateless") === "stateless") {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const { status, text } = await postJson(url, "tools/list", {}, controller);
-      if (requiresSession(status, text)) {
-        urlMode.set(url, "session");
-      } else {
-        const out = extractJson(text);
-        const tools = (out.result && out.result.tools) || [];
-        return tools.some((t) => t.name === toolName);
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // Session fallback: initialize first (shared helper), then tools/list.
+// Send a JSON-RPC request, stateless-only. The device server runs with
+// stateless support (MCP 2026-07-28+ / bare requests without a version header
+// are served without a session), so there is no session fallback: a JSON-RPC
+// error in the response is surfaced as an exception for the caller's retry
+// logic. The error message carries the firmware's `data.reason` (e.g.
+// "initialize must be first interaction") so status output is self-explanatory.
+async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const sessionId = await initializeSession(url, controller.signal, "workled-discover");
-
-    // Call tools/list with session ID
-    const listRes = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "Mcp-Session-Id": sessionId,
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: nextRpcIdFn(),
-        method: "tools/list",
-        params: {},
-      }),
-    });
-    const text = await listRes.text();
+    const { status, text } = await postJson(url, method, params, controller);
     const out = extractJson(text);
-    const tools = (out.result && out.result.tools) || [];
-    return tools.some((t) => t.name === toolName);
+    if (out && out.error) {
+      const detail = out.error.data && (out.error.data.reason || out.error.data.method);
+      throw new Error(
+        `workled rpc: JSON-RPC error ${out.error.code}: ${out.error.message}${detail ? ` (${detail})` : ""} (HTTP ${status})`
+      );
+    }
+    return out;
   } finally {
     clearTimeout(timer);
   }
@@ -699,23 +504,12 @@ async function discoverWorkledUrl(clientPrefix) {
   const candidates = getWorkledCandidates(clientPrefix);
   if (candidates.length === 0) return null;
 
-  // Concurrent discovery with Promise.allSettled
-  const results = await Promise.allSettled(
-    candidates.map(async (c) => {
-      const ok = await hasTool(c.url, TOOL_NAME);
-      if (ok) return c.url;
-      throw new Error("Tool not found");
-    })
-  );
-
-  for (const res of results) {
-    if (res.status === "fulfilled" && res.value) {
-      workledUrl = res.value;
-      workledUrlExpiry = Date.now() + WORKLED_URL_TTL_MS;
-      return res.value;
-    }
-  }
-  return null;
+  // Single-candidate mode: return the first configured URL directly, without
+  // any probe (the server is stateless).
+  const url = candidates[0].url;
+  workledUrl = url;
+  workledUrlExpiry = Date.now() + WORKLED_URL_TTL_MS;
+  return url;
 }
 
 let pendingState = null;
@@ -727,6 +521,15 @@ const flushPromises = [];
 // a failed send must NOT be recorded here, or an identical later request would
 // be suppressed and the LED would stay stuck on the wrong state.
 let lastSentState = null;
+
+// Settle every pending flush promise (used by sendLoop when a state's send
+// completes or the sender loop exits).
+function resolveFlushPromises(result) {
+  while (flushPromises.length > 0) flushPromises.shift().resolve(result);
+}
+function rejectFlushPromises(err) {
+  while (flushPromises.length > 0) flushPromises.shift().reject(err);
+}
 
 async function sendLoop() {
   try {
@@ -744,10 +547,7 @@ async function sendLoop() {
       if (!url) {
         lastErr = new Error("MCP URL not configured or not discovered");
         const result = { state, sent, error: lastErr, superseded: false };
-        while (flushPromises.length > 0) {
-          const { resolve } = flushPromises.shift();
-          resolve(result);
-        }
+        resolveFlushPromises(result);
         console.warn(`[workled] setAgentState(${state}) skipped: no MCP URL available`);
         continue;
       }
@@ -760,7 +560,7 @@ async function sendLoop() {
           break;
         }
         try {
-          await rpc(url, "tools/call", { name: TOOL_NAME, arguments: { state_name: state } });
+          await rpc(url, "tools/call", { name: "set_agent_state", arguments: { state_name: state } });
           lastErr = null;
           sent = true;
           lastSentState = state;
@@ -774,10 +574,7 @@ async function sendLoop() {
       }
       // Resolve any waiting flush promises for this state
       const result = { state, sent, error: lastErr, superseded };
-      while (flushPromises.length > 0) {
-        const { resolve } = flushPromises.shift();
-        resolve(result);
-      }
+      resolveFlushPromises(result);
       if (lastErr) {
         // give up on this state; no resend later
         console.warn(`[workled] setAgentState(${state}) failed after ${maxAttempts} attempts: ${lastErr.message || lastErr}`);
@@ -786,10 +583,7 @@ async function sendLoop() {
   } finally {
     senderRunning = false;
     // Reject any remaining flush promises if sender exits unexpectedly
-    while (flushPromises.length > 0) {
-      const { reject } = flushPromises.shift();
-      reject(new Error("Sender loop exited unexpectedly"));
-    }
+    rejectFlushPromises(new Error("Sender loop exited unexpectedly"));
   }
 }
 
@@ -813,6 +607,7 @@ function setAgentState(state) {
 // not exit before the MCP call completes. Timeout after 15s to avoid hanging
 // the process if the sender loop is stuck.
 // Returns a promise that resolves with { state, sent, error } for the last state.
+const FLUSH_TIMEOUT_MS = 15000; // must exceed WORKLED_HOOK_TIMEOUT_MS so the host's hook budget never truncates an in-flight send
 async function flushState() {
   // If nothing pending and not running, return immediately
   if (pendingState === null && !senderRunning) {
@@ -823,8 +618,8 @@ async function flushState() {
   // soon as flush settles so short-lived hook processes do not linger.
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error("flushState timeout after 15s")),
-      15000
+      () => reject(new Error(`flushState timeout after ${FLUSH_TIMEOUT_MS}ms`)),
+      FLUSH_TIMEOUT_MS
     );
     flushPromises.push({
       resolve: (result) => {
@@ -845,6 +640,17 @@ function getUserMessage(event) {
   const msg = props.info || {};
   if (msg.role !== "user") return null;
   return msg;
+}
+
+// Register a seen user-message id and opportunistically clear the dedup set
+// when it grows too large or goes stale. Shared by the opencode and openclaw
+// adapters so per-turn "thinking" is only triggered once per message.
+function markSeenMessage(id) {
+  seenUserMessages.add(id);
+  if (seenUserMessages.size > 200 || Date.now() - seenMessagesCleanedAt > SEEN_MESSAGES_CLEANUP_INTERVAL_MS) {
+    seenUserMessages.clear();
+    seenMessagesCleanedAt = Date.now();
+  }
 }
 
 // ---- opencode adapter --------------------------------------------------------
@@ -910,11 +716,7 @@ export const opencodeEntry = {
           if (!msg) return;
           const id = msg.id || JSON.stringify(msg);
           if (seenUserMessages.has(id)) return;
-          seenUserMessages.add(id);
-          if (seenUserMessages.size > 200 || Date.now() - seenMessagesCleanedAt > SEEN_MESSAGES_CLEANUP_INTERVAL_MS) {
-            seenUserMessages.clear();
-            seenMessagesCleanedAt = Date.now();
-          }
+          markSeenMessage(id);
           setAgentState("thinking");
         } catch (err) {
           // Never block the user workflow; device unreachable is skipped gracefully.
@@ -960,11 +762,7 @@ export const openclawEntry = {
       try {
         const id = event.messageId || JSON.stringify(event);
         if (seenUserMessages.has(id)) return;
-        seenUserMessages.add(id);
-        if (seenUserMessages.size > 200 || Date.now() - seenMessagesCleanedAt > SEEN_MESSAGES_CLEANUP_INTERVAL_MS) {
-          seenUserMessages.clear();
-          seenMessagesCleanedAt = Date.now();
-        }
+        markSeenMessage(id);
         setAgentState("thinking");
       } catch (err) {
         console.warn(`[workled] before_agent_run hook error: ${err && err.message}`);
@@ -1137,6 +935,11 @@ function resolveHookState(event, payload) {
   return target;
 }
 
+// Single shared hook timeout budget (milliseconds), used directly by the internal
+// flush cap below. skill-install.mjs converts it to seconds for the host's hook
+// `timeout` in settings.json. This is the one tunable for the whole hook budget.
+export const WORKLED_HOOK_TIMEOUT_MS = 10000;
+
 async function runHookMode() {
   try {
     const argv = process.argv.slice(2);
@@ -1193,8 +996,9 @@ async function runHookMode() {
     // Always print an empty JSON object so the hook never blocks or denies.
     // Do NOT hard-exit while a state send may still be in flight: process.exit
     // would abort the in-flight HTTP request before the device receives it
-    // (the first call after a fresh process does initialize + tools/list +
-    // tools/call, which exceeds the flush cap). Let the event loop drain — the
+    // (the first call after a fresh process is a single stateless
+    // tools/call, which still exceeds the flush cap because of node startup
+    // latency). Let the event loop drain — the
     // pending socket keeps the process alive until the send settles — then exit.
     process.stdout.write("{}\n");
     setTimeout(() => process.exit(0), 50).unref();
@@ -1203,41 +1007,37 @@ async function runHookMode() {
 
 // ---- status mode (diagnostics) ---------------------------------------------
 
-// Reachability probe: a bare MCP initialize handshake. Unlike ensureSession it
-// does not require a session id, so it reports HTTP-level reachability only.
-async function probeReachable(url, timeoutMs = DEFAULT_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: nextRpcIdFn(),
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-03-26",
-          capabilities: {},
-          clientInfo: { name: "workled-status", version: SKILL_VERSION },
-        },
-      }),
-      signal: controller.signal,
-    });
-    if (res.ok) return { reachable: true, error: null };
-    return { reachable: false, error: `HTTP ${res.status}` };
-  } catch (err) {
-    return { reachable: false, error: (err && err.message) || String(err) };
-  } finally {
-    clearTimeout(timer);
+// Reachability probe: a bare stateless tools/call to get_agent_state. No
+// initialize handshake or session needed (the server serves stateless
+// requests), and it also verifies the endpoint is really a workled server:
+// only workled knows the get_agent_state tool. Reuses rpc() so error handling
+// stays in one place; any throw (HTTP/JSON-RPC/network) means unreachable.
+// Retries DEFAULT_MAX_ATTEMPTS times with backoff and reports which attempt
+// succeeded so `status` can distinguish a flaky-but-working link from a dead
+// one.
+async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= DEFAULT_MAX_ATTEMPTS; attempt++) {
+    try {
+      await rpc(url, "tools/call", { name: "get_agent_state", arguments: {} }, timeoutMs);
+      return { reachable: true, error: null, attempt };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < DEFAULT_MAX_ATTEMPTS) {
+        await sleepWithJitter(DEFAULT_RETRY_DELAY_MS, attempt - 1);
+      }
+    }
   }
+  return {
+    reachable: false,
+    error: (lastErr && lastErr.message) || String(lastErr),
+    attempt: DEFAULT_MAX_ATTEMPTS,
+  };
 }
 
 // status: scan every client config source, keep only sources declaring a
-// `workled` server, and probe each unique URL with an initialize handshake.
+// `workled` server, and probe each unique URL with a bare stateless
+// tools/call.
 // `clients` is omitted entirely when no workled server is configured.
 async function runStatusMode() {
   const out = { hint: "", ok: false, exitCode: 1 };
@@ -1306,6 +1106,8 @@ async function runStatusMode() {
       reachable: !!(probe && probe.reachable),
     };
     if (probe && probe.error) entry.error = probe.error;
+    // Which attempt (1-based) succeeded, or how many were tried when failing.
+    if (probe && probe.attempt) entry.attempt = probe.attempt;
     return entry;
   });
 
@@ -1317,7 +1119,7 @@ async function runStatusMode() {
       out.hint = `Macro requires Bluetooth. Pair the device as a BLE HID keyboard (device name: ${deviceName}) and ensure it is connected.`;
     } else {
       out.hint =
-        'workled server reachable. If the LED stays off, run set_brightness("128") or use the device switch.';
+        'workled server reachable. If the LED stays off, run set_brightness(128) or use the device switch.';
     }
   } else if (out.clients.some((c) => c.enabled === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";

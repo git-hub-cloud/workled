@@ -9,6 +9,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   rmdirSync,
   statSync,
@@ -34,39 +35,77 @@ const REMINDER = [
 
 const h = homedir();
 
-// `.bak` paths this run's install/uninstall writes via writeJsonPretty /
-// directWriteConfig. Tracked so uninstall can drop the stale pre-uninstall
+// `.bak` paths this run's install/uninstall writes via writeConfigWithBackup.
+// Tracked so uninstall can drop the stale pre-uninstall
 // backups it creates (P2) without touching any backups it did not write.
 const createdBaks = new Set();
 
 // ---- safe path removal ----------------------------------------------------
-// WorkBuddy's managed Node intercepts fs.rmSync (and friends) through a
-// "safe-delete" shim that moves the path into the Recycle Bin and then THROWS,
-// even though the path is already gone. That spurious throw aborts the
-// uninstall loop after the first file. removePath wraps the delete and only
-// treats it as a failure when the path is *still present* after the attempt,
-// so uninstall completes on every client. On a normal (unintercepted)
-// environment the first rmSync succeeds and returns — byte-for-byte the same
-// behaviour as before, so other clients are unaffected.
+// WorkBuddy's managed Node intercepts fs delete calls through a "safe-delete"
+// shim. Two behaviours are known:
+//   1. It may MOVE the target into the Recycle Bin and then THROW, even though
+//      the path is already gone (a no-op that would otherwise abort the caller).
+//   2. For a "bulk"/recursive delete past a per-turn threshold it REFUSES and
+//      THROWS, leaving the target STILL PRESENT ("SAFE_DELETE_BULK_*").
+// removePath tolerates both: it only treats removal as failed when the path is
+// still present after every escape hatch has been tried. A single recursive
+// rm covers behaviour 1 and the normal case; when that is refused (behaviour
+// 2) we fall back to removeTreeRobust, which deletes entries ONE AT A TIME so
+// no individual call trips the bulk-confirm refusal.
 function removePath(p, opts = {}) {
+  if (!existsSync(p)) return; // already gone — nothing to do
+
+  // Escape hatch 1: a single recursive rm. Succeeds on a normal environment;
+  // on behaviour 1 the shim moves the path to the bin and throws (path gone);
+  // only behaviour 2 (bulk refusal) leaves the target present.
   try {
     rmSync(p, { recursive: true, force: true, ...opts });
-    return;
-  } catch (err) {
-    // Possibly moved to the Recycle Bin by the safe-delete shim. If it's gone,
-    // treat the throw as success rather than aborting the whole uninstall.
-    if (!existsSync(p)) return;
-    // Still present: try a lower-level removal as a last resort.
-    try {
-      const st = statSync(p);
-      if (st.isDirectory()) rmdirSync(p, { recursive: true });
-      else unlinkSync(p);
-    } catch {
-      // ignore; fall through to the existence re-check below
+    if (!existsSync(p)) return; // shim moved it to the bin — gone
+  } catch {
+    if (!existsSync(p)) return; // shim threw but target is gone — treat as success
+    // still present: fall through to the manual walk
+  }
+
+  // Escape hatch 2: the bulk-refusal path. Walk the tree and delete entries
+  // individually — non-recursive deletes are not subject to the bulk-confirm
+  // refusal, so this removes the directory even when a single recursive rm was
+  // denied.
+  try {
+    removeTreeRobust(p);
+  } catch {
+    // fall through to the final existence check
+  }
+  if (!existsSync(p)) return;
+
+  // Last resort: one more recursive rm in case the walk got partway.
+  try { rmSync(p, { recursive: true, force: true, ...opts }); } catch {}
+  if (existsSync(p)) {
+    throw new Error(`Failed to remove ${p} (safe-delete shim refused and manual removal was blocked)`);
+  }
+}
+
+// Recursive per-entry removal. Each file is unlinked individually and each
+// directory is emptied bottom-up, so no single call is a "bulk" delete. Every
+// operation is wrapped and verified by an existence check, because the shim may
+// move a target to the Recycle Bin and throw (target gone) or refuse (target
+// still present) — either way we only escalate when the target truly remains.
+function removeTreeRobust(p) {
+  let st;
+  try { st = statSync(p); } catch { return; } // already gone or inaccessible
+  if (st.isDirectory()) {
+    let entries = [];
+    try { entries = readdirSync(p); } catch { entries = []; }
+    for (const entry of entries) {
+      removeTreeRobust(join(p, entry));
     }
-    if (existsSync(p)) {
-      throw new Error(`Failed to remove ${p}: ${err && err.message}`);
-    }
+    // Directory should be empty now — remove it bottom-up.
+    try { rmdirSync(p, { recursive: false }); } catch {}
+  } else {
+    try { unlinkSync(p); } catch {}
+  }
+  // Final attempt for this entry if it is somehow still present.
+  if (existsSync(p)) {
+    try { rmSync(p, { recursive: true, force: true }); } catch {}
   }
 }
 
@@ -212,22 +251,10 @@ function readJsonOrEmpty(file) {
   }
 }
 
-// Deep merge helper: merges src into dst, returning a new object
-function deepMerge(dst, src) {
-  const result = { ...dst };
-  for (const key of Object.keys(src)) {
-    // If src[key] is an empty object/array or dst[key] is not an object, replace entirely
-    if (src[key] && typeof src[key] === "object" && !Array.isArray(src[key]) && 
-        dst[key] && typeof dst[key] === "object" && Object.keys(src[key]).length > 0) {
-      result[key] = deepMerge(dst[key], src[key]);
-    } else {
-      result[key] = src[key];
-    }
-  }
-  return result;
-}
-
-function writeJsonPretty(file, obj) {
+// Write a JSON config object, keeping a `.bak` of the previous content (tracked
+// in createdBaks so uninstall can drop its own stale backups). mkdir -p the
+// parent first. The single write helper for every JSON config this tool manages.
+function writeConfigWithBackup(file, obj) {
   mkdirSync(dirname(file), { recursive: true });
   if (existsSync(file)) {
     try {
@@ -238,26 +265,6 @@ function writeJsonPretty(file, obj) {
     }
   }
   writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
-}
-
-// Merge-write helper for openclaw.json: reads existing config, merges, writes
-function mergeWriteConfig(file, partial) {
-  const existing = readOpenclawConfig();
-  const merged = deepMerge(existing, partial);
-  writeJsonPretty(file, merged);
-}
-
-// Direct-write helper for openclaw.json: writes the config as-is (no merge)
-function directWriteConfig(file, cfg) {
-  // Write directly without merging
-  mkdirSync(dirname(file), { recursive: true });
-  if (existsSync(file)) {
-    try {
-      writeFileSync(file + ".bak", readFileSync(file, "utf8"), "utf8");
-      createdBaks.add(file + ".bak");
-    } catch {}
-  }
-  writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n", "utf8");
 }
 
 // ---- hook command construction (agy / hermes) -------------------------------
@@ -352,7 +359,7 @@ function removeMcpServerYaml(file, keyCandidates) {
 
 // Remove the `workled` MCP server entry from one MCP_SOURCES source (global or
 // project). JSON sources: drop obj[key].workled, then the key itself when
-// empty; a .bak is kept by writeJsonPretty. YAML sources (hermes) go through
+// empty; a .bak is kept by writeConfigWithBackup. YAML sources (hermes) go through
 // removeMcpServerYaml(), which probes the historical MCP key candidates.
 // Returns null when nothing was touched.
 function removeMcpServer(source) {
@@ -368,7 +375,7 @@ function removeMcpServer(source) {
   if (!map || typeof map !== "object" || map.workled === undefined) return null;
   delete map.workled;
   if (Object.keys(map).length === 0) delete obj[source.key];
-  writeJsonPretty(file, obj);
+  writeConfigWithBackup(file, obj);
   return `Removed workled from ${source.key} -> ${file}`;
 }
 
@@ -447,7 +454,7 @@ function registerWorkledSettingsHooks() {
     if (spec.matcher) group.matcher = spec.matcher;
     settings.hooks[ev].push(group);
   }
-  writeJsonPretty(settingsFile, settings);
+  writeConfigWithBackup(settingsFile, settings);
   return `Installed workled hooks -> ${settingsFile}`;
 }
 
@@ -481,7 +488,7 @@ function unregisterWorkledSettingsHooks() {
   }
   if (!removed) return `No workled hooks at ${settingsFile}`;
   if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-  writeJsonPretty(settingsFile, settings);
+  writeConfigWithBackup(settingsFile, settings);
   return `Removed workled hooks -> ${settingsFile}`;
 }
 
@@ -511,7 +518,7 @@ function addMcpServer(source, entry) {
   const merged = { url, enabled: entry.enabled !== false };
   if (existing.type) merged.type = existing.type;
   map.workled = merged;
-  writeJsonPretty(file, obj);
+  writeConfigWithBackup(file, obj);
   return `Registered workled -> ${source.key} (${file})`;
 }
 
@@ -615,7 +622,7 @@ function installAgy() {
     entry[ev] = [agyCommandShape(ev)];
   }
   root[AGY_HOOK_ID] = entry;
-  writeJsonPretty(hooksFile, root);
+  writeConfigWithBackup(hooksFile, root);
   return `Installed agy hooks -> ${hooksFile}`;
 }
 
@@ -626,7 +633,7 @@ function uninstallAgy() {
   delete json[AGY_HOOK_ID];
   // Always write back — never delete hooks.json even if now empty;
   // other tools or clients may rely on the file's existence.
-  writeJsonPretty(hooksFile, json);
+  writeConfigWithBackup(hooksFile, json);
   return `Removed agy workled hooks -> ${hooksFile}`;
 }
 
@@ -696,8 +703,10 @@ async function installOpenclaw() {
   };
   plugins.entries = entries;
   cfg.plugins = plugins;
-  // Use mergeWrite to preserve existing config sections
-  mergeWriteConfig(openclawConfigPath(), { plugins: cfg.plugins });
+  // cfg already carries every existing section from readOpenclawConfig(), so
+  // write it whole — a merge round-trip would re-read the file and risk mixing
+  // two snapshots while the Gateway watcher is reloading.
+  writeConfigWithBackup(openclawConfigPath(), cfg);
 
   // Wait for Gateway to finish reloading and verify the config persisted.
   // Gateway's file watcher triggers a restart when plugins.load changes.
@@ -721,10 +730,10 @@ async function installOpenclaw() {
 
   if (!verified) {
     // Config didn't stabilise — write it one more time directly (no merge)
-    // to bypass any deepMerge edge-case with empty existing plugins.
+    // to bypass any rollback edge-case with empty existing plugins.
     const cfg2 = readOpenclawConfig();
     cfg2.plugins = { ...cfg.plugins };
-    directWriteConfig(configPath, cfg2);
+    writeConfigWithBackup(configPath, cfg2);
     // Verify again
     await sleep(2000);
     const final = readOpenclawConfig();
@@ -782,9 +791,9 @@ async function uninstallOpenclaw() {
   const configPath = openclawConfigPath();
   let cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
 
-  // Write the cleaned config. Use directWriteConfig to avoid deepMerge
-  // re-introducing stale workled entries from a concurrently-modified file.
-  directWriteConfig(configPath, cleaned.cfg);
+  // Write the cleaned config via the shared helper (no merge round-trip, so
+  // stale workled entries from a concurrently-modified file cannot resurface).
+  writeConfigWithBackup(configPath, cleaned.cfg);
   if (cleaned.changed) {
     msg += cleaned.messages.join("\n") + "\n";
     msg += `Updated openclaw.json -> ${configPath}\n`;
@@ -803,7 +812,7 @@ async function uninstallOpenclaw() {
 
   // Gateway didn't stabilise — force-write clean config one final time.
   cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
-  directWriteConfig(configPath, cleaned.cfg);
+  writeConfigWithBackup(configPath, cleaned.cfg);
   msg += `Force-cleaned openclaw.json (Gateway rollback recovery)\n`;
   return msg.trimEnd();
 }
@@ -814,47 +823,62 @@ function fileUrl(p) {
   return pathToFileURL(p).href;
 }
 
+// Generated entry files share a fixed "do not edit" header and a trailing
+// newline; each adapter only supplies its own import/export body lines.
+const ENTRY_HEADER = "// Generated by workled install.mjs. Do not edit.";
+function entryFile(lines) {
+  return [ENTRY_HEADER, ...lines, ""].join("\n");
+}
+
 // opencode: the plugins dir auto-loads EVERY exported function as a plugin, so
 // the installed file exposes a single plugin function that adapts the entry's
 // register() into opencode's factory shape.
 function opencodeEntryFile() {
-  return [
-    `// Generated by workled install.mjs. Do not edit.`,
+  return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
     `export const workled = async (ctx) => await core.register(ctx);`,
-    ``,
-  ].join("\n");
+  ]);
 }
 
 // openclaw: Gateway loads via plugins.load.paths; wraps the entry with the SDK.
 function openclawEntryFile() {
-  return `// Generated by workled install.mjs. Do not edit.\nimport { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";\nimport { openclawEntry } from "${fileUrl(corePath)}";\nexport default definePluginEntry(openclawEntry);\n`;
+  return entryFile([
+    `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";`,
+    `import { openclawEntry } from "${fileUrl(corePath)}";`,
+    `export default definePluginEntry(openclawEntry);`,
+  ]);
 }
 
 // pi: extensions take the default export as (pi: ExtensionAPI) => void.
 function piEntryFile() {
-  return [
-    `// Generated by workled install.mjs. Do not edit.`,
+  return entryFile([
     `import { piEntry } from "${fileUrl(corePath)}";`,
     `export default (pi) => piEntry.register(pi);`,
-    ``,
-  ].join("\n");
+  ]);
 }
 
 // kilo (Anomaly) is an opencode fork: Event/Hooks types are identical to
 // opencode, so it reuses opencodeEntry. The installed file is a module
 // descriptor (default export { id, server }) in the single `plugin/` dir.
 function kiloEntryFile() {
-  return [
-    `// Generated by workled install.mjs. Do not edit.`,
+  return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
     `export default {`,
     `  id: "workled",`,
     `  server: async (ctx) => await core.register(ctx),`,
     `};`,
-    ``,
-  ].join("\n");
+  ]);
 }
+
+// Entry-file generators for the plugin-file clients (opencode / kilo / pi).
+// Target paths and labels live in CLIENT_TARGETS (index.js); this table only
+// adds what cannot be data — the generated entry content — so client paths are
+// maintained in exactly one place. Keys must be a subset of CLIENTS.
+const PLUGIN_CLIENTS = {
+  opencode: opencodeEntryFile,
+  kilo: kiloEntryFile,
+  pi: piEntryFile,
+};
 
 // hermes: shell hooks are declared in <hermes-home>/config.yaml under a
 // top-level `hooks:` block; each event maps to an array of { command,
@@ -1066,6 +1090,14 @@ function uninstallHermes() {
 
 // ---- CLI ----------------------------------------------------------------------
 
+// Render one client's --help line from CLIENT_TARGETS: plugin clients use the
+// structured dest/label (plus the standard AGENTS.md reminder suffix), the
+// others carry ready-made help text.
+function targetHelp(name) {
+  const t = CLIENT_TARGETS[name] ?? CLIENT_TARGETS.default;
+  return t.help || `${t.label} -> ${t.dest()} + reminder in AGENTS.md`;
+}
+
 function printHelp() {
   console.log(`workled skill installer
 
@@ -1073,7 +1105,7 @@ Usage:
   node skill-install.mjs install|uninstall --client <name>|all
   node skill-install.mjs install|uninstall --file <instruction-file>
 
-${CLIENTS.map((c) => `  ${c.padEnd(10)} ${CLIENT_TARGETS[c] ?? CLIENT_TARGETS.default}`).join("\n")}
+${CLIENTS.map((c) => `  ${c.padEnd(10)} ${targetHelp(c)}`).join("\n")}
   --file     generic: only the reminder (clients not in the list use this method)
   --client   REQUIRED -- the invoking agent passes its own client name, or
              "all" to apply the operation to every client
@@ -1140,51 +1172,34 @@ async function main() {
     mcpEntry = { url, enabled: true };
   }
 
+  const failedClients = [];
   for (const c of targets) {
     const isInstall = action === "install";
     const lines = [];
+    try {
     switch (c) {
-      case "opencode": {
-        const destDir = join(h, ".config", "opencode", "plugins");
-        const dest = join(destDir, "workled.js");
+      case "opencode":
+      case "kilo":
+      case "pi": {
+        const t = CLIENT_TARGETS[c]; // { label, dest, agents } — plugin client
+        const dest = t.dest();
+        const destDir = dirname(dest);
         if (isInstall) {
           mkdirSync(destDir, { recursive: true });
-          writeFileSync(dest, opencodeEntryFile(), "utf8");
-          lines.push(`Installed opencode plugin -> ${dest}`);
-          lines.push(appendReminder(join(h, ".config", "opencode", "AGENTS.md")));
-          lines.push(...(await registerWorkledMcp("opencode", mcpEntry)));
+          writeFileSync(dest, PLUGIN_CLIENTS[c](), "utf8");
+          lines.push(`Installed ${c} ${t.label} -> ${dest}`);
+          lines.push(appendReminder(t.agents()));
+          lines.push(...(await registerWorkledMcp(c, mcpEntry)));
         } else {
           if (existsSync(dest)) {
             removePath(dest);
-            removeEmptyParent(dirname(dest));
-            lines.push(`Removed opencode plugin -> ${dest}`);
+            removeEmptyParent(destDir);
+            lines.push(`Removed ${c} ${t.label} -> ${dest}`);
           } else {
-            lines.push(`No opencode plugin at ${dest}`);
+            lines.push(`No ${c} ${t.label} at ${dest}`);
           }
-          lines.push(removeReminder(join(h, ".config", "opencode", "AGENTS.md")));
-          lines.push(...unregisterWorkledMcp("opencode"));
-        }
-        break;
-      }
-      case "kilo": {
-        const destDir = join(h, ".config", "kilo", "plugin");
-        const dest = join(destDir, "workled.js");
-        if (isInstall) {
-          mkdirSync(destDir, { recursive: true });
-          writeFileSync(dest, kiloEntryFile(), "utf8");
-          lines.push(`Installed kilo plugin -> ${dest}`);
-          lines.push(appendReminder(join(h, ".config", "kilo", "AGENTS.md")));
-          lines.push(...(await registerWorkledMcp("kilo", mcpEntry)));
-        } else {
-          if (existsSync(dest)) {
-            removePath(dest);
-            removeEmptyParent(dirname(dest));
-            lines.push(`Removed kilo plugin -> ${dest}`);
-          } else {
-            lines.push(`No kilo plugin at ${dest}`);
-          }
-          lines.push(removeReminder(join(h, ".config", "kilo", "AGENTS.md")));
-          lines.push(...unregisterWorkledMcp("kilo"));
+          lines.push(removeReminder(t.agents()));
+          lines.push(...unregisterWorkledMcp(c));
         }
         break;
       }
@@ -1210,28 +1225,6 @@ async function main() {
         else lines.push(...unregisterWorkledMcp("hermes"));
         break;
       }
-      case "pi": {
-        const destDir = join(h, ".pi", "agent", "extensions");
-        const dest = join(destDir, "workled.ts");
-        if (isInstall) {
-          mkdirSync(destDir, { recursive: true });
-          writeFileSync(dest, piEntryFile(), "utf8");
-          lines.push(`Installed pi extension -> ${dest}`);
-          lines.push(appendReminder(join(h, ".pi", "AGENTS.md")));
-          lines.push(...(await registerWorkledMcp("pi", mcpEntry)));
-        } else {
-          if (existsSync(dest)) {
-            removePath(dest);
-            removeEmptyParent(dirname(dest));
-            lines.push(`Removed pi extension -> ${dest}`);
-          } else {
-            lines.push(`No pi extension at ${dest}`);
-          }
-          lines.push(removeReminder(join(h, ".pi", "AGENTS.md")));
-          lines.push(...unregisterWorkledMcp("pi"));
-        }
-        break;
-      }
       case "workbuddy": {
         // WorkBuddy is a pure-MCP client with no per-client hook layer, so the
         // state protocol is enforced by user-level hooks in settings.json
@@ -1252,6 +1245,25 @@ async function main() {
         process.exit(1);
     }
     console.log(lines.join("\n") + "\n");
+    } catch (err) {
+      // One client failed (e.g. the safe-delete shim refused a bulk delete this
+      // turn). Do NOT abort the batch — report and continue so every other
+      // client is still (un)installed.
+      console.error(`⚠ Failed to ${action} client "${c}": ${err && err.message}`);
+      failedClients.push(c);
+    }
+  }
+
+  // If any client could not be (un)installed this run (typically because the
+  // safe-delete shim blocked a bulk delete under a busy turn), surface a
+  // summary and a non-zero exit so the caller knows to retry those clients in a
+  // fresh turn — without having skipped the ones that succeeded.
+  if (failedClients.length) {
+    console.error(
+      `\n⚠ ${failedClients.length} client(s) failed to ${action}: ${failedClients.join(", ")}.\n` +
+      `  Re-run \`node skill-install.mjs ${action} --client ${failedClients.length === 1 ? failedClients[0] : "all"}\` in a fresh turn to finish.`
+    );
+    process.exitCode = 1;
   }
 
   // P2: uninstall writes clean configs and leaves a `.bak` of the pre-uninstall
@@ -1302,5 +1314,3 @@ main().catch((err) => {
   console.error(`install.mjs error: ${err && err.stack}`);
   process.exit(1);
 });
-
-

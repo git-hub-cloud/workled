@@ -34,9 +34,9 @@ Call `set_agent_state` via MCP on every state transition:
 |---|---|---|---|
 | set_agent_state | state_name: string | Set LED to reflect agent state (`thinking`/`idle`/`input`/`error`) | `set_agent_state("thinking")` |
 | get_agent_state | — | Returns current agent LED state: `idle`/`thinking`/`input`/`error` (empty string if unset) | `get_agent_state()` |
-| set_brightness | brightness: string | LED brightness 0-255 | `set_brightness("128")` |
-| get_brightness | — | Returns current LED brightness 0-255 | `get_brightness()` |
-| set_effect | effect_name: string, effect_json: string | effect_name ∈ `led`(manual effect)/`idle`/`thinking`/`input`/`error`; effect_json is a JSON string `{"type","hue","saturation","value","speed"}`. Map natural-language colors to HSV (see table below). | `set_effect("led", '{"type":"breathe","hue":180,"speed":50}')` |
+| set_brightness | brightness: integer | LED brightness 0-255; **0 = off** | `set_brightness(128)` |
+| get_brightness | — | Returns current LED brightness 0-255; **0 when the light is off** | `get_brightness()` |
+| set_effect | effect_name: string, effect_json: string | effect_name ∈ `led`(manual effect)/`idle`/`thinking`/`input`/`error`; effect_json is a JSON string `{"type","hue","saturation","value","speed"}`. Light must be on first (set_brightness > 0). Map natural-language colors to HSV (see table below). | `set_effect("led", '{"type":"breathe","hue":180,"speed":50}')` |
 | get_effect | effect_name: string | Get effect_name config as JSON | `get_effect("thinking")` |
 | set_macro | macro_name: string, macro_json: string | Set the macro for a touch pad gesture; macro_name ∈ `single_click`/`double_click`/`long_press_start`; macro_json is a JSON array of segments (see Macro Format); empty macro_json resets | `set_macro("single_click", '[{"combo":"ctrl+c"}]')` |
 | get_macro | macro_name: string | Returns the macro as a JSON array string, or empty string if unset (password values masked) | `get_macro("single_click")` |

@@ -207,7 +207,7 @@ agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
 - **workled configured but disabled** — `workled.enabled` is `false`; enable it
   in your agent config or set `WORKLED_MCP_URL`.
 - **Device reachable but the LED stays off** — the strip brightness may be 0.
-  Run `set_brightness("128")`, or use the device's manual on/off switch.
+  Run `set_brightness(128)`, or use the device's manual on/off switch.
 - **No MCP config found at all** — neither `WORKLED_MCP_URL` nor any config
   source declares the server. Add it under `mcp` in your agent config (see
   "MCP endpoint" above) or set the environment variable.
