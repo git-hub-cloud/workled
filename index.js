@@ -294,7 +294,7 @@ function getWorkledCandidates(clientPrefix) {
 //           probe never masquerades as a missing adapter.
 //
 // `devicePaired` / `deviceName` are workled-specific: they report the workled
-// device (name matches HomeAnt|workled) rather than any HID/keyboard device,
+// device (name matches HomeAnt-* or workled-* prefix) rather than any HID/keyboard device,
 // so the macro-readiness hint is accurate.
 export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const result = {
@@ -322,14 +322,14 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
         result.powered = statuses.some((s) => s.toLowerCase() === "ok");
 
         try {
-          // Workled-specific: match the device name (HomeAnt-* or workled),
+          // Workled-specific: match devices with HomeAnt-* or workled-* prefix,
           // not any generic HID/keyboard/bluetooth device.
           const { stdout: hidOut } = await execWithRetry(
             "powershell",
             [
               "-NoProfile",
               "-Command",
-              "Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'HomeAnt|workled' } | Select-Object -First 1 -ExpandProperty FriendlyName",
+              "Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match '^(HomeAnt|workled)' } | Select-Object -First 1 -ExpandProperty FriendlyName",
             ],
             { timeout: timeoutMs }
           );
@@ -356,7 +356,7 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = pairedOut.trim().split(/\r?\n/).filter(Boolean);
-          const hidLine = lines.find((l) => /homeant|workled|keyboard|hid/i.test(l));
+          const hidLine = lines.find((l) => /^(homeant|workled)/i.test(l));
           if (hidLine) {
             result.devicePaired = true;
             const m = hidLine.match(/address:\s*([^\s,]+)/i);
@@ -381,8 +381,8 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             data.SPBluetoothDataType?.[0]?.device_paired ||
             [];
           const hidDevice = devices.find((d) =>
-            /homeant|workled|keyboard|hid/i.test(d.device_name || "") ||
-            /homeant|workled|keyboard|hid/i.test(d.device_type || "")
+            /^(homeant|workled)/i.test(d.device_name || "") ||
+            /^(homeant|workled)/i.test(d.device_type || "")
           );
           if (hidDevice) {
             result.devicePaired = true;
@@ -405,7 +405,7 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = devOut.trim().split(/\r?\n/).filter(Boolean);
-          const wlLine = lines.find((l) => /homeant|workled/i.test(l));
+          const wlLine = lines.find((l) => /^(homeant|workled)/i.test(l));
           if (wlLine) {
             result.devicePaired = true;
             result.deviceName = wlLine.split(/\s+/).slice(2).join(" ") || null;
@@ -1115,8 +1115,15 @@ async function runStatusMode() {
     out.ok = true;
     out.exitCode = 0;
     if (bluetooth && bluetooth.available === true && !bluetooth.devicePaired) {
-      const deviceName = bluetooth.deviceName || "the workled device";
-      out.hint = `Macro requires Bluetooth. Pair the device as a BLE HID keyboard (device name: ${deviceName}) and ensure it is connected.`;
+      const deviceName = bluetooth.deviceName || null;
+      let hint = "Macro requires Bluetooth. Pair the device as a BLE HID keyboard.";
+      if (deviceName) {
+        hint += ` Found: ${deviceName}.`;
+      } else {
+        hint += " Device not found — scan for devices whose name starts with 'HomeAnt' or 'workled' in your OS Bluetooth settings.";
+      }
+      hint += " Ensure it is connected.";
+      out.hint = hint;
     } else {
       out.hint =
         'workled server reachable. If the LED stays off, run set_brightness(128) or use the device switch.';
@@ -1129,8 +1136,11 @@ async function runStatusMode() {
     if (bluetooth && bluetooth.available === false) {
       out.hint = `Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name. Bluetooth is also unavailable: ${bluetooth.error || "no Bluetooth adapter detected"}.`;
     } else {
-      out.hint =
-        "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
+      let hint = "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
+      if (bluetooth && bluetooth.deviceName) {
+        hint += ` Your paired device is '${bluetooth.deviceName}'.`;  
+      }
+      out.hint = hint;
     }
   }
 

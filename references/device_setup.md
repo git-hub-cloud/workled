@@ -59,11 +59,11 @@ for per-client config paths and keys.
 
 ## Bluetooth pairing (required for macro)
 
-The device appears as a BLE HID keyboard. Pair it with your computer:
+The device appears as a BLE HID keyboard. Its name starts with `HomeAnt` or `workled`. Pair it with your computer:
 
-- **Windows**: Settings → Bluetooth & devices → Add device → Bluetooth → select `<device-name>`.
-- **macOS**: System Settings → Bluetooth → select `<device-name>`.
-- **Linux**: `bluetoothctl` → `scan on` → `pair <device-name>` → `trust <device-name>` → `connect <device-name>`.
+- **Windows**: Settings → Bluetooth & devices → Add device → Bluetooth → select the device whose name starts with `HomeAnt` or `workled`.
+- **macOS**: System Settings → Bluetooth → select the device whose name starts with `HomeAnt` or `workled`.
+- **Linux**: `bluetoothctl` → `scan on` → look for a device whose name starts with `HomeAnt` or `workled` → `pair <device-name>` → `trust <device-name>` → `connect <device-name>`.
 
 After pairing, the device stays connected while in range. If it disconnects, re-pair or trigger reconnection.
 
