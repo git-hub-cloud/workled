@@ -35,11 +35,6 @@ const REMINDER = [
 
 const h = homedir();
 
-// `.bak` paths this run's install/uninstall writes via writeConfigWithBackup.
-// Tracked so uninstall can drop the stale pre-uninstall
-// backups it creates (P2) without touching any backups it did not write.
-const createdBaks = new Set();
-
 // ---- safe path removal ----------------------------------------------------
 // WorkBuddy's managed Node intercepts fs delete calls through a "safe-delete"
 // shim. Two behaviours are known:
@@ -106,36 +101,6 @@ function removeTreeRobust(p) {
   // Final attempt for this entry if it is somehow still present.
   if (existsSync(p)) {
     try { rmSync(p, { recursive: true, force: true }); } catch {}
-  }
-}
-
-// P2 (legacy sweep): beyond the backups we just wrote this run, any
-// pre-existing `<config>.bak` sibling that still carries a `workled` entry is a
-// stale leftover from an earlier (pre-fix) uninstall. Remove those too so an
-// uninstall leaves the config dirs genuinely clean. Only the installer's own
-// `<managed-config>.bak` files are considered, and only when they actually
-// contain "workled", so unrelated user backups are never touched.
-function cleanStaleWorkledBaks(targets = CLIENTS) {
-  // Sweep only the managed config files belonging to the targeted clients so a
-  // per-client uninstall (`--client <name>`) never cleans other clients' dirs.
-  // MCP_SOURCES covers most clients; openclaw's config and agy's hooks are
-  // added by client name below.
-  const wanted = new Set(targets);
-  const managed = MCP_SOURCES.filter((s) => wanted.has(s.client.split(".")[0])).map((s) => s.path());
-  if (wanted.has("openclaw")) managed.push(openclawConfigPath());
-  if (wanted.has("agy")) managed.push(join(h, ".gemini", "config", "hooks.json"));
-  if (wanted.has("workbuddy")) managed.push(join(h, ".workbuddy", "settings.json"));
-  const seen = new Set();
-  for (const file of managed) {
-    if (seen.has(file)) continue;
-    seen.add(file);
-    const bak = file + ".bak";
-    if (!existsSync(bak)) continue;
-    let content = "";
-    try { content = readFileSync(bak, "utf8"); } catch { continue; }
-    if (/workled/.test(content)) {
-      try { removePath(bak); } catch { /* best effort */ }
-    }
   }
 }
 
@@ -251,19 +216,12 @@ function readJsonOrEmpty(file) {
   }
 }
 
-// Write a JSON config object, keeping a `.bak` of the previous content (tracked
-// in createdBaks so uninstall can drop its own stale backups). mkdir -p the
-// parent first. The single write helper for every JSON config this tool manages.
-function writeConfigWithBackup(file, obj) {
+// Write a JSON config object. mkdir -p the parent first. The single write
+// helper for every JSON config this tool manages. No `.bak` is created: the
+// writes are idempotent (re-install overwrites the same entries), so backups
+// would be pure extra filesystem churn that only prompts cleanup later.
+function writeConfig(file, obj) {
   mkdirSync(dirname(file), { recursive: true });
-  if (existsSync(file)) {
-    try {
-      writeFileSync(file + ".bak", readFileSync(file, "utf8"), "utf8");
-      createdBaks.add(file + ".bak");
-    } catch {
-      // Backup failed, proceed anyway
-    }
-  }
   writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
 }
 
@@ -359,8 +317,9 @@ function removeMcpServerYaml(file, keyCandidates) {
 
 // Remove the `workled` MCP server entry from one MCP_SOURCES source (global or
 // project). JSON sources: drop obj[key].workled, then the key itself when
-// empty; a .bak is kept by writeConfigWithBackup. YAML sources (hermes) go through
-// removeMcpServerYaml(), which probes the historical MCP key candidates.
+// empty; the config is rewritten in place via writeConfig (no backup file is
+// created). YAML sources (hermes) go through removeMcpServerYaml(), which
+// probes the historical MCP key candidates.
 // Returns null when nothing was touched.
 function removeMcpServer(source) {
   if (source.format === "yaml") {
@@ -375,7 +334,7 @@ function removeMcpServer(source) {
   if (!map || typeof map !== "object" || map.workled === undefined) return null;
   delete map.workled;
   if (Object.keys(map).length === 0) delete obj[source.key];
-  writeConfigWithBackup(file, obj);
+  writeConfig(file, obj);
   return `Removed workled from ${source.key} -> ${file}`;
 }
 
@@ -454,7 +413,7 @@ function registerWorkledSettingsHooks() {
     if (spec.matcher) group.matcher = spec.matcher;
     settings.hooks[ev].push(group);
   }
-  writeConfigWithBackup(settingsFile, settings);
+  writeConfig(settingsFile, settings);
   return `Installed workled hooks -> ${settingsFile}`;
 }
 
@@ -488,7 +447,7 @@ function unregisterWorkledSettingsHooks() {
   }
   if (!removed) return `No workled hooks at ${settingsFile}`;
   if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-  writeConfigWithBackup(settingsFile, settings);
+  writeConfig(settingsFile, settings);
   return `Removed workled hooks -> ${settingsFile}`;
 }
 
@@ -518,7 +477,7 @@ function addMcpServer(source, entry) {
   const merged = { url, enabled: entry.enabled !== false };
   if (existing.type) merged.type = existing.type;
   map.workled = merged;
-  writeConfigWithBackup(file, obj);
+  writeConfig(file, obj);
   return `Registered workled -> ${source.key} (${file})`;
 }
 
@@ -622,7 +581,7 @@ function installAgy() {
     entry[ev] = [agyCommandShape(ev)];
   }
   root[AGY_HOOK_ID] = entry;
-  writeConfigWithBackup(hooksFile, root);
+  writeConfig(hooksFile, root);
   return `Installed agy hooks -> ${hooksFile}`;
 }
 
@@ -633,7 +592,7 @@ function uninstallAgy() {
   delete json[AGY_HOOK_ID];
   // Always write back — never delete hooks.json even if now empty;
   // other tools or clients may rely on the file's existence.
-  writeConfigWithBackup(hooksFile, json);
+  writeConfig(hooksFile, json);
   return `Removed agy workled hooks -> ${hooksFile}`;
 }
 
@@ -706,7 +665,7 @@ async function installOpenclaw() {
   // cfg already carries every existing section from readOpenclawConfig(), so
   // write it whole — a merge round-trip would re-read the file and risk mixing
   // two snapshots while the Gateway watcher is reloading.
-  writeConfigWithBackup(openclawConfigPath(), cfg);
+  writeConfig(openclawConfigPath(), cfg);
 
   // Wait for Gateway to finish reloading and verify the config persisted.
   // Gateway's file watcher triggers a restart when plugins.load changes.
@@ -733,7 +692,7 @@ async function installOpenclaw() {
     // to bypass any rollback edge-case with empty existing plugins.
     const cfg2 = readOpenclawConfig();
     cfg2.plugins = { ...cfg.plugins };
-    writeConfigWithBackup(configPath, cfg2);
+    writeConfig(configPath, cfg2);
     // Verify again
     await sleep(2000);
     const final = readOpenclawConfig();
@@ -793,7 +752,7 @@ async function uninstallOpenclaw() {
 
   // Write the cleaned config via the shared helper (no merge round-trip, so
   // stale workled entries from a concurrently-modified file cannot resurface).
-  writeConfigWithBackup(configPath, cleaned.cfg);
+  writeConfig(configPath, cleaned.cfg);
   if (cleaned.changed) {
     msg += cleaned.messages.join("\n") + "\n";
     msg += `Updated openclaw.json -> ${configPath}\n`;
@@ -812,7 +771,7 @@ async function uninstallOpenclaw() {
 
   // Gateway didn't stabilise — force-write clean config one final time.
   cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
-  writeConfigWithBackup(configPath, cleaned.cfg);
+  writeConfig(configPath, cleaned.cfg);
   msg += `Force-cleaned openclaw.json (Gateway rollback recovery)\n`;
   return msg.trimEnd();
 }
@@ -1266,19 +1225,10 @@ async function main() {
     process.exitCode = 1;
   }
 
-  // P2: uninstall writes clean configs and leaves a `.bak` of the pre-uninstall
-  // state (which still carries the `workled` entry) for every JSON config it
-  // touches. Those stale backups are genuine leftovers, so drop the ones this
-  // run created, then sweep any pre-existing `workled` backups still sitting
-  // next to the managed config files. The install path deliberately keeps its
-  // `.bak` files as a safety net and is left untouched.
-  if (action === "uninstall") {
-    for (const bak of createdBaks) {
-      try { removePath(bak); } catch { /* best effort */ }
-    }
-    createdBaks.clear();
-    cleanStaleWorkledBaks(targets);
-  }
+  // No `.bak` files are created (writes are idempotent), so there is nothing
+  // to clean up here. Historical `.bak` files left by older versions are
+  // deliberately left untouched — the tool never deletes user-visible
+  // backup files.
 
   // After install, point the agent at the diagnostic command so it can check
   // MCP reachability and surface the result (hint) to the user. The hint is
@@ -1298,7 +1248,7 @@ async function main() {
           console.log("");
           console.log("⚠ WORKLED MCP SERVER NOT CONFIGURED");
           console.log("   Please add the MCP server to your client config:");
-          console.log("   See references/device_setup.md for instructions.");
+          console.log("   See device_setup.md for instructions.");
           console.log("   Or run: node " + corePath + " status to check current state.");
         } else {
           console.log("   " + status.hint);
