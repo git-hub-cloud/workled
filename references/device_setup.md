@@ -18,7 +18,7 @@ A fresh device broadcasts its own hotspot. Connect your computer to that hotspot
 - Set your home Wi-Fi and enter its password to complete provisioning.
 - The device then connects to your home Wi-Fi automatically.
 
-## Home page
+## Device Home page
 
 Open the device's web page in a browser (device status / provisioning):
 
@@ -54,9 +54,6 @@ Add the server to your agent config. For opencode, edit `opencode.json`
 }
 ```
 
-Other clients follow the same pattern — see `## Installation & Uninstallation`
-for per-client config paths and keys.
-
 ## Bluetooth pairing (required for macro)
 
 The device appears as a BLE HID keyboard. Its name starts with `HomeAnt` or `workled`. Pair it with your computer:
@@ -69,63 +66,94 @@ After pairing, the device stays connected while in range. If it disconnects, re-
 
 ## Installation & Uninstallation
 
-All clients are installed / uninstalled with `skill-install.mjs`.
+### Install the skill
 
-`index.js` exports adapters, all with the same entry shape `{id,name,description,register}`:
+Choose one of the following methods to install the skill locally.
 
-- `opencodeEntry` — opencode adapter (`register(ctx)` returns hooks; the installed entry wraps it into opencode's plugin factory `async (ctx) => await core.register(ctx)`). **kilo reuses this adapter**: kilo is an opencode fork with identical Event/Hooks types; the kilo entry only changes the module shape (`export default { id, server }`).
-- `openclawEntry` — openclaw adapter (`register(api)` hooks `api.on`; the generated entry wraps it with the SDK, installed under `~/.openclaw/plugins/workled/`)
-- `piEntry` — pi adapter (`register(pi)` hooks `pi.on`; the generated `.ts` does `export default (pi) => piEntry.register(pi)`)
-- CLI hook mode: `node index.js hook [--event <name>]` (unified event→state map; covers agy and hermes shell hooks)
+#### Method 1 — Agent-based install (recommended)
 
-Each client gets a **thin generated entry file** that exposes exactly one adapter, because:
-
-- opencode auto-loads EVERY export of a plugin file as a plugin → the installed file exposes only the `workled` plugin function.
-- kilo auto-loads every `.js` in `~/.config/kilo/plugin/` and requires a module descriptor → the installed file does `export default { id: "workled", server: async (ctx) => await core.register(ctx) }`.
-- pi loads extensions by **default export** → the installed `.ts` does `export default (pi) => piEntry.register(pi)`.
-- openclaw requires a `definePluginEntry`-shaped default export → the installed entry imports the SDK and wraps `openclawEntry`.
-
-### One-click install / uninstall (all clients)
-
-Fully global: every target path is derived from `homedir()`, never from cwd, so the same command runs from any directory on any shell. Every supported client is handled together once you pass `--client all`.
+If your agent client provides a skill installer that accepts a remote URL,
+point it at the repository:
 
 ```
-node <skill-dir>/skill-install.mjs install --client all        # install to all clients (opencode, kilo, openclaw, agy, hermes, pi, workbuddy)
-node <skill-dir>/skill-install.mjs uninstall --client all       # uninstall from all clients
-node <skill-dir>/skill-install.mjs install --file <any-instruction-file>   # generic clients (reminder only)
+https://github.com/git-hub-cloud/workled
 ```
 
-> **Targets are explicit.** Both `install` and `uninstall` without `--client`
-> fail with the client enum (and `all`) and a hint to pass `--client <name>`
-> (your own client) or `--client all`. Omitted never means "all" — that would
-> touch / wipe every client's integration by accident.
+#### Method 2 — git clone (manual)
+
+Clone the repository into a directory your client scans for `skills/*/SKILL.md`.
+opencode scans the paths below automatically:
+
+```bash
+git clone https://github.com/git-hub-cloud/workled.git ~/.agents/skills/workled
+```
+
+Keep up to date:
+
+```bash
+git -C ~/.agents/skills/workled pull
+```
+
+### Client integration
+
+Fully global: every target path is derived from `homedir()`, never from cwd, so
+the same command runs from any directory on any shell. Both `install` and
+`uninstall` **require** an explicit target: `--client <name>` (opencode, kilo,
+openclaw, agy, hermes, pi, workbuddy) for one client, or `--client all` for
+every client. `--file` targets a single instruction file (reminder only).
+`index.js status` accepts the same optional `--client <name>` filter; default
+is **all clients**.
+
+```
+node <skill-dir>/skill-install.mjs install|uninstall --client <name>|all
+node <skill-dir>/skill-install.mjs install|uninstall --file <any-instruction-file>   # generic clients (reminder only)
+node <skill-dir>/skill-install.mjs --help
+node <skill-dir>/index.js status [--client <name>]    # filter optional; default all
+```
+
+Examples:
+
+```
+node <skill-dir>/skill-install.mjs install --client opencode
+node <skill-dir>/skill-install.mjs uninstall --client opencode
+node <skill-dir>/skill-install.mjs install --client all
+node <skill-dir>/skill-install.mjs uninstall --client all
+node <skill-dir>/index.js status --client opencode
+```
+
+> **Targets are explicit.** A bare `install` / `uninstall` (no `--client`)
+> errors with the client enum and a hint to pass `--client <name>` — your own
+> client — or `--client all`. Omitted never means "all"; deliberately pass
+> `--client all` only when you intend to apply the operation to every client.
 
 What every client's install flow does:
 
 1. **Reminder** — writes the marker + reminder block below into the client's instruction file. If the marker is already present, it is not added again.
 2. **Client-level hook / plugin / entry** — covers the Enter → first-output gap (the window the agent cannot reach): calls `set_agent_state("thinking")` when the user submits a message.
-3. **Uninstall** — removes the marker + reminder block and the hook/entry.
-
-Per-client targets:
-
-| Client   | Hook / plugin target                                   | Instruction file          | Notes |
-|----------|--------------------------------------------------------|---------------------------|-------|
-| opencode | `~/.config/opencode/plugins/workled/`                | `~/.config/opencode/AGENTS.md` | plugin file only re-exports `workledLed` |
-| kilo     | `~/.config/kilo/plugin/workled/`                     | `~/.config/kilo/AGENTS.md` | same plugin API as opencode; `export default { id, server }` module shape |
-| openclaw | `~/.openclaw/plugins/workled/` + `openclaw.plugin.json` manifest, registered in `openclaw.json` `plugins.load.paths` + `plugins.entries.workled` | `~/.openclaw/AGENTS.md` | restart the Gateway to load; conversation hooks require `plugins.entries.workled.hooks.allowConversationAccess=true` |
-| agy      | `~/.gemini/config/hooks.json` (`workled` key)          | `~/.gemini/AGENTS.md`     | event name read from stdin or `--event` argv |
-| hermes   | `hooks:` block in `<hermes-home>/config.yaml` (shell hooks) | `<hermes-home>/AGENTS.md` | home = `$HERMES_HOME` → `%LOCALAPPDATA%\hermes` (Windows) → `~/.hermes` (unix); YAML config; only workled entries are replaced, user hooks are preserved |
-| pi       | `~/.pi/agent/extensions/workled.ts`                    | `~/.pi/AGENTS.md`         | default-export wraps `piEntry.register` |
-| workbuddy | `~/.workbuddy/mcp.json` (`mcpServers.workled`)         | SKILL.md (loaded by WorkBuddy) | MCP-only; SKILL.md carries the protocol — no hook/plugin/reminder file to manage |
-| generic  | none (reminder only)                                   | any `--file`              | clients not listed use manual `set_agent_state` calls only |
+3. **MCP entry** — registers the `workled` server in the client's MCP config (opencode/kilo/openclaw/agy/pi/workbuddy register it; hermes uses a YAML block).
+4. **Uninstall** — removes the marker + reminder block, the hook/entry, and the MCP entry. Everything else in the config files is preserved verbatim.
 
 ### Event mapping per client
 
-- **opencode / kilo** (automatic detection): `session.idle` → `idle`; `session.error` → `error`; `question.asked` → `input`; `question.replied` / `question.rejected` → `thinking`; `permission.asked` → `input`; `permission.replied` → `thinking`. Input tool configurable via `WORKLED_INPUT_TOOLS` (comma-separated, default: `question`).
-- **openclaw** (best-effort; verify against a real Gateway): `message_received` → `thinking`; `before_tool_call` (tool in `WORKLED_INPUT_TOOLS`) → `input`; `agent_end` → `idle` (or `error` on a failed run); `session_end` → `idle` fallback.
-- **agy** (hook CLI): `PreInvocation`/`PostInvocation` → `thinking`; `PreToolUse`/`PostToolUse` → `input` (only when the payload tool is in `WORKLED_INPUT_TOOLS`); `Stop` → `idle`.
-- **hermes** (shell hooks via the same hook CLI): `pre_llm_call` → `thinking`; `post_llm_call` → `idle`; `pre_tool_call` → `input` (only when the tool is in `WORKLED_INPUT_TOOLS`; `post_tool_call` is intentionally NOT registered so a returned input tool does not re-set `input`); `pre_approval_request` → `input`; `post_approval_response` → `thinking`; `on_session_start` → `thinking`; `on_session_end` → `idle`; `subagent_start`/`subagent_stop` → `thinking`.
+- **opencode / kilo** (automatic detection): `session.idle` → `idle`; `session.error` → `error`; `question.asked` → `input`; `question.replied` / `question.rejected` → `thinking`; `permission.asked` → `input`; `permission.replied` → `thinking`. Input tools are detected by a fixed `question` substring match (e.g. `AskUserQuestion`).
+- **openclaw** (best-effort; verify against a real Gateway): `message_received` → `thinking`; `before_tool_call` (tool name matches `question`) → `input`; `agent_end` → `idle` (or `error` on a failed run); `session_end` → `idle` fallback.
+- **agy** (hook CLI): `PreInvocation`/`PostInvocation` → `thinking`; `PreToolUse`/`PostToolUse` → `input` (only when the payload tool name matches `question`); `Stop` → `idle`.
+- **hermes** (shell hooks via the same hook CLI): `pre_llm_call` → `thinking`; `post_llm_call` → `idle`; `pre_tool_call` → `input` (only when the tool name matches `question`; `post_tool_call` is intentionally NOT registered so a returned input tool does not re-set `input`); `pre_approval_request` → `input`; `post_approval_response` → `thinking`; `on_session_start` → `thinking`; `on_session_end` → `idle`; `subagent_start`/`subagent_stop` → `thinking`.
 - **pi** (extension): `agent_start` → `thinking`; `agent_settled` → `idle`; `session_shutdown` → `idle`; `tool_call` (input tools) → `input`; `session_start` → notify.
+
+After installing, run `node <skill-dir>/index.js status` and surface the JSON
+`hint` to the user. A `hint` of "No `workled` server configured" means the
+client's MCP is not set up — guide the user through the MCP endpoint
+above.
+
+> **Prevent / detect a placeholder URL.** `install` resolves the MCP URL once:
+> `WORKLED_MCP_URL` → Bluetooth/mDNS discovery → placeholder
+> `http://<device-name>.local:18791/mcp`. If no real URL is known and the
+> target config has **no existing `workled` entry** (e.g. after an earlier
+> uninstall), the placeholder is written. Fix it by editing the config URL to
+> the real device name/IP, or re-run install with
+> `WORKLED_MCP_URL=http://<device-name>.local:18791/mcp` set. A config that
+> already holds a real URL is never downgraded to the placeholder.
 
 ### Marker line (grep-friendly)
 
@@ -138,38 +166,13 @@ Per-client targets:
 > - `set_agent_state("error")` on errors
 ```
 
-## Installing for one client
-
-`skill-install.mjs install` / `uninstall` both **require** an explicit target:
-`--client <name>` (opencode, kilo, openclaw, agy, hermes, pi, workbuddy) for one
-client, or `--client all` for every client. `index.js status` accepts the same
-optional `--client <name>` filter; default is **all clients**.
-
-```
-node <skill-dir>/skill-install.mjs install --client opencode
-node <skill-dir>/skill-install.mjs uninstall --client opencode
-node <skill-dir>/skill-install.mjs uninstall --client all
-node <skill-dir>/index.js status --client opencode
-```
-
-> **Agent-facing guidance:** always pass your own client name —
-> `node <skill-dir>/skill-install.mjs install|uninstall --client <your-client>`.
-> A bare `install` / `uninstall` errors with the client enum (opencode, kilo,
-> openclaw, agy, hermes, pi, workbuddy, all); deliberately pass `--client all`
-> only when you intend to apply the operation to every client.
-
-After installing, run `node <skill-dir>/index.js status` and surface the JSON
-`hint` to the user. A `hint` of "No `workled` server configured" means the
-client's MCP is not set up — guide the user through the MCP endpoint
-above.
-
 ## Verify
 
 After the device is reachable and the opencode plugin is loaded, trigger an LED
 state change:
 
 ```
-set_agent_state("idle")
+set_brightness(128)
 ```
 
 The LED should respond. If it does not, see Troubleshooting below.
@@ -187,12 +190,16 @@ node <skill-dir>/index.js status
 
 The command scans the MCP config of every client (opencode global and project,
 agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
-(`WORKLED_MCP_URL` override wins), and checks reachability via an MCP
-`initialize` handshake — tools are not probed. Fields:
+(`WORKLED_MCP_URL` override wins), and checks reachability with a **stateless**
+`tools/call get_agent_state` probe. Each URL is probed up to 3 times
+with backoff; the successful attempt number is reported. Fields:
 
 - `WORKLED_MCP_URL` — the override value, or `null`
-- `workled` — `{ client, enabled, url, reachable, error? }`, or `null` when no
-  `workled` server is configured
+- `workled` — `{ client, enabled, url, reachable, attempt, error? }`, or `null`
+  when no `workled` server is configured; `attempt` is the probe attempt that
+  succeeded (1-3)
+- `clients` — one entry per discovered client config (`client`, `path`,
+  `enabled`, `url`, `reachable`, `attempt`)
 - `hint` — a concrete next step for the current state
 - `ok` / `exitCode` — success flag and process exit code
 
@@ -202,12 +209,20 @@ agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
 - **Device unreachable** — make sure the device is powered on and that your
   computer is on the same Wi-Fi network as the device.
 - **mDNS name not resolving** — the device name must match the one configured
-  for the device; it varies per device. When in doubt, use the device's IP
-  address instead of the `.local` name.
+  for the device; it varies per device. `.local` (mDNS) resolution is
+  **unreliable** on Windows/agents under load (per-request lookups can fail with
+  `ENOTFOUND`, especially under concurrency). Prefer a **static IP / DHCP
+  reservation** for the device and use the IP address in configs instead of the
+  `.local` name.
+- **Device dropped off the network** — the device can go offline silently
+  (power loss / Wi-Fi sleep). Recheck `index.js status`; if the URL does not
+  resolve at all, power-cycle the device and confirm it rejoined the LAN.
 - **workled configured but disabled** — `workled.enabled` is `false`; enable it
   in your agent config or set `WORKLED_MCP_URL`.
-- **Device reachable but the LED stays off** — the strip brightness may be 0.
-  Run `set_brightness(128)`, or use the device's manual on/off switch.
+- **Device reachable but the LED stays off** — check three things, in order:
+  1. **Brightness may be 0** — run `set_brightness(128)`, or use the device's manual on/off switch.
+  2. **MCP config not loaded yet** — after adding/editing the MCP server entry, **restart the agent or the session** so it reloads the config.
+  3. **MCP connection not approved** — some agents require **manually allowing/trusting** the MCP connection before they will use it. Without approval the server is configured but never connected.
 - **No MCP config found at all** — neither `WORKLED_MCP_URL` nor any config
   source declares the server. Add it under `mcp` in your agent config (see
   "MCP endpoint" above) or set the environment variable.
@@ -216,4 +231,4 @@ agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
 
 | Variable | Default | Description |
 |---|---|---|
-| `WORKLED_MCP_URL` | Override the MCP server URL directly. |
+| `WORKLED_MCP_URL` | | Override the MCP server URL directly. |

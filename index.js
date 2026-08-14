@@ -50,14 +50,18 @@ try {
 //   format  - json (JSONC tolerated via stripJsonc) | yaml
 //   path    - resolved lazily so `projectDir` (cwd, updated on register) and
 //             $HERMES_HOME are always read at call time, never frozen at load.
+//   type    - default `type` written for a fresh workled MCP entry; only set
+//             for clients that require an explicit transport declaration
+//             (opencode/kilo/workbuddy use "remote"). Clients that infer the
+//             transport from `url` (gemini/agy, openclaw, pi, hermes) omit it.
 export const MCP_SOURCES = [
   // opencode (global + project)
-  { client: "opencode.global", key: "mcp", format: "json", path: () => join(HOME, ".config", "opencode", "opencode.json") },
-  { client: "opencode.global", key: "mcp", format: "json", path: () => join(HOME, ".config", "opencode", "opencode.jsonc") },
-  { client: "opencode.project", key: "mcp", format: "json", path: () => join(projectDir, "opencode.json") },
-  { client: "opencode.project", key: "mcp", format: "json", path: () => join(projectDir, "opencode.jsonc") },
+  { client: "opencode.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.json") },
+  { client: "opencode.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.jsonc") },
+  { client: "opencode.project", key: "mcp", format: "json", type: "remote", path: () => join(projectDir, "opencode.json") },
+  { client: "opencode.project", key: "mcp", format: "json", type: "remote", path: () => join(projectDir, "opencode.jsonc") },
   // kilo (opencode fork)
-  { client: "kilo.global", key: "mcp", format: "json", path: () => join(HOME, ".config", "kilo", "kilo.jsonc") },
+  { client: "kilo.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "kilo", "kilo.jsonc") },
   // agy / gemini (two possible global locations + project)
   { client: "agy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "config", "mcp.json") },
   { client: "agy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "antigravity-cli", "mcp.json") },
@@ -66,8 +70,9 @@ export const MCP_SOURCES = [
   { client: "openclaw.global", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
   // pi
   { client: "pi.global", key: "mcp", format: "json", path: () => join(HOME, ".pi", "mcp.json") },
-  // workbuddy (JSON, mcpServers key, ~/.workbuddy/mcp.json)
-  { client: "workbuddy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".workbuddy", "mcp.json") },
+  // workbuddy (JSON, mcpServers key, ~/.workbuddy/mcp.json; Claude Code
+  // compatible, so remote servers declare type: "remote")
+  { client: "workbuddy.global", key: "mcpServers", format: "json", type: "remote", path: () => join(HOME, ".workbuddy", "mcp.json") },
   // hermes (YAML)
   { client: "hermes.global", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
 ];
@@ -133,11 +138,45 @@ const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
 // single-flight and stateless.
 let nextRpcId = 1;
 
-function getInputTools() {
-  return (process.env.WORKLED_INPUT_TOOLS || "question")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+// Fixed patterns treated as "waiting for user input" by the openclaw/pi
+// adapters. Covers the common naming conventions used by agent toolkits
+// (AskUserQuestion, AskUserConfirm, choose_option, select_choice,
+// prompt_input, permission_approval etc.) so input detection fires on
+// every interactive tool regardless of client spelling.
+export function getInputTools() {
+  return ["question", "confirm", "ask", "choose", "select", "prompt", "input", "approval"];
+}
+
+// Input-tool detection for the openclaw/pi adapters. Matches by substring
+// (case-insensitive) so tools like "AskUserQuestion" or "ask_question" hit
+// the fixed "question" pattern — an exact `includes(name)` would never fire
+// for those names and the input state would stay dark.
+export function isInputTool(name) {
+  if (!name || typeof name !== "string") return false;
+  return getInputTools().some((t) => name.toLowerCase().includes(t.toLowerCase()));
+}
+
+// Decide the effective MCP URL when (re)writing a workled server entry.
+// Never downgrade a working URL to the `<device-name>` placeholder: if the
+// incoming URL is the placeholder but an existing real URL is present, keep
+// the real one. Pure helper shared by skill-install.mjs and the test suite.
+export function resolveMergedUrl(existingUrl, incomingUrl) {
+  const isPlaceholder = (u) => typeof u === "string" && u.includes("<device-name>");
+  return isPlaceholder(incomingUrl) && existingUrl && !isPlaceholder(existingUrl)
+    ? existingUrl
+    : incomingUrl;
+}
+
+// Decide the `type` field for a workled MCP entry when (re)writing config.
+// An existing `type` wins (a client may use a different transport spelling or
+// the user customized it); otherwise the source's default `type` is applied.
+// Returns null when neither exists, so the caller omits the field entirely
+// rather than writing an empty `type`. Pure helper shared by skill-install.mjs
+// and the test suite.
+export function resolveMcpType(existingType, defaultType) {
+  if (existingType) return existingType;
+  if (defaultType) return defaultType;
+  return null;
 }
 
 function sleepWithJitter(baseMs, attempt) {
@@ -170,7 +209,7 @@ let workledUrlExpiry = 0;
 let hookClientPrefix = null;
 let projectDir = process.cwd();
 const seenUserMessages = new Set();
-let seenMessagesCleanedAt = 0;
+let seenMessagesCleanedAt = Date.now();
 const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // Config candidates cache (parsed server list with name==='workled', enabled, url)
@@ -293,9 +332,11 @@ function getWorkledCandidates(clientPrefix) {
 //           "unknown" instead of falsely claiming "no adapter", so a blocked
 //           probe never masquerades as a missing adapter.
 //
-// `devicePaired` / `deviceName` are workled-specific: they report the workled
-// device (name matches HomeAnt-* or workled-* prefix) rather than any HID/keyboard device,
-// so the macro-readiness hint is accurate.
+// `devicePaired` / `deviceName` are workled-specific: they report ONLY the
+// workled device (name matches HomeAnt-* or workled-* prefix) so the
+// macro-readiness hint is accurate. A non-workled device never masquerades as
+// paired (fixes #1 — Linux fallback path previously promoted the first
+// arbitrary BT device to "paired").
 export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const result = {
     available: null,
@@ -305,40 +346,142 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
     error: null,
   };
 
+  // Regex shared by every platform probe. Device broadcasts use names like
+  // "HomeAnt-A919" or "workled-1234"; OS-level paired lists often carry the
+  // same name, optionally with HID suffixes. Match anywhere (not just ^)
+  // because some hosts prepend "BLE " or append " (Keyboard)" to the name.
+  const WORKLED_NAME_RE = /(?:HomeAnt|workled)[-_]?[A-Za-z0-9]*/i;
+
   try {
     if (process.platform === "win32") {
-      try {
-        const { stdout: adapterOut } = await execWithRetry(
-          "powershell",
-          [
-            "-NoProfile",
-            "-Command",
-            "Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status",
-          ],
-          { timeout: timeoutMs }
-        );
-        const statuses = adapterOut.trim().split(/\r?\n/).filter(Boolean);
-        result.available = statuses.length > 0;
-        result.powered = statuses.some((s) => s.toLowerCase() === "ok");
+      // Windows: three-tier probe with progressive fallback.
+      //
+      //  Tier 1 (preferred): Get-CimInstance Win32_PnPEntity — gives us
+      //    HardwareID strings that carry the raw Bluetooth device name in
+      //    the format `BTHENUM\{UUID}_<device-mac>#`, plus a ConfigManager
+      //    status code where 0 == device present and working. This is the
+      //    most reliable source of the workled device name on Windows
+      //    because FriendlyName is often localised ("Bluetooth HID Device").
+      //  Tier 2 (powered): check the BTHPORT service AND the radio state
+      //    via the registry. PnP Status == "OK" only means the driver is
+      //    loaded (fixes #3 — previously it was conflated with "radio on").
+      //  Tier 3 (FriendlyName last-resort name match): keep the
+      //    FriendlyName regex probe as a final fallback so an older Windows
+      //    version that happens to set FriendlyName correctly is still
+      //    covered (fixes #2 — now it's one probe among many, not the
+      //    only way to detect a paired workled).
 
+      try {
+        // --- Tier 1: CIM PnP entities (adapter + device name) ------------
+        const cimCmd =
+          "@(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | " +
+          "Where-Object { $_.PNPClass -in @('Bluetooth','BluetoothLE') -or $_.Service -eq 'BTHLE' -or $_.Service -eq 'BTHPORT' } | " +
+          "Select-Object Name,FriendlyName,HardwareID,PNPClass,Status,ConfigManagerErrorCode | ConvertTo-Json -Compress)";
+        let parsed = [];
         try {
-          // Workled-specific: match devices with HomeAnt-* or workled-* prefix,
-          // not any generic HID/keyboard/bluetooth device.
-          const { stdout: hidOut } = await execWithRetry(
+          const { stdout: cimOut } = await execWithRetry(
+            "powershell",
+            ["-NoProfile", "-Command", cimCmd],
+            { timeout: timeoutMs }
+          );
+          const trimmed = cimOut.trim();
+          if (trimmed) parsed = JSON.parse(trimmed);
+        } catch {
+          parsed = [];
+        }
+        if (!Array.isArray(parsed)) parsed = parsed ? [parsed] : [];
+
+        // Adapter present = any Bluetooth class entry (regardless of status)
+        // that isn't just a virtual enumerator.
+        const adapterEntries = parsed.filter((e) =>
+          /^Bluetooth/i.test(String(e.PNPClass || ""))
+        );
+        result.available = adapterEntries.length > 0;
+
+        // Adapter working = at least one entry with CM error code 0 (OK).
+        const adapterWorking = adapterEntries.some((e) => {
+          const cmErr = Number(e.ConfigManagerErrorCode);
+          const statusOk = String(e.Status || "").toLowerCase() === "ok";
+          return cmErr === 0 || statusOk;
+        });
+
+        // --- Tier 2: powered — BTHPORT service + radio registry hint -----
+        // Query the Bluetooth Windows Service state; "Running" means the
+        // radio stack is up. Without this the PnP driver status can be
+        // "OK" even when the user turned the radio off in Action Center.
+        let serviceRunning = false;
+        try {
+          const { stdout: svcOut } = await execWithRetry(
             "powershell",
             [
               "-NoProfile",
               "-Command",
-              "Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match '^(HomeAnt|workled)' } | Select-Object -First 1 -ExpandProperty FriendlyName",
+              "(Get-Service -Name BTHPORT -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Status) -as [string]",
             ],
             { timeout: timeoutMs }
           );
-          if (hidOut.trim()) {
-            result.devicePaired = true;
-            result.deviceName = hidOut.trim();
-          }
+          serviceRunning = svcOut.trim().toLowerCase() === "running";
         } catch {
-          // workled device not found among PnP devices (not paired yet)
+          // service probe blocked — infer powered only from adapter working
+        }
+        result.powered = serviceRunning || adapterWorking;
+
+        // --- Tier 3: workled device name (HardwareID > Name > FriendlyName)
+        // HardwareID entries look like:
+        //   BTHENUM\{00001812-0000-1000-8000-00805f9b34fb}_LOCALMFG&0000
+        //   BTHENUM\\Dev_<6-hex-byte-mac>...
+        // But more importantly, the raw device enumeration name for HID
+        // over BLE sometimes embeds the advertised name. When it doesn't,
+        // we fall back to checking the Name and FriendlyName fields with
+        // the prefix regex so manually-assigned FriendlyNames still work.
+        // Additionally, scan *all* PnP entities, not just Bluetooth class —
+        // the HID side of a paired BLE keyboard often shows up under class
+        // "HIDClass" / "Keyboard" / "Mouse" with the real device name in
+        // FriendlyName and a BTHENUM HardwareID parent.
+        let matchedDevice = null;
+        for (const e of parsed) {
+          const haystack = [
+            e.Name,
+            e.FriendlyName,
+            ...(Array.isArray(e.HardwareID) ? e.HardwareID : []),
+          ]
+            .filter(Boolean)
+            .map(String)
+            .join(" | ");
+          const m = haystack.match(WORKLED_NAME_RE);
+          if (m) {
+            matchedDevice = m[0];
+            break;
+          }
+        }
+        // Last-resort FriendlyName sweep across ALL classes (covers the
+        // case where the CIM query accidentally filtered the HID side out,
+        // but a non-Bluetooth class entry still has a friendly name like
+        // "HomeAnt-A919 Keyboard").
+        if (!matchedDevice) {
+          try {
+            const { stdout: hidOut } = await execWithRetry(
+              "powershell",
+              [
+                "-NoProfile",
+                "-Command",
+                "Get-PnpDevice -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FriendlyName",
+              ],
+              { timeout: timeoutMs }
+            );
+            const names = hidOut.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+            const hit = names.find((n) => WORKLED_NAME_RE.test(n));
+            if (hit) {
+              const m = hit.match(WORKLED_NAME_RE);
+              matchedDevice = m ? m[0] : hit;
+            }
+          } catch {
+            // ignored — last resort only
+          }
+        }
+        if (matchedDevice) {
+          result.devicePaired = true;
+          result.deviceName = matchedDevice;
         }
       } catch {
         result.available = null;
@@ -356,11 +499,12 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = pairedOut.trim().split(/\r?\n/).filter(Boolean);
-          const hidLine = lines.find((l) => /^(homeant|workled)/i.test(l));
+          const hidLine = lines.find((l) => WORKLED_NAME_RE.test(l));
           if (hidLine) {
             result.devicePaired = true;
             const m = hidLine.match(/address:\s*([^\s,]+)/i);
-            result.deviceName = m ? m[1] : hidLine.split(",")[0]?.trim() || null;
+            const nameMatch = hidLine.match(WORKLED_NAME_RE);
+            result.deviceName = nameMatch ? nameMatch[0] : (m ? m[1] : hidLine.split(",")[0]?.trim() || null);
           }
         } catch {
           // no paired devices
@@ -381,12 +525,13 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             data.SPBluetoothDataType?.[0]?.device_paired ||
             [];
           const hidDevice = devices.find((d) =>
-            /^(homeant|workled)/i.test(d.device_name || "") ||
-            /^(homeant|workled)/i.test(d.device_type || "")
+            WORKLED_NAME_RE.test(d.device_name || "") ||
+            WORKLED_NAME_RE.test(d.device_type || "")
           );
           if (hidDevice) {
             result.devicePaired = true;
-            result.deviceName = hidDevice.device_name || null;
+            const nm = String(hidDevice.device_name || "").match(WORKLED_NAME_RE);
+            result.deviceName = nm ? nm[0] : (hidDevice.device_name || null);
           }
         } catch {
           result.available = null;
@@ -401,17 +546,20 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
         result.powered = stdout.includes("Powered: yes");
 
         try {
+          // `bluetoothctl devices` lines: "AA:BB:CC:DD:EE:FF DeviceName"
+          // Only accept a device whose name matches the workled prefix.
+          // Fixes #1: the previous else-if branch promoted ANY paired
+          // device (earbuds, mouse) to "workled paired" when no match
+          // was found — that branch is now removed entirely.
           const { stdout: devOut } = await execFileAsync("bluetoothctl", ["devices"], {
             timeout: timeoutMs,
           });
           const lines = devOut.trim().split(/\r?\n/).filter(Boolean);
-          const wlLine = lines.find((l) => /^(homeant|workled)/i.test(l));
+          const wlLine = lines.find((l) => WORKLED_NAME_RE.test(l));
           if (wlLine) {
             result.devicePaired = true;
-            result.deviceName = wlLine.split(/\s+/).slice(2).join(" ") || null;
-          } else if (lines.length > 0) {
-            result.devicePaired = true;
-            result.deviceName = lines[0].split(/\s+/).slice(2).join(" ") || null;
+            const m = wlLine.match(WORKLED_NAME_RE);
+            result.deviceName = m ? m[0] : (wlLine.split(/\s+/).slice(2).join(" ") || null);
           }
         } catch {
           // no paired devices
@@ -500,35 +648,95 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 
 async function discoverWorkledUrl(clientPrefix) {
   if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
-  if (workledUrl && Date.now() < workledUrlExpiry) return workledUrl;
+  const now = Date.now();
+  if (workledUrl && now < workledUrlExpiry) return workledUrl;
   const candidates = getWorkledCandidates(clientPrefix);
   if (candidates.length === 0) return null;
 
-  // Single-candidate mode: return the first configured URL directly, without
-  // any probe (the server is stateless).
+  // Pick the first configured URL directly, without probing (the server is
+  // stateless); a failed send clears the cache so the next event re-reads the
+  // config files from disk.
   const url = candidates[0].url;
   workledUrl = url;
-  workledUrlExpiry = Date.now() + WORKLED_URL_TTL_MS;
+  workledUrlExpiry = now + WORKLED_URL_TTL_MS;
   return url;
+}
+
+// Forget every cached URL/candidate so the next discovery re-reads the config
+// files from disk. Called when a send fails so a device that went offline (or a
+// config change) is picked up immediately instead of after the full URL TTL.
+function invalidateDiscovery() {
+  workledUrl = null;
+  workledUrlExpiry = 0;
+  cachedCandidates = null;
+  candidatesExpiry = 0;
 }
 
 let pendingState = null;
 let senderRunning = false;
-// Track flush promises for CLI hook mode
+// Track flush promises for CLI hook mode. Each queued flush is tagged with
+// the state that was pending at enqueue time so sendLoop can settle only the
+// promises whose target state has actually been processed (fixes #6:
+// previously a single completed state settled every queued flush regardless
+// of which state each caller was waiting for).
 const flushPromises = [];
-// The last state actually delivered via MCP (set only on a successful send).
-// Used to dedup consecutive identical states WITHOUT poisoning future recovery:
-// a failed send must NOT be recorded here, or an identical later request would
-// be suppressed and the LED would stay stuck on the wrong state.
+// { state, resolve, reject }[]
+//
+// The last state actually delivered via MCP (set only on a successful send)
+// AND the monotonic timestamp of that send. Dedup only fires when the
+// incoming state matches lastSentState AND the last send was within the
+// recent dedup window — otherwise an identical state across turns is sent
+// so the device can reset animations (fixes #7).
 let lastSentState = null;
+let lastSentStateAtMs = 0;
+const SAME_STATE_DEDUP_WINDOW_MS = 200;
 
-// Settle every pending flush promise (used by sendLoop when a state's send
-// completes or the sender loop exits).
-function resolveFlushPromises(result) {
-  while (flushPromises.length > 0) flushPromises.shift().resolve(result);
+// Pure, side-effect-free predicate that decides whether an incoming state
+// should be deduplicated against the last successfully delivered state.
+// Exposed for unit tests (and re-used by setAgentState below) so the 200 ms
+// short-window rule of #7 is locked down: a repeat state is only suppressed
+// when it matches the last sent state, the queue is empty, AND the previous
+// send happened within the dedup window. Any repeat state after the window
+// is delivered so the device can restart breath/pulse animations.
+export function shouldDedupState(state, ctx) {
+  const dedup = ctx.dedupWindowMs ?? SAME_STATE_DEDUP_WINDOW_MS;
+  if (state !== ctx.lastSentState) return false;
+  if (ctx.pendingState !== null && ctx.pendingState !== undefined) return false;
+  if (typeof ctx.lastSentStateAtMs !== "number") return false;
+  if (typeof ctx.nowMs !== "number") return false;
+  return ctx.nowMs - ctx.lastSentStateAtMs < dedup;
 }
-function rejectFlushPromises(err) {
-  while (flushPromises.length > 0) flushPromises.shift().reject(err);
+
+// Pure version of resolveFlushPromisesForState (fixes #6). Given an array of
+// flush entries `{ state: string|null, resolve, reject }` and a just-processed
+// `state`, removes and resolves every entry whose target state matches — an
+// entry with state=null means "wait for queue drain" so it only matches
+// state=null. Returns the count of settled entries so tests can assert that
+// entries tagged with a DIFFERENT state remain in-flight for a later settle.
+export function drainFlushPromisesForState(list, state, result) {
+  let settled = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const entry = list[i];
+    if (entry.state === null || entry.state === state) {
+      list.splice(i, 1);
+      entry.resolve(result);
+      settled++;
+    }
+  }
+  return settled;
+}
+
+// Settle flush promises whose target state matches the just-processed one.
+// Thin wrapper over the pure helper above — see that helper for the #6 note.
+function resolveFlushPromisesForState(state, result) {
+  drainFlushPromisesForState(flushPromises, state, result);
+}
+// Reject every remaining flush promise (sender-loop teardown path).
+function rejectAllFlushPromises(err) {
+  while (flushPromises.length > 0) {
+    const entry = flushPromises.shift();
+    entry.reject(err);
+  }
 }
 
 async function sendLoop() {
@@ -547,7 +755,7 @@ async function sendLoop() {
       if (!url) {
         lastErr = new Error("MCP URL not configured or not discovered");
         const result = { state, sent, error: lastErr, superseded: false };
-        resolveFlushPromises(result);
+        resolveFlushPromisesForState(state, result);
         console.warn(`[workled] setAgentState(${state}) skipped: no MCP URL available`);
         continue;
       }
@@ -564,6 +772,7 @@ async function sendLoop() {
           lastErr = null;
           sent = true;
           lastSentState = state;
+          lastSentStateAtMs = Date.now();
           break;
         } catch (err) {
           lastErr = err;
@@ -572,26 +781,39 @@ async function sendLoop() {
           }
         }
       }
-      // Resolve any waiting flush promises for this state
+      // Resolve only flush promises waiting for THIS state
       const result = { state, sent, error: lastErr, superseded };
-      resolveFlushPromises(result);
+      resolveFlushPromisesForState(state, result);
       if (lastErr) {
-        // give up on this state; no resend later
+        // give up on this state; no resend later. A dead device or a changed
+        // config should be re-discovered immediately, so drop the cached URL
+        // and candidate list for the next event.
+        invalidateDiscovery();
         console.warn(`[workled] setAgentState(${state}) failed after ${maxAttempts} attempts: ${lastErr.message || lastErr}`);
       }
     }
+    // After the outer while-loop exits (pendingState became null) we know the
+    // queue is fully drained. Flush any remaining "wait for drain" entries
+    // (state === null) that weren't settled by a specific state match.
+    const drainResult = { state: null, sent: true, error: null, superseded: false };
+    resolveFlushPromisesForState(null, drainResult);
   } finally {
     senderRunning = false;
-    // Reject any remaining flush promises if sender exits unexpectedly
-    rejectFlushPromises(new Error("Sender loop exited unexpectedly"));
+    // Reject any stragglers if sender exits unexpectedly (shouldn't happen)
+    rejectAllFlushPromises(new Error("Sender loop exited unexpectedly"));
   }
 }
 
 function setAgentState(state) {
-  // Dedup consecutive identical states already delivered and drained. Keyed on
-  // lastSentState (not last requested) so a previously-failed state is never
-  // suppressed and will be re-queued on the next request.
-  if (state === lastSentState && pendingState === null) {
+  // Short-window dedup: only skip when the same state was successfully sent
+  // VERY recently AND no other state is queued. This lets legitimate repeat
+  // requests (new turn, animation reset, question → answered → back to
+  // thinking all resolve to "thinking" but separated by "input") reach the
+  // device so it can restart breath / pulse effects. A tight 200 ms window
+  // still collapses accidental double-fires from clients that emit duplicate
+  // lifecycle events in quick succession.
+  const now = Date.now();
+  if (shouldDedupState(state, { lastSentState, lastSentStateAtMs, nowMs: now, pendingState })) {
     return;
   }
   pendingState = state;
@@ -614,14 +836,23 @@ async function flushState() {
     return { state: null, sent: true, error: null, superseded: false };
   }
 
-  // Resolves when the current state is sent; the timeout timer is cleared as
-  // soon as flush settles so short-lived hook processes do not linger.
+  // Capture the state that is currently queued (or being sent) so the flush
+  // promise only settles when THAT specific state is actually processed.
+  // null means "wait for full queue drain" — used when sender is mid-flight
+  // with no new pending item but we still want to wait for the running loop
+  // to come all the way back to idle.
+  const targetState = pendingState !== null ? pendingState : null;
+
+  // Resolves when the target state (or queue drain) settles; the timeout timer
+  // is cleared as soon as flush settles so short-lived hook processes do not
+  // linger.
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error(`flushState timeout after ${FLUSH_TIMEOUT_MS}ms`)),
       FLUSH_TIMEOUT_MS
     );
     flushPromises.push({
+      state: targetState,
       resolve: (result) => {
         clearTimeout(timer);
         resolve(result);
@@ -724,10 +955,11 @@ export const opencodeEntry = {
         }
       },
       "tool.execute.before": async (input) => {
-        const wanted = getInputTools().map((t) => t.toLowerCase());
         try {
-          const toolName = input && input.tool ? String(input.tool).toLowerCase() : "";
-          if (toolName && wanted.includes(toolName)) {
+          // Substring, case-insensitive match (isInputTool) so renamed tool
+          // variants (ask_question vs AskUserQuestion) still light up `input`.
+          const toolName = input && input.tool ? String(input.tool) : "";
+          if (toolName && isInputTool(toolName)) {
             setAgentState("input");
           }
         } catch (err) {
@@ -772,10 +1004,9 @@ export const openclawEntry = {
     // Tool call that needs a user decision -> input
     api.on("before_tool_call", async (event) => {
       try {
-        const inputTools = getInputTools();
         const name =
           (event && (event.toolName || event.tool || event.name)) || "";
-        if (inputTools.includes(name)) {
+        if (isInputTool(name)) {
           setAgentState("input");
         }
       } catch (err) {
@@ -848,10 +1079,9 @@ export const piEntry = {
     pi.on("tool_call", async (event) => {
       // Best-effort input detection: pi has no built-in question tool, but
       // extensions may register interactive tools. Match by tool name.
-      const inputTools = getInputTools();
       const name =
         (event && (event.toolName || event.tool || event.name)) || "";
-      if (inputTools.includes(name)) {
+      if (isInputTool(name)) {
         setAgentState("input");
       }
     });
@@ -878,8 +1108,18 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 
 // Event name -> state, unified across every hook-based client (agy, hermes).
 // Event names are unique per client so no conflicts arise; the same mapping
-// serves all of them. Tool events map to "input" only when the payload
-// references an input tool (checked by extractToolName below).
+// serves all of them.
+//
+// PreToolUse maps to "tool": it resolves to "input" only when the payload
+// references an input tool (AskUserQuestion etc., checked by extractToolName),
+// otherwise it is a no-op. PostToolUse maps to "thinking" — after any tool
+// returns the agent resumes working, so the LED returns to the working state.
+//
+// NOTE (WorkBuddy limitation): the host fires PreToolUse/PostToolUse for
+// AskUserQuestion at the moment the USER ANSWERS, NOT when the question is
+// rendered. So a hook can never light "input" during the wait window. The
+// agent MUST call set_agent_state("input") itself BEFORE rendering a question
+// (see SKILL.md). The hooks here are only a safety net for the answer moment.
 const HOOK_MAP = {
   // WorkBuddy (Claude Code-compatible hooks in ~/.workbuddy/settings.json)
   UserPromptSubmit: "thinking",
@@ -888,7 +1128,7 @@ const HOOK_MAP = {
   PreInvocation: "thinking",
   PostInvocation: "thinking",
   PreToolUse: "tool",
-  PostToolUse: "tool",
+  PostToolUse: "thinking",
   // hermes shell-hook events (snake_case)
   pre_llm_call: "thinking",
   post_llm_call: "idle",
@@ -1001,7 +1241,10 @@ async function runHookMode() {
     // latency). Let the event loop drain — the
     // pending socket keeps the process alive until the send settles — then exit.
     process.stdout.write("{}\n");
-    setTimeout(() => process.exit(0), 50).unref();
+    // Bounded safety net: if the host keeps stdin open (or some socket never
+    // settles) the process would otherwise hang forever. This cap is far beyond
+    // the flush budget so it never truncates a legitimate in-flight send.
+    setTimeout(() => process.exit(0), FLUSH_TIMEOUT_MS + 5000).unref();
   }
 }
 
@@ -1087,14 +1330,15 @@ async function runStatusMode() {
   }));
   out.bluetooth = bluetooth;
 
-  // Probe each unique URL once.
-  const results = new Map();
-  for (const e of entries) {
-    if (!e.url || !e.enabled) continue;
-    if (!results.has(e.url)) {
-      results.set(e.url, await probeReachable(e.url));
-    }
-  }
+  // Probe each unique URL once, in parallel. Distinct URLs can be checked
+  // concurrently; per-URL retries (up to 3 with backoff) stay inside
+  // probeReachable. Keeps `status` fast when many clients share configs.
+  const urls = [
+    ...new Set(entries.filter((e) => e.url && e.enabled).map((e) => e.url)),
+  ];
+  const results = new Map(
+    await Promise.all(urls.map(async (u) => [u, await probeReachable(u)]))
+  );
 
   out.clients = entries.map((e) => {
     const probe = e.url && e.enabled ? results.get(e.url) : null;
@@ -1126,7 +1370,9 @@ async function runStatusMode() {
       out.hint = hint;
     } else {
       out.hint =
-        'workled server reachable. If the LED stays off, run set_brightness(128) or use the device switch.';
+        "workled server reachable. If the LED stays off: check brightness (set_brightness(128) or use the device switch); " +
+        "if MCP was just configured, restart the agent/session so it loads the new config; " +
+        "some agents also require manually allowing/trusting the MCP connection before they use it.";
     }
   } else if (out.clients.some((c) => c.enabled === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
@@ -1138,7 +1384,7 @@ async function runStatusMode() {
     } else {
       let hint = "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
       if (bluetooth && bluetooth.deviceName) {
-        hint += ` Your paired device is '${bluetooth.deviceName}'.`;  
+        hint += ` Your paired device is '${bluetooth.deviceName}'.`;
       }
       out.hint = hint;
     }

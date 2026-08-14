@@ -3,7 +3,7 @@
 // Usage client targets: run `node skill-install.mjs --help`.
 
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname, join, resolve } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import {
   existsSync,
@@ -17,11 +17,19 @@ import {
   writeFileSync,
 } from "fs";
 import { stripJsonc, hermesHome, sleep } from "./utils.js";
-import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS } from "./index.js";
+import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const corePath = join(scriptDir, "index.js");
-const SKILL_VERSION = JSON.parse(stripJsonc(readFileSync(join(scriptDir, "_meta.json"), "utf8"))).version;
+// SKILL_VERSION: single-sourced from _meta.json, with a fallback so a missing
+// or corrupt registry file never crashes the installer (index.js guards the
+// same read).
+let SKILL_VERSION = "";
+try {
+  SKILL_VERSION = JSON.parse(stripJsonc(readFileSync(join(scriptDir, "_meta.json"), "utf8"))).version || "";
+} catch {
+  // fallback to default
+}
 const MARKER = "<!-- workled -->";
 const REMINDER = [
   MARKER,
@@ -133,9 +141,12 @@ function stripAllReminderBlocks(content) {
       continue;
     }
     if (skip) {
-      // Drop every line of the reminder block (blockquote/list and blank
-      // lines) until the first non-reminder line ends the block.
-      if (t === "" || t.startsWith("> ") || t.startsWith("- ")) continue;
+      // Drop every line of the reminder block (blockquote lines and blank
+      // lines) until the first non-reminder line ends the block. Only "> "
+      // lines and blanks belong to the canonical REMINDER block; "- " lines
+      // are never treated as block content so a user's own list that follows
+      // the reminder is preserved.
+      if (t === "" || t.startsWith("> ")) continue;
       skip = false;
     }
     out.push(line);
@@ -181,9 +192,12 @@ function removeReminder(file) {
       continue;
     }
     if (skip) {
-      // Drop every line of the reminder block (blockquote/list and blank
-      // lines) until the first non-reminder line ends the block.
-      if (t === "" || t.startsWith("> ") || t.startsWith("- ")) continue;
+      // Drop every line of the reminder block (blockquote lines and blank
+      // lines) until the first non-reminder line ends the block. Only "> "
+      // lines and blanks belong to the canonical REMINDER block; "- " lines
+      // are never treated as block content so a user's own list that follows
+      // the reminder is preserved.
+      if (t === "" || t.startsWith("> ")) continue;
       skip = false;
     }
     out.push(line);
@@ -225,6 +239,480 @@ function writeConfig(file, obj) {
   writeFileSync(file, JSON.stringify(obj, null, 2) + "\n", "utf8");
 }
 
+// ---- JSON/JSONC text editors (comment-preserving) ---------------------------
+// install/uninstall edit config files with byte-level surgery instead of
+// JSON.stringify round-trips, so user comments, key order, and formatting
+// survive untouched. The workled entry is always a flat object, which makes
+// locating it inside the server map a single flat-object regex.
+
+// Return true when <text> parses as JSON (JSONC comments/trailing commas OK).
+export function isValidJsonc(text) {
+  try {
+    JSON.parse(stripJsonc(text));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Walk raw text (string literals and // and /* */ comments skipped) and return
+// the span of a top-level key's object value: { start, end } are the opening
+// `{` and its matching `}`. Only the first match of `"<key>"` at brace depth 1
+// (directly inside the root object) is considered. Returns null when the key
+// or an object value is absent.
+//
+// A leading UTF-8 BOM is skipped internally so brace-depth counting lines up
+// with the actual root `{`, but returned indices are ALWAYS relative to the
+// ORIGINAL caller-supplied text (fixes #5: without this BOM compensation every
+// returned span would be off by one, and the caller would slice into the
+// middle of keys, corrupting the file and falling back to JSON.stringify —
+// losing all user comments/formatting).
+function findTopLevelObjectValueSpan(text, key) {
+  let bom = 0;
+  if (text.charCodeAt(0) === 0xfeff) bom = 1;
+  const body = bom ? text.slice(1) : text;
+  const needle = `"${key}"`;
+  const n = body.length;
+  let inStr = false;
+  let i = 0;
+  let depth = 0;
+  let valueStart = -1;
+
+  while (i < n) {
+    const c = body[i];
+    if (inStr) {
+      if (c === "\\") i += 2;
+      else {
+        if (c === '"') inStr = false;
+        i++;
+      }
+      continue;
+    }
+    if (c === '"') {
+      const start = i;
+      i++;
+      while (i < n) {
+        if (body[i] === "\\") i += 2;
+        else if (body[i] === '"') {
+          i++;
+          break;
+        } else i++;
+      }
+      if (depth === 1 && body.slice(start, i) === needle) {
+        let j = i;
+        while (j < n && /\s/.test(body[j])) j++;
+        if (body[j] === ":") {
+          j++;
+          while (j < n && /\s/.test(body[j])) j++;
+          if (body[j] === "{") {
+            valueStart = j;
+            break;
+          }
+        }
+      }
+      continue;
+    }
+    if (c === "/" && body[i + 1] === "/") {
+      while (i < n && body[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && body[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(body[i] === "*" && body[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") depth--;
+    i++;
+  }
+  if (valueStart < 0) return null;
+
+  // Match braces from valueStart to find the matching closing brace.
+  inStr = false;
+  let d = 0;
+  let j = valueStart;
+  while (j < n) {
+    const c = body[j];
+    if (inStr) {
+      if (c === "\\") j += 2;
+      else {
+        if (c === '"') inStr = false;
+        j++;
+      }
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      j++;
+      continue;
+    }
+    if (c === "/" && body[j + 1] === "/") {
+      while (j < n && body[j] !== "\n") j++;
+      continue;
+    }
+    if (c === "/" && body[j + 1] === "*") {
+      j += 2;
+      while (j < n && !(body[j] === "*" && body[j + 1] === "/")) j++;
+      j += 2;
+      continue;
+    }
+    if (c === "{") d++;
+    else if (c === "}") {
+      d--;
+      if (d === 0) return { start: valueStart + bom, end: j + bom };
+    }
+    j++;
+  }
+  return null;
+}
+
+// Index of the root object's closing `}` (string/comment safe), or -1 when the
+// document is not an object literal. A leading BOM is skipped internally but
+// returned indices are still relative to the original caller-supplied text so
+// callers slice the original bytes correctly (sibling fix of #5).
+function findRootObjectEnd(text) {
+  let bom = 0;
+  if (text.charCodeAt(0) === 0xfeff) bom = 1;
+  const body = bom ? text.slice(1) : text;
+  let inStr = false;
+  let depth = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (inStr) {
+      if (c === "\\") i++;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      continue;
+    }
+    if (c === "/" && body[i + 1] === "/") {
+      while (i < body.length && body[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && body[i + 1] === "*") {
+      i += 2;
+      while (i < body.length && !(body[i] === "*" && body[i + 1] === "/")) i++;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i + bom;
+    }
+  }
+  return -1;
+}
+
+// Locate the span { start, end } of the NAMED OBJECT entry inside a parent
+// object-value span. The parent span covers `{ ... }` of the containing map
+// (e.g. the value of `"mcp": { ... }`). Walks through the map text with full
+// brace-balancing and string/comment awareness so a nested object value
+// (e.g. `"workled": { "effects": { "thinking": {...} } }`) does NOT cut the
+// match short at an inner `}`. Used by upsertJsoncEntry / removeJsoncEntry
+// to replace the regex `[^{}]*` that choked on nested values (fixes #4/#10).
+// Returns null when the named entry is absent.
+//
+// NOTE: the caller passes text.slice(span.start, span.end) which INCLUDES the
+// outer opening `{` at index 0 and the closing `}` at the last index. After
+// we consume the outer `{` depth becomes 1, and keys written inside the map
+// are encountered at depth == 1 (not 0).
+//
+// Exported for unit tests (fixes #9 — nesting, inline comments, and strings
+// containing `{}` must not cut the span short).
+export function findNamedObjectSpanInMap(mapText, name) {
+  const needle = `"${name}"`;
+  const n = mapText.length;
+  let inStr = false;
+  let i = 0;
+  // Depth starts at 0 and increments once when we see the outer `{` of the
+  // enclosing map. Top-level keys of the map (e.g. "workled", "my-other-mcp")
+  // therefore live at depth == 1; any nested objects push depth to >= 2.
+  let depth = 0;
+
+  while (i < n) {
+    const c = mapText[i];
+    if (inStr) {
+      if (c === "\\") i += 2;
+      else {
+        if (c === '"') inStr = false;
+        i++;
+      }
+      continue;
+    }
+    if (c === '"') {
+      const start = i;
+      i++;
+      while (i < n) {
+        if (mapText[i] === "\\") i += 2;
+        else if (mapText[i] === '"') { i++; break; }
+        else i++;
+      }
+      // Keys at depth 1 inside the slice = top-level keys of the containing
+      // map (after consuming the outer `{`). This is where we match needle.
+      if (depth === 1 && mapText.slice(start, i) === needle) {
+        let j = i;
+        while (j < n && /\s/.test(mapText[j])) j++;
+        if (mapText[j] === ":") {
+          j++;
+          while (j < n && /\s/.test(mapText[j])) j++;
+          if (mapText[j] === "{") {
+            // Brace-balance to find the matching `}`. Nesting depth here is
+            // local to the needle's value object so we start a fresh counter.
+            const objStart = j;
+            let d = 0;
+            let k = j;
+            while (k < n) {
+              const cc = mapText[k];
+              if (inStr) {
+                if (cc === "\\") k += 2;
+                else { if (cc === '"') inStr = false; k++; }
+                continue;
+              }
+              if (cc === '"') { inStr = true; k++; continue; }
+              if (cc === "/" && mapText[k + 1] === "/") { while (k < n && mapText[k] !== "\n") k++; continue; }
+              if (cc === "/" && mapText[k + 1] === "*") { k += 2; while (k < n && !(mapText[k] === "*" && mapText[k + 1] === "/")) k++; k += 2; continue; }
+              if (cc === "{") d++;
+              else if (cc === "}") { d--; if (d === 0) return { start: objStart, end: k }; }
+              k++;
+            }
+          }
+        }
+      }
+      continue;
+    }
+    if (c === "/" && mapText[i + 1] === "/") { while (i < n && mapText[i] !== "\n") i++; continue; }
+    if (c === "/" && mapText[i + 1] === "*") { i += 2; while (i < n && !(mapText[i] === "*" && mapText[i + 1] === "/")) i++; i += 2; continue; }
+    if (c === "{" || c === "[") depth++;
+    else if (c === "}" || c === "]") depth--;
+    i++;
+  }
+  return null;
+}
+
+// Whitespace prefix of the line containing <index>.
+function lineIndentAt(text, index) {
+  let lineStart = index;
+  while (lineStart > 0 && text[lineStart - 1] !== "\n") lineStart--;
+  const m = text.slice(lineStart, index).match(/^[\t ]*/);
+  return m ? m[0] : "";
+}
+
+// Format a server entry as a multi-line JSON object block.
+// <keyIndent> is the indentation that the `"serverName": {` line itself
+// should sit at (i.e. the indent of a sibling key inside the containing
+// map); child fields sit one level deeper, consistently using 2 spaces.
+function jsoncEntryBlock(serverName, entry, keyIndent) {
+  const fieldIndent = keyIndent + "  ";
+  const keys = Object.keys(entry);
+  const lines = [`${keyIndent}${JSON.stringify(serverName)}: {`];
+  keys.forEach((k, idx) => {
+    const comma = idx < keys.length - 1 ? "," : "";
+    lines.push(`${fieldIndent}${JSON.stringify(k)}: ${JSON.stringify(entry[k])}${comma}`);
+  });
+  lines.push(`${keyIndent}}`);
+  return lines.join("\n");
+}
+
+// First non-whitespace, non-comment character at/after <from>.
+function nextSignificant(text, from) {
+  let i = from;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    return { index: i, char: c };
+  }
+  return { index: n, char: "" };
+}
+
+// First non-whitespace, non-comment character strictly before <from>.
+function prevSignificant(text, from) {
+  let i = from - 1;
+  while (i >= 0) {
+    const c = text[i];
+    if (/\s/.test(c)) {
+      i--;
+      continue;
+    }
+    if (c === "/" && text[i - 1] === "/") {
+      const lineStart = text.lastIndexOf("\n", i - 1) + 1;
+      i = lineStart - 1;
+      continue;
+    }
+    if (c === "/" && text[i - 1] === "*") {
+      const open = text.lastIndexOf("/*", i - 2);
+      i = open >= 0 ? open - 1 : i - 2;
+      continue;
+    }
+    return { index: i, char: c };
+  }
+  return { index: -1, char: "" };
+}
+
+// Find the character index of the OPENING QUOTE of a QUOTED KEY ("...") that
+// sits immediately before `valObjStart` (the `{` of an object value).
+// Specifically: when we see the `{` of e.g. `"workled": { ... }`, this helper
+// walks backwards, properly honoring escape sequences, to land on the FIRST
+// character of the `"workled"` key (the opening double quote) and NOT on the
+// closing double quote (fixes the remove/upsert surgery where only half the
+// key string was being deleted). Then, to make sure we haven't walked into a
+// string value instead of a key, we verify that the token before this quoted
+// string is NOT a colon (a key sits after nothing / `{` / `,` or whitespace,
+// never after `:`).
+//
+// Exported for unit tests (fixes #10 — cross-line `"key":\n  { ... }` layouts
+// and string values containing escaped quotes/colons must not return the
+// wrong starting index, otherwise the key string is only half-deleted).
+export function findKeyLineStartForValue(text, valObjStart) {
+  let i = valObjStart;
+  while (i > 0) {
+    const c = text[i];
+    if (c === '"') {
+      // Candidate closing quote. Walk backwards (honoring \ escapes) to the
+      // matching opening quote of this string.
+      let j = i - 1;
+      while (j >= 0) {
+        if (text[j] === "\\") {
+          // skip the escaped character (or just the backslash at the start)
+          j -= 2;
+          continue;
+        }
+        if (text[j] === '"') {
+          // FOUND the opening quote at index `j`.
+          // Verify this is a KEY (not a VALUE): the non-whitespace character
+          // BEFORE position j must NOT be `:` (it's typically `{` or `,`).
+          let k = j - 1;
+          while (k >= 0 && /\s/.test(text[k])) k--;
+          if (k >= 0 && text[k] === ":") {
+            // It's a value string. Keep the outer backwards-scan going from
+            // BEFORE this value string.
+            i = k - 1;
+          } else {
+            // Opening quote of a map key. This is what we want.
+            return j;
+          }
+          break;
+        }
+        j--;
+      }
+      if (j < 0) { i--; continue; }
+      continue;
+    }
+    i--;
+  }
+  return -1;
+}
+
+// Insert or replace the <serverName> entry under a top-level <key> map in raw
+// JSONC text, preserving every unrelated byte. Returns the edited text, or null
+// when surgery is not possible (caller falls back to a JSON.stringify rewrite).
+export function upsertJsoncEntry(text, key, serverName, entry) {
+  const span = findTopLevelObjectValueSpan(text, key);
+  if (!span) {
+    // No top-level <key> yet: append it inside the root object.
+    const rootEnd = findRootObjectEnd(text);
+    if (rootEnd < 0) return null;
+    const keyIndent = lineIndentAt(text, rootEnd);
+    const block = `${JSON.stringify(key)}: {\n${jsoncEntryBlock(serverName, entry, keyIndent + "  ")}\n${keyIndent}}`;
+    const before = text.slice(0, rootEnd);
+    const after = text.slice(rootEnd);
+    const prev = prevSignificant(before, before.length);
+    const sep = prev.char === "{" ? "\n" : ",\n";
+    return before + sep + block + after;
+  }
+  const mapSlice = text.slice(span.start, span.end);
+  // Use the brace-balancing scanner (not the naive `[^{}]*` regex) so a
+  // nested value inside the entry (e.g. `"effects": {...}` inside workled)
+  // doesn't truncate the match (fixes #4/#10 — without this we'd overwrite
+  // only up to the first inner `}` leaving the rest of the object and a
+  // stray `}` that corrupts the file).
+  const found = findNamedObjectSpanInMap(mapSlice, serverName);
+  if (found) {
+    // Existing entry: replace the FULL `"serverName": { ... }` span.
+    // jsoncEntryBlock emits the key together with the value block, so the
+    // replacement range must cover the entire key:value (not just the value
+    // object). Indentation is inherited from the original key line so
+    // `"workled":\n  { ... }` layouts remain consistent after re-insertion.
+    const objAbsoluteStart = span.start + found.start; // index of `{`
+    const objAbsoluteEnd   = span.start + found.end;   // index of matching `}`
+    const keyIdx = findKeyLineStartForValue(text, objAbsoluteStart);
+    const replaceFrom = keyIdx >= 0 ? keyIdx : objAbsoluteStart;
+    const replaceTo   = objAbsoluteEnd + 1; // include closing `}`
+    const keyIndent = lineIndentAt(text, replaceFrom);
+    return text.slice(0, replaceFrom) + jsoncEntryBlock(serverName, entry, keyIndent) + text.slice(replaceTo);
+  }
+  // Insert at the end of the map (just before its closing brace).
+  const keyIndent = lineIndentAt(text, span.start);
+  const inner = text.slice(span.start + 1, span.end).replace(/\s+$/, "");
+  const lastSig = prevSignificant(inner, inner.length);
+  let sep;
+  if (stripJsonc(inner).trim() === "") sep = ""; // empty (or comment-only) map
+  else if (lastSig.char === ",") sep = "\n"; // JSONC trailing comma already present
+  else sep = ",";
+  return (
+    text.slice(0, span.start + 1) +
+    inner +
+    sep +
+    "\n" +
+    jsoncEntryBlock(serverName, entry, keyIndent + "  ") +
+    "\n" +
+    keyIndent +
+    text.slice(span.end)
+  );
+}
+
+// Remove the <serverName> entry from a top-level <key> map in raw JSONC text,
+// fixing surrounding commas. Returns the edited text, or null when the entry or
+// the map is absent. Uses findNamedObjectSpanInMap so entries with nested
+// object values (e.g. workled.effects = {...}) are correctly removed end-to-end
+// instead of being truncated at the first inner `}` (fixes #4/#10).
+export function removeJsoncEntry(text, key, serverName) {
+  const span = findTopLevelObjectValueSpan(text, key);
+  if (!span) return null;
+  const mapSlice = text.slice(span.start, span.end);
+  const found = findNamedObjectSpanInMap(mapSlice, serverName);
+  if (!found) return null;
+  // Compute the KEY start + value end, so comma cleanup covers the full
+  // `"key": { ... }` range not just the value part.
+  const objAbsoluteStart = span.start + found.start;
+  const objAbsoluteEnd   = span.start + found.end;
+  const keyIdx = findKeyLineStartForValue(text, objAbsoluteStart);
+  // If we can't find the key line, still attempt cleanup starting at the
+  // value's `{` — it'll leave `"workled": ` dangling but that's obvious and
+  // the isValidJsonc guard will refuse the edit (fallback to full rewrite).
+  const removeFrom = keyIdx >= 0 ? keyIdx : objAbsoluteStart;
+  const removeTo   = objAbsoluteEnd + 1; // include the closing `}`
+
+  const after = nextSignificant(text, removeTo);
+  if (after.char === ",") {
+    // Not the last member: drop the entry and the comma that followed it.
+    return text.slice(0, removeFrom) + text.slice(after.index + 1);
+  }
+  const prev = prevSignificant(text, removeFrom);
+  if (prev.char === ",") {
+    // Last member: also drop the comma that preceded it.
+    return text.slice(0, prev.index) + text.slice(removeTo);
+  }
+  // Only member: drop just the entry (the map becomes {}).
+  return text.slice(0, removeFrom) + text.slice(removeTo);
+}
+
 // ---- hook command construction (agy / hermes) -------------------------------
 
 function hookCommand(eventName) {
@@ -260,10 +748,14 @@ function removeMcpServerYaml(file, keyCandidates) {
     const blockLines = lines.slice(split.start, split.end);
     // Detect the indent used for server keys inside this block (e.g. 2
     // spaces, 4 spaces). Server keys live at the deepest level under the
-    // top-level block, so we look for any indented `name:` mapping.
+    // top-level block, so we look for any indented block-start mapping.
+    // Uses isBlockStartKey so inline values (`url: "...":` even with a
+    // colon in the URL string), anchors (`&ref`), aliases (`*ref`), and
+    // flow syntax (`{...}` / `[...]`) are not mistaken for a new block key.
     let serverIndent = null;
     for (const line of blockLines) {
-      const m = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
+      if (!isBlockStartKey(line)) continue;
+      const m = line.match(/^(\s+)/);
       if (m) {
         serverIndent = m[1];
         break;
@@ -276,9 +768,13 @@ function removeMcpServerYaml(file, keyCandidates) {
     let skipping = false;
     const curIndentLen = serverIndent.length;
     for (const line of blockLines) {
-      const serverKey = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
-      if (serverKey && serverKey[1].length === curIndentLen) {
-        if (serverKey[2] === "workled") {
+      const blockStarter = isBlockStartKey(line);
+      const indentMatch = line.match(/^(\s+)/);
+      const lineIndentLen = indentMatch ? indentMatch[1].length : 0;
+      if (blockStarter && lineIndentLen === curIndentLen) {
+        const nameMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-:]*):/);
+        const name = nameMatch ? nameMatch[1] : null;
+        if (name === "workled") {
           skipping = true;
           continue;
         } else {
@@ -328,14 +824,43 @@ function removeMcpServer(source) {
   }
   const file = source.path();
   if (!existsSync(file)) return null;
-  const obj = readJsonOrEmpty(file);
-  if (!obj || typeof obj !== "object") return null;
-  const map = obj[source.key];
-  if (!map || typeof map !== "object" || map.workled === undefined) return null;
-  delete map.workled;
-  if (Object.keys(map).length === 0) delete obj[source.key];
-  writeConfig(file, obj);
+  const raw = readFileSync(file, "utf8");
+  if (!isValidJsonc(raw)) return null;
+  let edited = removeJsoncEntry(raw, source.key, "workled");
+  if (edited == null) return null; // no workled entry here
+  // Drop the map too when uninstall emptied it (replaces the old `delete obj[key]`).
+  const dropped = removeJsoncKey(edited, source.key);
+  if (dropped != null) edited = dropped;
+  // Safety net: if surgery produced an unparseable file, leave it untouched.
+  if (!isValidJsonc(edited)) return null;
+  writeFileSync(file, edited, "utf8");
   return `Removed workled from ${source.key} -> ${file}`;
+}
+
+// Remove a top-level <key> entry (the whole `"key": {...}`) from raw JSONC
+// text, fixing the surrounding comma. Returns the edited text, or null when the
+// key is absent. Only used to drop an emptied map left behind by uninstall.
+export function removeJsoncKey(text, key) {
+  const span = findTopLevelObjectValueSpan(text, key);
+  if (!span) return null;
+  const inner = text.slice(span.start + 1, span.end);
+  if (stripJsonc(inner).trim() !== "") return null; // refuse to drop a populated map
+  const needle = `"${key}"`;
+  const keyAt = text.lastIndexOf(needle, span.start - 1);
+  if (keyAt < 0) return null;
+  const sep = text.slice(keyAt + needle.length, span.start);
+  if (!/^\s*:\s*$/.test(sep)) return null;
+
+  const after = nextSignificant(text, span.end + 1);
+  let start = keyAt;
+  let end = span.end + 1;
+  if (after.char === ",") {
+    end = after.index + 1;
+  } else {
+    const before = prevSignificant(text, keyAt);
+    if (before.char === ",") start = before.index;
+  }
+  return text.slice(0, start) + text.slice(end);
 }
 
 // Remove the `workled` MCP server entry from every config source of one client
@@ -376,18 +901,30 @@ function workledHookCommand(eventName) {
 // PreToolUse) restricts the hook to a specific tool so it does NOT run on every
 // tool call — a bare PreToolUse hook would spawn a ~3.6s process per Bash/Read/
 // Write and stall the agent. The `input` state is emitted only when the matched
-// tool is one of the workled "input" tools (see getInputTools / WORKLED_INPUT_TOOLS).
+// tool is one of the workled "input" tools (see getInputTools — a fixed
+// "question" substring match).
 const WORKLED_HOOK_SPECS = [
   { event: "UserPromptSubmit", matcher: null },
   { event: "Stop", matcher: null },
   { event: "PreToolUse", matcher: "AskUserQuestion" },
+  // PostToolUse maps to "thinking" (HOOK_MAP) so confirming an AskUserQuestion
+  // returns the LED to the working state; it fires when the user answers, so it
+  // never touches the wait window that PreToolUse's "input" must cover.
+  { event: "PostToolUse", matcher: "AskUserQuestion" },
 ];
 
 // Write workled hooks into ~/.workbuddy/settings.json. Idempotent: any prior
 // workled entry for the same event is replaced first.
 function registerWorkledSettingsHooks() {
   const settingsFile = join(h, ".workbuddy", "settings.json");
-  const settings = readJsonOrEmpty(settingsFile) || {};
+  const parsed = readJsonOrEmpty(settingsFile);
+  // Never overwrite a settings.json that exists but cannot be parsed: the
+  // user's other settings would be lost. Warn and bail out instead.
+  if (parsed === null && existsSync(settingsFile)) {
+    console.warn(`SKIPPED writing hooks: ${settingsFile} is unreadable, not modified`);
+    return `SKIPPED workled hooks -> ${settingsFile} (unreadable, not modified)`;
+  }
+  const settings = parsed || {};
   if (!settings.hooks || typeof settings.hooks !== "object") settings.hooks = {};
   for (const spec of WORKLED_HOOK_SPECS) {
     const ev = spec.event;
@@ -452,14 +989,24 @@ function unregisterWorkledSettingsHooks() {
 }
 
 // Inverse of removeMcpServer: write the `workled` server entry into one MCP
-// source (JSON or YAML). For JSON, an existing `type` (e.g. WorkBuddy's
-// "remote") is preserved so we never downgrade a client's transport setting.
+// source (JSON or YAML). For JSON, an existing `type` is preserved and a fresh
+// entry is written with the source's default `type` (see MCP_SOURCES), so
+// clients that require an explicit transport declaration (opencode/kilo/
+// workbuddy use "remote") never get a bare `{ url, enabled }` entry that the
+// client would ignore.
 function addMcpServer(source, entry) {
   if (source.format === "yaml") {
     return addMcpServerYaml(source.path(), source.key, "workled", entry);
   }
   const file = source.path();
-  const obj = readJsonOrEmpty(file) || {};
+  // A corrupt existing config must never be flattened to {} and written back,
+  // or the user's other servers would be lost. Skip the source with a warning
+  // instead; a missing file still falls through to creating a fresh entry.
+  const raw = existsSync(file) ? readFileSync(file, "utf8") : null;
+  if (raw != null && !isValidJsonc(raw)) {
+    return `SKIPPED workled -> ${source.key} (${file}): config file unreadable, not modified`;
+  }
+  const obj = raw == null ? {} : JSON.parse(stripJsonc(raw));
   const map =
     obj[source.key] && typeof obj[source.key] === "object"
       ? obj[source.key]
@@ -469,14 +1016,39 @@ function addMcpServer(source, entry) {
   // entry carries the placeholder but an existing real URL is present, keep the
   // real one. This guards `install` runs where WORKLED_MCP_URL / Bluetooth are
   // unavailable (placeholder path) yet a valid config already exists.
-  const PLACEHOLDER = "<device-name>";
-  const isPlaceholder = (u) => typeof u === "string" && u.includes(PLACEHOLDER);
-  const url = isPlaceholder(entry.url) && existing.url && !isPlaceholder(existing.url)
-    ? existing.url
-    : entry.url;
-  const merged = { url, enabled: entry.enabled !== false };
-  if (existing.type) merged.type = existing.type;
-  map.workled = merged;
+  const url = resolveMergedUrl(existing.url, entry.url);
+  const desired = { url, enabled: entry.enabled !== false };
+  // Existing type wins; otherwise fall back to the source's default so fresh
+  // installs carry the transport declaration their client requires.
+  const type = resolveMcpType(existing.type, source.type);
+  if (type) desired.type = type;
+
+  if (raw == null) {
+    // No file yet: create a minimal one with just the workled server.
+    writeConfig(file, { [source.key]: { workled: desired } });
+    return `Registered workled -> ${source.key} (${file})`;
+  }
+
+  // No-op fast path: the entry already matches. Do not rewrite the file — this
+  // keeps user comments and formatting untouched across repeated installs.
+  const same =
+    existing.url === desired.url &&
+    (existing.enabled === undefined ? true : existing.enabled) === desired.enabled &&
+    (existing.type || null) === (desired.type || null);
+  if (same) {
+    return `Registered workled -> ${source.key} (${file}) (unchanged)`;
+  }
+
+  // Preferred path: byte-level surgery that preserves user comments, key
+  // order, and formatting. Falls back to a full JSON.stringify rewrite only if
+  // the layout defeats the editor (the file was already validated as parseable,
+  // so the rewrite loses nothing but comments/formatting).
+  const edited = upsertJsoncEntry(raw, source.key, "workled", desired);
+  if (edited != null && isValidJsonc(edited)) {
+    writeFileSync(file, edited, "utf8");
+    return `Registered workled -> ${source.key} (${file})`;
+  }
+  map.workled = desired;
   writeConfig(file, obj);
   return `Registered workled -> ${source.key} (${file})`;
 }
@@ -503,7 +1075,8 @@ function addMcpServerYaml(file, key, serverName, entry) {
   const blockLines = lines.slice(split.start, split.end);
   let sIndent = "  ";
   for (const l of blockLines) {
-    const m = l.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
+    if (!isBlockStartKey(l)) continue;
+    const m = l.match(/^(\s+)/);
     if (m) {
       sIndent = m[1];
       break;
@@ -511,10 +1084,15 @@ function addMcpServerYaml(file, key, serverName, entry) {
   }
   const out = [];
   let skipping = false;
+  const targetIndentLen = sIndent.length;
   for (const l of blockLines) {
-    const m = l.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
-    if (m && m[1] === sIndent) {
-      if (m[2] === serverName) {
+    const blockStarter = isBlockStartKey(l);
+    const indentMatch = l.match(/^(\s+)/);
+    const lineIndentLen = indentMatch ? indentMatch[1].length : 0;
+    if (blockStarter && lineIndentLen === targetIndentLen) {
+      const nameMatch = l.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-:]*):/);
+      const name = nameMatch ? nameMatch[1] : null;
+      if (name === serverName) {
         skipping = true;
         continue;
       }
@@ -866,14 +1444,80 @@ function hermesCommandYaml(ev) {
   return JSON.stringify(hookCommand(ev));
 }
 
+// True when <line> is a YAML document boundary:
+//   `---`  document start / explicit directives end
+//   `...`  document end
+// Anchors/comments/flow markers are not boundaries. Used to avoid straddling
+// multi-doc YAML files (fixes #9 — previously a workled block in doc #1
+// could be detected as spanning all the way down through subsequent docs).
+function isYamlDocBoundary(line) {
+  return /^---\s*(#.*)?$|^\.\.\.\s*(#.*)?$/.test(line.trim());
+}
+// True when a line that starts an indented mapping key (e.g. "  workled:") is
+// actually a BLOCK start — i.e. the value lives on subsequent indented lines,
+// NOT inline after the colon. The following inline forms must NOT be treated
+// as block starts (fixes #9):
+//   - anchors / aliases:   `  workled: &common` / `  workled: *ref`
+//   - flow maps / lists:   `  workled: { a: 1 }` / `  workled: [1, 2]`
+//   - plain scalars:       `  url: "http://..."` / `  enabled: true`
+// Without this check, `url: "http://..."` lines whose quoted value contains
+// a trailing `:` would falsely be detected as nested keys, collapsing the
+// server body and leaving stale fields behind.
+function isBlockStartKey(line) {
+  const m = line.match(/^(\s*)([A-Za-z_][A-Za-z0-9_.\-:]*):(.*)$/);
+  if (!m) return false;
+  const rest = m[3].trim();
+  // Drop a trailing YAML comment from the "rest" portion before checking.
+  const stripped = rest.replace(/\s+#.*$/, "");
+  if (stripped === "") return true; // key: EOL or key: # comment only
+  // Inline value is present → NOT a block start. Any anchor/alias/flow
+  // opener / plain scalar counts as inline.
+  if (/^[&*?!>|%@`]/.test(stripped)) return false;
+  if (/^[\[{"']/.test(stripped)) return false; // flow scalar
+  if (/^\d/.test(stripped)) return false;      // number / timestamp
+  return false; // any other non-empty tail (e.g. `enabled: true`) is inline
+}
+// Same as isBlockStartKey but for UNINDENTED top-level keys. Accepts a
+// candidate key name so we also match `key: # end-of-line comment` as a
+// valid block start. Used by splitTopLevelBlock to anchor the search.
+function isTopLevelKeyStart(line, key) {
+  const re = new RegExp(`^${key}:(.*)$`);
+  const m = line.match(re);
+  if (!m) return false;
+  if (/^\s/.test(line)) return false; // top-level means line starts with the key
+  const rest = m[1].trim().replace(/\s+#.*$/, "");
+  if (rest === "") return true;
+  // A value exists on the same line: not a block start.
+  return false;
+}
+
 // Split a YAML document into a leading top-level block for a given key and the
 // remainder, so the caller can replace just that key.
-function splitTopLevelBlock(yamlText, key) {
+//
+// YAML feature coverage (fixes #9):
+//   * Multi-doc (`---` / `...` boundaries): block end detection stops at the
+//     next top-level key OR next document boundary, whichever comes first.
+//   * Anchors/aliases: `key: &anchor` at top level is not mistaken for a
+//     block body; `*ref` values don't look like indented keys.
+//   * Flow syntax (inline maps `{...}` and lists `[...]`): inline values are
+//     not treated as nested keys, so values like `url: "http://x:y"` don't
+//     confuse the indent-based server-key detector.
+//
+// Exported for unit tests so the three new YAML parsing invariants of #9 are
+// independently assertable (no need to hit the filesystem install helpers).
+export function splitTopLevelBlock(yamlText, key) {
   const lines = yamlText.split("\n");
-  const keyLineRe = new RegExp(`^${key}:\\s*$|^${key}:\\s+`);
+  // If the file contains multiple documents, only search the FIRST one for
+  // our key. Config.yaml is overwhelmingly a single-doc file, but when a
+  // hand-edited file uses `---` we should not span docs.
   let start = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (keyLineRe.test(lines[i]) && !/^\s/.test(lines[i])) {
+    const l = lines[i];
+    if (isYamlDocBoundary(l) && start !== -1) {
+      // Encountered a doc boundary AFTER locating our key — block ends here.
+      return { start, end: i };
+    }
+    if (isTopLevelKeyStart(l, key)) {
       start = i;
       break;
     }
@@ -881,7 +1525,14 @@ function splitTopLevelBlock(yamlText, key) {
   if (start === -1) return null;
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    if (lines[i].trim() !== "" && !/^\s/.test(lines[i])) {
+    const l = lines[i];
+    // Next non-empty, non-indented line = next top-level key = block ends.
+    if (l.trim() !== "" && !/^\s/.test(l)) {
+      end = i;
+      break;
+    }
+    // Explicit YAML doc boundary also ends the block (and the doc).
+    if (isYamlDocBoundary(l)) {
       end = i;
       break;
     }
@@ -892,15 +1543,20 @@ function splitTopLevelBlock(yamlText, key) {
 // Detect the indentation of event keys inside an existing `hooks:` block, so we
 // reuse whatever indent the user's config uses instead of assuming 2 spaces.
 // Falls back to 2 spaces (the canonical default) when no indented key is found.
+// Uses isBlockStartKey so inline scalars / anchors / flow syntax are not
+// mistaken for block event keys (fixes #9).
 function detectEventIndent(blockLines) {
   for (const line of blockLines) {
-    const m = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
+    if (!isBlockStartKey(line)) continue;
+    const m = line.match(/^(\s+)/);
     if (m && m[1].length >= 1 && m[1].length <= 6) return m[1];
   }
   return "  ";
 }
 
-function installHermesHooks(yamlText) {
+// Exported for unit tests (fixes #9). Purely rewrites the hermes hooks block;
+// does not touch the filesystem (the filesystem helpers call into this).
+export function installHermesHooks(yamlText) {
   const events = hermesHookEvents();
   const split = splitTopLevelBlock(yamlText, "hooks");
   if (!split) {
@@ -926,15 +1582,18 @@ function installHermesHooks(yamlText) {
   let currentEvent = null;
   const ensured = new Set();
   for (const line of blockLines) {
-    const evMatch = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
-    if (evMatch && evMatch[1].length > 0) {
+    const isBlock = isBlockStartKey(line);
+    const evIndentMatch = line.match(/^(\s+)/);
+    if (isBlock && evIndentMatch && evIndentMatch[1].length > 0) {
       // Any indented map key under `hooks:` is an event key. Keep its own
       // indentation; entries are derived one level deeper than that key.
-      currentEvent = evMatch[2];
+      const nameMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-:]*):/);
+      if (!nameMatch) { out.push(line); continue; }
+      currentEvent = nameMatch[1];
       out.push(line);
       if (events.includes(currentEvent) && !ensured.has(currentEvent)) {
         ensured.add(currentEvent);
-        out.push(`${evMatch[1]}  - command: ${hermesCommandYaml(currentEvent)}`);
+        out.push(`${evIndentMatch[1]}  - command: ${hermesCommandYaml(currentEvent)}`);
       }
       continue;
     }
@@ -947,7 +1606,9 @@ function installHermesHooks(yamlText) {
     }
     // Drop orphan continuation lines left behind by previous broken installs
     // (e.g. " hook --event" that no longer has a parent - command: line).
-    const isOrphan = /^\s+\S+/.test(line) && !line.includes("command:");
+    // Only lines that carry the workled "hook --event" fragment qualify, so a
+    // user's own continuation lines (e.g. a hook's "timeout:") are preserved.
+    const isOrphan = /^\s+\S+/.test(line) && !line.includes("command:") && line.includes("hook --event");
     if (isOrphan) continue;
     out.push(line);
   }
@@ -962,7 +1623,9 @@ function installHermesHooks(yamlText) {
   return [...before, ...out, ...after].join("\n");
 }
 
-function uninstallHermesHooks(yamlText) {
+// Exported for unit tests (fixes #9). Purely rewrites the hermes hooks block;
+// does not touch the filesystem (the filesystem helpers call into this).
+export function uninstallHermesHooks(yamlText) {
   const events = hermesHookEvents();
   const split = splitTopLevelBlock(yamlText, "hooks");
   if (!split) return yamlText;
@@ -977,11 +1640,16 @@ function uninstallHermesHooks(yamlText) {
   for (const line of blockLines) {
     if (line.trim() === "") continue;
     if (!/^\s/.test(line)) continue;
-    const evMatch = line.match(/^(\s+)([A-Za-z_][A-Za-z0-9_]*):\s*$/);
-    if (evMatch) {
-      cur = { key: evMatch[2], indent: evMatch[1], entries: [] };
-      groups.push(cur);
-    } else if (cur) {
+    const evIndentMatch = line.match(/^(\s+)/);
+    if (isBlockStartKey(line) && evIndentMatch) {
+      const nameMatch = line.match(/^\s*([A-Za-z_][A-Za-z0-9_.\-:]*):/);
+      if (nameMatch) {
+        cur = { key: nameMatch[1], indent: evIndentMatch[1], entries: [] };
+        groups.push(cur);
+        continue;
+      }
+    }
+    if (cur) {
       cur.entries.push(line);
     } else {
       // Indented line before any event group (odd but harmless): keep it so
@@ -994,11 +1662,13 @@ function uninstallHermesHooks(yamlText) {
     }
   }
   // Drop only our workled entries; keep everything else (indent-preserving).
+  // A workled event group keeps its remaining entries, so the user's own hooks
+  // on the same event survive an uninstall.
   const keptGroups = groups
     .map((g) => {
       const workledEvt = events.includes(g.key);
       const kept = workledEvt
-        ? g.entries.filter((l) => !/^\s*-\s+command:.*workled/.test(l) && !/^\s+\S+/.test(l))
+        ? g.entries.filter((l) => !/^\s*-\s+command:.*workled/.test(l))
         : g.entries;
       return { key: g.key, indent: g.indent, entries: kept };
     })
@@ -1122,10 +1792,12 @@ async function main() {
     const url = await resolveWorkledMcpUrl();
     if (url.includes("<device-name>")) {
       console.warn(
-        "Warning: no WORKLED_MCP_URL set and no workled device discovered via " +
-          "Bluetooth. Wrote a placeholder URL (http://<device-name>.local:18791/mcp); " +
-          "replace <device-name> with your real workled device name (e.g. HomeAnt-XXXX), " +
-          "or set WORKLED_MCP_URL, before connecting."
+        "Warning: no WORKLED_MCP_URL set. A placeholder URL " +
+          "(http://<device-name>.local:18791/mcp) will be " +
+          "written into configs that have no existing workled entry (e.g. after an " +
+          "earlier uninstall) — existing real URLs are kept. Replace <device-name> with " +
+          "your real workled device name (e.g. HomeAnt-XXXX), or re-run install with " +
+          "WORKLED_MCP_URL set, before connecting."
       );
     }
     mcpEntry = { url, enabled: true };
@@ -1237,7 +1909,10 @@ async function main() {
   if (action === "install" && !fileArg) {
     // Run status check to see if MCP is configured
     const { spawnSync } = await import("child_process");
-    const statusResult = spawnSync("node", [corePath, "status"], {
+    // Use process.execPath (the same Node this installer runs under) instead
+    // of a bare "node": the status check then works even when the user's PATH
+    // has no Node entry (e.g. invoked through an IDE-managed runtime).
+    const statusResult = spawnSync(process.execPath, [corePath, "status"], {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -1260,7 +1935,12 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`install.mjs error: ${err && err.stack}`);
-  process.exit(1);
-});
+// Run only when invoked directly (not when imported by the test suite, which
+// needs the exported JSONC editor helpers without triggering an install).
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  main().catch((err) => {
+    console.error(`install.mjs error: ${err && err.stack}`);
+    process.exit(1);
+  });
+}

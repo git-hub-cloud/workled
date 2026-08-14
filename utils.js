@@ -52,6 +52,20 @@ export function stripJsonc(src) {
       i++;
       continue;
     }
+    if (c === ",") {
+      // JSONC allows a trailing comma before a closing brace/bracket
+      // (`{"a": 1,}`). Drop such a comma. This branch is only reached outside
+      // string literals, so a literal `,}` inside a string value is untouched.
+      let j = i + 1;
+      while (j < src.length && (src[j] === " " || src[j] === "\t" || src[j] === "\n" || src[j] === "\r")) j++;
+      if (src[j] === "}" || src[j] === "]") {
+        i++;
+        continue;
+      }
+      out += c;
+      i++;
+      continue;
+    }
     if (c === "/" && src[i + 1] === "/") {
       while (i < src.length && src[i] !== "\n") i++;
       continue;
