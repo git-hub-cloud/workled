@@ -64,13 +64,13 @@ Rule of thumb: hue 0-359 picks the hue, saturation 0-255 (0 = white/pastel, 255 
 
 ## Macro Format
 
-Full macro reference [macro_format.md](references/macro_format.md)
+Full macro reference [macro_format.md](macro_format.md)
 
 ## Setup & Troubleshooting
 
 If the device is not responding, run `node <skill-dir>/index.js status`
 and follow the JSON `hint` it prints. Full install / deployment /
-troubleshooting reference: [device_setup.md](references/device_setup.md)
+troubleshooting reference: [device_setup.md](device_setup.md)
 
 ## Contributing
 
