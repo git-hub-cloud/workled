@@ -6,6 +6,7 @@ import { homedir } from "os";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import {
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -16,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { stripJsonc, hermesHome, sleep } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome } from "./utils.js";
 import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -630,11 +631,17 @@ export function upsertJsoncEntry(text, key, serverName, entry) {
     if (rootEnd < 0) return null;
     const keyIndent = lineIndentAt(text, rootEnd);
     const block = `${JSON.stringify(key)}: {\n${jsoncEntryBlock(serverName, entry, keyIndent + "  ")}\n${keyIndent}}`;
-    const before = text.slice(0, rootEnd);
+    let before = text.slice(0, rootEnd);
+    // Clean up interior whitespace when the root object is otherwise empty.
+    // Prevents blank-line accumulation from repeated install/uninstall cycles.
+    const interior = before.slice(1);
+    if (/^\s*$/.test(interior)) {
+      before = "{";
+    }
     const after = text.slice(rootEnd);
     const prev = prevSignificant(before, before.length);
     const sep = prev.char === "{" ? "\n" : ",\n";
-    return before + sep + block + after;
+    return before + sep + block + "\n" + after;
   }
   const mapSlice = text.slice(span.start, span.end);
   // Use the brace-balancing scanner (not the naive `[^{}]*` regex) so a
@@ -834,6 +841,16 @@ function removeMcpServer(source) {
   // Safety net: if surgery produced an unparseable file, leave it untouched.
   if (!isValidJsonc(edited)) return null;
   writeFileSync(file, edited, "utf8");
+  // If the file is now effectively empty `{}`, delete it entirely.
+  // This prevents file litter and blank-line accumulation on re-install.
+  if (existsSync(file)) {
+    const finalRaw = readFileSync(file, "utf8");
+    if (stripJsonc(finalRaw).replace(/\s/g, "") === "{}") {
+      removePath(file);
+      removeEmptyParent(dirname(file));
+      return `Removed workled from ${source.key} -> ${file} (deleted empty config)`;
+    }
+  }
   return `Removed workled from ${source.key} -> ${file}`;
 }
 
@@ -865,10 +882,10 @@ export function removeJsoncKey(text, key) {
 
 // Remove the `workled` MCP server entry from every config source of one client
 // (global + project scope). Returns the list of removal messages produced by
-// removeMcpServer() (null results filtered out); an empty array means no
-// `workled` MCP server entry was found to remove.
+// unregisterWorkledMcp(client) via removeMcpServer() (null results filtered
+// out); an empty array means no `workled` MCP server entry was found to remove.
 function unregisterWorkledMcp(client) {
-  return MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`))
+  return MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`) && !s.patchManaged)
     .map((s) => removeMcpServer(s))
     .filter(Boolean);
 }
@@ -1117,7 +1134,7 @@ function addMcpServerYaml(file, key, serverName, entry) {
 // sources (deduped by path). Mirrors unregisterWorkledMcp so install and
 // uninstall stay symmetric and every client's logic is identical.
 function registerWorkledMcp(client, entry) {
-  const sources = MCP_SOURCES.filter((s) => s.client === `${client}.global`);
+  const sources = MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`) && !s.patchManaged);
   const seen = new Set();
   const msgs = [];
   for (const s of sources) {
@@ -1717,6 +1734,126 @@ function uninstallHermes() {
   return `Removed hermes shell hooks -> ${cfg}`;
 }
 
+// ---- dsh (DeepSeek Harness) --------------------------------------------------
+// dsh architecture: everything is a Cordis plugin — there is no zero-plugin
+// pure-config path. We ship a first-class `workled-dsh-plugin` (sibling
+// directory `./dsh-plugin/`) that:
+//   1. ctx.on() SEVEN native Cordis events (bridge-source-validated):
+//        agent/session-start, agent/pre-step, tools/pre-execute,
+//        tools/post-execute, agent/turn-stopping, subagent/start,
+//        subagent/end
+//   2. drives the workled LED BY DIRECT HTTP to the workled MCP endpoint
+//      (tools/call set_agent_state JSON-RPC POST), no shell hop, no hook CLI.
+
+// cordis.patch.yml insert block: mounts ONLY the native plugin. No extra
+// hooks bridge or MCP-client rows needed because the plugin calls HTTP
+// directly with WORKLED_MCP_URL / config.url.
+//
+// IMPORTANT: `name` and `path` use RELATIVE paths (`../../plugins/workled/...`)
+// because the patch file lives at `<dsh-home>/profiles/web/cordis.patch.yml`
+// and dsh's cordis:include loader resolves the import specifier from that
+// directory. A bare npm package name would fail with ERR_MODULE_NOT_FOUND
+// (the plugin is vendored locally, not in node_modules); an absolute file://
+// URL would be user-specific and break when copied across machines. The
+// relative path is identical for every user because dsh's directory layout
+// is always `<dsh-home>/{profiles/web,plugins/workled}/...`.
+function dshPatchBlock(url) {
+  return [
+    "- insert:",
+    "    - id: workled",
+    "      name: '../../plugins/workled/src/index.js'",
+    "      path: '../../plugins/workled'",
+    "      config:",
+    `        url: '${url}'`,
+    "        timeout: 1500",
+    "        enabled: true",
+  ].join("\n");
+}
+
+// Split a YAML top-level array (rows starting with `- ` at column 0) into
+// items, preserving any prelude lines (comments) before the first item. Used to
+// surgically remove stale workled rows from cordis.patch.yml on re-install /
+// uninstall without touching the user's other rows.
+function splitYamlTopItems(text) {
+  const lines = text.split("\n");
+  const items = [];
+  let cur = null;
+  const prelude = [];
+  for (const line of lines) {
+    if (/^-\s/.test(line)) {
+      if (cur) items.push(cur);
+      cur = [line];
+    } else if (cur) {
+      cur.push(line);
+    } else if (line.trim() !== "") {
+      prelude.push(line);
+    }
+  }
+  if (cur) items.push(cur);
+  items.prelude = prelude;
+  return items;
+}
+
+// Recursively copy the dsh-plugin tree. Node 18+ supports fs.cp; we use a
+// small manual cpDir so the installer doesn't need fs.promises or flag checks.
+function cpDir(src, dest) {
+  mkdirSync(dest, { recursive: true });
+  for (const entry of readdirSync(src, { withFileTypes: true })) {
+    const s = join(src, entry.name);
+    const d = join(dest, entry.name);
+    if (entry.isDirectory()) cpDir(s, d);
+    else copyFileSync(s, d);
+  }
+}
+
+function installDsh() {
+  const home = dshHome();
+  const url = process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
+  mkdirSync(home, { recursive: true });
+  // A) Vend the native Cordis plugin to <dsh-home>/plugins/workled/.
+  const srcPlugin = join(scriptDir, "dsh-plugin");
+  const dstPlugin = join(home, "plugins", "workled");
+  cpDir(srcPlugin, dstPlugin);
+  // B) Mount plugin in the `web` profile cordis.patch.yml (dsh-web-app default).
+  const profileDir = join(home, "profiles", "web");
+  mkdirSync(profileDir, { recursive: true });
+  const patchFile = join(profileDir, "cordis.patch.yml");
+  const block = dshPatchBlock(url);
+  let content = "";
+  if (existsSync(patchFile)) content = readFileSync(patchFile, "utf8");
+  const items = splitYamlTopItems(content);
+  const kept = items.filter((it) => !it.some((l) => l.includes("workled")));
+  const rows = (items.prelude || []).filter((l) => l.trim() !== "[]").concat(kept);
+  rows.push(block.split("\n"));
+  const written = rows.flat().join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+  writeFileSync(patchFile, written, "utf8");
+  return `Installed dsh Cordis plugin -> ${dstPlugin}\nInstalled dsh profile patch -> ${patchFile}`;
+}
+
+function uninstallDsh() {
+  const home = dshHome();
+  const removed = [];
+  // A) Remove vendored plugin tree.
+  const pluginDir = join(home, "plugins", "workled");
+  if (existsSync(pluginDir)) {
+    removePath(pluginDir);
+    removed.push(`Removed dsh plugin dir ${pluginDir}`);
+    removeEmptyParent(dirname(pluginDir));
+  }
+  // B) Strip workled rows from the `web` profile cordis.patch.yml.
+  const patchFile = join(home, "profiles", "web", "cordis.patch.yml");
+  if (existsSync(patchFile)) {
+    const items = splitYamlTopItems(readFileSync(patchFile, "utf8"));
+    const kept = items.filter((it) => !it.some((l) => l.includes("workled")));
+    const rows = (items.prelude || []).filter((l) => l.trim() !== "[]").concat(kept);
+    const written = rows.flat().join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+    const body = kept.length > 0 ? written : (written ? written + "\n" : "") + "[]";
+    writeFileSync(patchFile, body + "\n", "utf8");
+    removed.push(`Removed workled plugin from ${patchFile}`);
+  }
+  return removed.length > 0 ? removed.join("\n") : `No workled install at ${home}`;
+}
+
 // ---- CLI ----------------------------------------------------------------------
 
 // Render one client's --help line from CLIENT_TARGETS: plugin clients use the
@@ -1856,6 +1993,15 @@ async function main() {
         else lines.push(...unregisterWorkledMcp("hermes"));
         break;
       }
+      case "dsh": {
+        const dh = dshHome();
+        lines.push(isInstall ? installDsh() : uninstallDsh());
+        // Reminder lives at the Harness home (install/uninstall symmetric);
+        // dsh's MCP + hooks wiring is fully owned by installDsh/uninstallDsh
+        // (cordis.patch.yml + workled-hooks.json), so no separate MCP step.
+        lines.push(isInstall ? appendReminder(join(dh, "AGENTS.md")) : removeReminder(join(dh, "AGENTS.md")));
+        break;
+      }
       case "workbuddy": {
         // WorkBuddy is a pure-MCP client with no per-client hook layer, so the
         // state protocol is enforced by user-level hooks in settings.json
@@ -1868,6 +2014,17 @@ async function main() {
         } else {
           lines.push(...unregisterWorkledMcp("workbuddy"));
           lines.push(unregisterWorkledSettingsHooks());
+        }
+        break;
+      }
+      case "trae": {
+        // Trae (Cursor-compatible): pure MCP config — global ~/.cursor/mcp.json
+        // and project .trae/mcp.json, both with mcpServers key. No hook layer
+        // because the MCP server is called directly by the agent via MCP tools.
+        if (isInstall) {
+          lines.push(...(await registerWorkledMcp("trae", mcpEntry)));
+        } else {
+          lines.push(...unregisterWorkledMcp("trae"));
         }
         break;
       }

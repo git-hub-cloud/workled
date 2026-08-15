@@ -7,7 +7,8 @@ description: "MUST call set_agent_state via MCP on each agent state transition (
 
 ## Mandatory State Protocol
 
-Call `set_agent_state` via MCP on every state transition:
+Call `set_agent_state` via MCP on every state transition. The MCP server name
+varies by host — look for the server whose tools include *set_agent_state* in the block of the system prompt.
 
 | State | When |
 |-------|------|
@@ -68,9 +69,11 @@ Full macro reference [macro_format.md](references/macro_format.md)
 
 ## Setup & Troubleshooting
 
+Supported clients, install/uninstall commands, per-client event mapping, and full device
+deployment steps: [device_setup.md](references/device_setup.md)
+
 If the device is not responding, run `node <skill-dir>/index.js status`
-and follow the JSON `hint` it prints. Full install / deployment /
-troubleshooting reference: [device_setup.md](references/device_setup.md)
+and follow the JSON `hint` it prints.
 
 ## Contributing
 

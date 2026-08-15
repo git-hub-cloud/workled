@@ -23,7 +23,7 @@ import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome, sleep } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeHome, resolveProjectRoot } from "./utils.js";
 
 const HOME = homedir();
 const execFileAsync = promisify(execFile);
@@ -75,6 +75,19 @@ export const MCP_SOURCES = [
   { client: "workbuddy.global", key: "mcpServers", format: "json", type: "remote", path: () => join(HOME, ".workbuddy", "mcp.json") },
   // hermes (YAML)
   { client: "hermes.global", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
+  // dsh (DeepSeek Harness): workled is a native Cordis plugin under
+  // <dsh-home>/plugins/workled/, mounted via the `web` profile's
+  // cordis.patch.yml (format: `- insert:` with id: workled, config: {url,
+  // timeout, enabled}). format: "dsh-patch" triggers the dedicated parser in
+  // loadMcpServers that extracts config.url + enabled and also probes the
+  // vendored plugin dir existence.
+  { client: "dsh.global", key: "mcp", format: "dsh-patch", path: () => join(dshHome(), "profiles", "web", "cordis.patch.yml") },
+  // trae (Trae IDE, NOT Cursor): Trae is a VSCode fork whose global MCP
+  // config lives at <trae-home>/User/globalStorage/mcp.json (traeHome()
+  // resolves "Trae CN" vs "Trae" on Windows). Project config at .trae/mcp.json.
+  // mcpServers key, HTTP remote — type omitted (Trae infers transport from url).
+  { client: "trae.global", key: "mcpServers", format: "json", path: () => join(traeHome(), "User", "globalStorage", "mcp.json") },
+  { client: "trae.project", key: "mcpServers", format: "json", path: () => join(projectDir, ".trae", "mcp.json") },
 ];
 
 // Every client the skill installs to. `status` accepts an optional
@@ -120,6 +133,12 @@ export const CLIENT_TARGETS = {
   },
   workbuddy: {
     help: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
+  },
+  dsh: {
+    help: "plugin -> <dsh-home>/plugins/workled + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP) + reminder in AGENTS.md",
+  },
+  trae: {
+    help: "mcp    -> <trae-home>/User/globalStorage/mcp.json (global, mcpServers.workled) + .trae/mcp.json (project)",
   },
   default: {
     help: "installed (targets: see SKILL.md)",
@@ -207,7 +226,12 @@ async function execWithRetry(cmd, args, opts, maxAttempts = 2) {
 let workledUrl = null;
 let workledUrlExpiry = 0;
 let hookClientPrefix = null;
-let projectDir = process.cwd();
+// Optional URL forced from the hook CLI (--url). dsh installs write the URL
+// inline into its workled-hooks.json commands because dsh's MCP config lives in
+// a cordis.patch.yml plugin row that discovery cannot parse. When set, it wins
+// over every other discovery source for this process.
+let forcedMcpUrl = null;
+let projectDir = resolveProjectRoot();
 const seenUserMessages = new Set();
 let seenMessagesCleanedAt = Date.now();
 const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -280,7 +304,57 @@ function stripValue(v) {
 function loadMcpServers() {
   const servers = [];
   for (const s of MCP_SOURCES) {
+    if (s.patchManaged) continue; // legacy mark; superseded by bespoke parsers
     const srcPath = s.path();
+    if (s.format === "dsh-patch") {
+      // dsh bespoke parser: cordis.patch.yml top-level YAML array. Look for a
+      // `- insert:` block whose descendent rows contain `- id: workled`, then
+      // extract `config: {url, enabled}` scalar fields. Also probe the
+      // vendored plugin dir to report install status.
+      const pluginDir = join(dshHome(), "plugins", "workled");
+      const pluginInstalled = existsSync(pluginDir) && existsSync(join(pluginDir, "src", "index.js"));
+      if (!existsSync(srcPath)) {
+        // Even when no patch file exists, surface a "ghost" workled entry so
+        // diagnoseStatus can distinguish "patch missing (not installed)" from
+        // "no workled entry in patch". pluginInstalled=false below doubles as
+        // the install signal.
+        servers.push({
+          name: "workled",
+          client: s.client,
+          path: srcPath,
+          server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: false },
+        });
+        continue;
+      }
+      try {
+        const text = readFileSync(srcPath, "utf8");
+        const parsed = dshWorkledPluginFromPatch(text);
+        if (parsed) {
+          servers.push({
+            name: "workled",
+            client: s.client,
+            path: srcPath,
+            server: {
+              url: parsed.url,
+              enabled: parsed.enabled !== false,
+              type: "remote",
+              _dshPluginInstalled: pluginInstalled,
+              _dshPatchExists: true,
+            },
+          });
+        } else {
+          servers.push({
+            name: "workled",
+            client: s.client,
+            path: srcPath,
+            server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: true, _dshWorkledRow: false },
+          });
+        }
+      } catch {
+        /* unreadable patch file: skip */
+      }
+      continue;
+    }
     if (!existsSync(srcPath)) continue;
     try {
       const text = readFileSync(srcPath, "utf8");
@@ -298,6 +372,45 @@ function loadMcpServers() {
     }
   }
   return servers;
+}
+
+// Parse a dsh `cordis.patch.yml` (top-level YAML array of `- insert:` rows)
+// and extract the {url, enabled} config from the row whose inserted id is
+// `workled` (the native Cordis plugin). Returns null when no such row is
+// present. Scalar values use stripValue() for consistency with the hermes parser.
+function dshWorkledPluginFromPatch(yamlText) {
+  const lines = yamlText.split(/\r?\n/);
+  // Accept both indent styles: 4-space "    - id: X" and 6-space "      - id: X".
+  const ID_RE = new RegExp(`^\\s{4,6}-\\s*id:\\s*workled\\s*$`);
+  let i = 0;
+  while (i < lines.length) {
+    if (!/^-\s*insert:\s*$/.test(lines[i])) { i++; continue; }
+    const start = i + 1;
+    let end = start;
+    while (end < lines.length && !/^-\s/.test(lines[end])) end++;
+    for (let k = start; k < end; k++) {
+      if (!ID_RE.test(lines[k])) continue;
+      const idIndentMatch = lines[k].match(/^(\s*)/);
+      const idIndent = idIndentMatch ? idIndentMatch[1].length : 6;
+      let url = null;
+      let enabled = undefined;
+      let row = k + 1;
+      while (row < end) {
+        const r = lines[row];
+        const lead = r.match(/^(\s*)/);
+        if (!lead || r.trim() === "") { row++; continue; }
+        if (lead[1].length <= idIndent) break; // next sibling "- id: ..."
+        const cfgUrl = r.match(/^\s*url:\s*(.+?)\s*$/);
+        if (cfgUrl) url = stripValue(cfgUrl[1].trim());
+        const cfgEnabled = r.match(/^\s*enabled:\s*(.+?)\s*$/);
+        if (cfgEnabled) enabled = stripValue(cfgEnabled[1].trim());
+        row++;
+      }
+      return { url, enabled };
+    }
+    i = end;
+  }
+  return null;
 }
 
 function getWorkledCandidates(clientPrefix) {
@@ -321,7 +434,7 @@ function getWorkledCandidates(clientPrefix) {
 }
 
 // Best-effort host-side Bluetooth diagnostic. Returns { available, powered,
-// devicePaired, deviceName, error }. On unsupported platforms or missing
+// devicePaired, deviceNames, error }. On unsupported platforms or missing
 // adapters the fields degrade gracefully so the caller never throws.
 //
 // `available` is tri-state:
@@ -332,17 +445,18 @@ function getWorkledCandidates(clientPrefix) {
 //           "unknown" instead of falsely claiming "no adapter", so a blocked
 //           probe never masquerades as a missing adapter.
 //
-// `devicePaired` / `deviceName` are workled-specific: they report ONLY the
-// workled device (name matches HomeAnt-* or workled-* prefix) so the
+// `devicePaired` / `deviceNames` are workled-specific: they report ONLY the
+// workled device(s) (name matches HomeAnt-* or workled-* prefix) so the
 // macro-readiness hint is accurate. A non-workled device never masquerades as
 // paired (fixes #1 — Linux fallback path previously promoted the first
-// arbitrary BT device to "paired").
+// arbitrary BT device to "paired"). When several workled devices are paired,
+// `deviceNames` lists them all (deduplicated).
 export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   const result = {
     available: null,
     powered: false,
     devicePaired: false,
-    deviceName: null,
+    deviceNames: [],
     error: null,
   };
 
@@ -437,8 +551,9 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
         // Additionally, scan *all* PnP entities, not just Bluetooth class —
         // the HID side of a paired BLE keyboard often shows up under class
         // "HIDClass" / "Keyboard" / "Mouse" with the real device name in
-        // FriendlyName and a BTHENUM HardwareID parent.
-        let matchedDevice = null;
+        // FriendlyName and a BTHENUM HardwareID parent. Collect every match
+        // (a single device can match via Name AND FriendlyName, so dedupe).
+        const matchedDevices = new Set();
         for (const e of parsed) {
           const haystack = [
             e.Name,
@@ -449,16 +564,13 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             .map(String)
             .join(" | ");
           const m = haystack.match(WORKLED_NAME_RE);
-          if (m) {
-            matchedDevice = m[0];
-            break;
-          }
+          if (m) matchedDevices.add(m[0]);
         }
         // Last-resort FriendlyName sweep across ALL classes (covers the
         // case where the CIM query accidentally filtered the HID side out,
         // but a non-Bluetooth class entry still has a friendly name like
-        // "HomeAnt-A919 Keyboard").
-        if (!matchedDevice) {
+        // "HomeAnt-A919 Keyboard"). Only run when Tier 1 found nothing.
+        if (matchedDevices.size === 0) {
           try {
             const { stdout: hidOut } = await execWithRetry(
               "powershell",
@@ -470,18 +582,17 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
               { timeout: timeoutMs }
             );
             const names = hidOut.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-            const hit = names.find((n) => WORKLED_NAME_RE.test(n));
-            if (hit) {
-              const m = hit.match(WORKLED_NAME_RE);
-              matchedDevice = m ? m[0] : hit;
+            for (const n of names) {
+              const m = n.match(WORKLED_NAME_RE);
+              if (m) matchedDevices.add(m[0]);
             }
           } catch {
             // ignored — last resort only
           }
         }
-        if (matchedDevice) {
+        if (matchedDevices.size > 0) {
           result.devicePaired = true;
-          result.deviceName = matchedDevice;
+          result.deviceNames = [...matchedDevices];
         }
       } catch {
         result.available = null;
@@ -499,12 +610,16 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = pairedOut.trim().split(/\r?\n/).filter(Boolean);
-          const hidLine = lines.find((l) => WORKLED_NAME_RE.test(l));
-          if (hidLine) {
+          const matched = new Set();
+          for (const l of lines) {
+            if (!WORKLED_NAME_RE.test(l)) continue;
+            const m = l.match(/address:\s*([^\s,]+)/i);
+            const nameMatch = l.match(WORKLED_NAME_RE);
+            matched.add(nameMatch ? nameMatch[0] : (m ? m[1] : l.split(",")[0]?.trim() || null));
+          }
+          if (matched.size > 0) {
             result.devicePaired = true;
-            const m = hidLine.match(/address:\s*([^\s,]+)/i);
-            const nameMatch = hidLine.match(WORKLED_NAME_RE);
-            result.deviceName = nameMatch ? nameMatch[0] : (m ? m[1] : hidLine.split(",")[0]?.trim() || null);
+            result.deviceNames = [...matched];
           }
         } catch {
           // no paired devices
@@ -524,14 +639,20 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             data.SPBluetoothDataType?.[0]?.device_connected ||
             data.SPBluetoothDataType?.[0]?.device_paired ||
             [];
-          const hidDevice = devices.find((d) =>
-            WORKLED_NAME_RE.test(d.device_name || "") ||
-            WORKLED_NAME_RE.test(d.device_type || "")
-          );
-          if (hidDevice) {
+          const matched = new Set();
+          for (const d of devices) {
+            if (
+              !WORKLED_NAME_RE.test(d.device_name || "") &&
+              !WORKLED_NAME_RE.test(d.device_type || "")
+            ) {
+              continue;
+            }
+            const nm = String(d.device_name || "").match(WORKLED_NAME_RE);
+            matched.add(nm ? nm[0] : (d.device_name || null));
+          }
+          if (matched.size > 0) {
             result.devicePaired = true;
-            const nm = String(hidDevice.device_name || "").match(WORKLED_NAME_RE);
-            result.deviceName = nm ? nm[0] : (hidDevice.device_name || null);
+            result.deviceNames = [...matched];
           }
         } catch {
           result.available = null;
@@ -555,11 +676,15 @@ export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
             timeout: timeoutMs,
           });
           const lines = devOut.trim().split(/\r?\n/).filter(Boolean);
-          const wlLine = lines.find((l) => WORKLED_NAME_RE.test(l));
-          if (wlLine) {
+          const matched = new Set();
+          for (const l of lines) {
+            if (!WORKLED_NAME_RE.test(l)) continue;
+            const m = l.match(WORKLED_NAME_RE);
+            matched.add(m ? m[0] : (l.split(/\s+/).slice(2).join(" ") || null));
+          }
+          if (matched.size > 0) {
             result.devicePaired = true;
-            const m = wlLine.match(WORKLED_NAME_RE);
-            result.deviceName = m ? m[0] : (wlLine.split(/\s+/).slice(2).join(" ") || null);
+            result.deviceNames = [...matched];
           }
         } catch {
           // no paired devices
@@ -647,6 +772,7 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 }
 
 async function discoverWorkledUrl(clientPrefix) {
+  if (forcedMcpUrl) return forcedMcpUrl;
   if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
   const now = Date.now();
   if (workledUrl && now < workledUrlExpiry) return workledUrl;
@@ -1139,6 +1265,25 @@ const HOOK_MAP = {
   on_session_end: "idle",
   subagent_start: "thinking",
   subagent_stop: "thinking",
+  // dsh native Cordis events (bridge-source-validated; see
+  // packages/core/agent-loop + packages/core/tools in deepseek-harness).
+  // Default install path: a native dsh Cordis plugin (dsh-plugin/src) calls
+  // workled DIRECTLY over HTTP (no shell hook hop). These entries remain so
+  // a user who prefers the shell-hook bridge can also route raw Cordis
+  // event names through the hook CLI path.
+  "agent/session-start": "thinking",
+  "agent/pre-step": "thinking",
+  "tools/pre-execute": "tool",
+  "tools/post-execute": "thinking",
+  "agent/turn-stopping": "idle",
+  "subagent/start": "thinking",
+  "subagent/end": "thinking",
+  // Additional Claude Code hook events that dsh's @deepseek-ai/dsh-hooks-claude-code
+  // bridge supports (dsh runs CC hook config verbatim — see its packages/hooks).
+  // Harmless for other clients, which never emit these events.
+  SessionStart: "thinking",
+  SubagentStart: "thinking",
+  SubagentStop: "thinking",
 };
 
 function extractToolName(payload) {
@@ -1188,6 +1333,12 @@ async function runHookMode() {
     const clientIdx = argv.indexOf("--client");
     const clientArg = clientIdx >= 0 ? argv[clientIdx + 1] : null;
     if (clientArg) hookClientPrefix = clientArg;
+    // --url: explicit MCP endpoint for clients whose config discovery cannot
+    // parse the MCP wiring (dsh mounts @deepseek-ai/dsh-mcp-client in a
+    // cordis.patch.yml plugin row). Wins over every other source.
+    const urlIdx = argv.indexOf("--url");
+    const urlArg = urlIdx >= 0 ? argv[urlIdx + 1] : null;
+    if (urlArg) forcedMcpUrl = urlArg;
 
     // Read the hook JSON payload from stdin (agy may pass the event name via
     // --event instead). Never block on stdin: if the host never closes it
@@ -1284,6 +1435,13 @@ async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 // `clients` is omitted entirely when no workled server is configured.
 async function runStatusMode() {
   const out = { hint: "", ok: false, exitCode: 1 };
+  const startedAt = Date.now();
+  // Progress goes to stderr so stdout stays a clean JSON for the install flow
+  // to parse; the step-by-step log also proves the process is alive while the
+  // Bluetooth/network probes (which can take seconds) are running.
+  const log = (msg) => console.error(`[workled] status: ${msg}`);
+
+  log("scanning agent configs...");
 
   // Optional per-client filter: `--client <name>` restricts the scan to
   // matching sources; omitted means all clients. Env override is always shown.
@@ -1304,31 +1462,74 @@ async function runStatusMode() {
   for (const s of loadMcpServers()) {
     if (s.name !== "workled") continue;
     if (clientPrefix && !s.client.startsWith(clientPrefix)) continue;
-    entries.push({
+    const entry = {
       client: s.client,
       path: s.path,
       enabled: s.server.enabled !== false,
       url: s.server.url || null,
-    });
+    };
+    // dsh-only install flags: allow the final status report to distinguish
+    // "patch present but URL placeholder" from "plugin vendored" from "both
+    // missing" without a second filesystem probe.
+    for (const k of ["_dshPluginInstalled", "_dshPatchExists", "_dshWorkledRow"]) {
+      if (k in s.server) entry[k] = s.server[k];
+    }
+    entries.push(entry);
   }
+  log(`found ${entries.length} workled entry(ies)`);
+
+  // Pre-compute dsh diagnosis so the "entries=0" early return and all later
+  // hint branches can append it uniformly.
+  function dshDiagnosis() {
+    const pool = entries.length > 0 ? entries : [];
+    const dshEntries = pool.filter((e) => e.client.startsWith("dsh"));
+    if (dshEntries.length === 0) return null;
+    const parts = [];
+    for (const c of dshEntries) {
+      const f = [];
+      if (c._dshPluginInstalled === true) f.push("plugin=installed");
+      else if (c._dshPluginInstalled === false) f.push("plugin=MISSING");
+      if (c._dshPatchExists === true && c._dshWorkledRow === false) f.push("patch=NO workled row");
+      else if (c._dshPatchExists === true) f.push("patch=ok");
+      else if (c._dshPatchExists === false) f.push("patch=MISSING");
+      if (!c.url) f.push("url=MISSING");
+      else if (c.url.includes("<device-name>")) f.push("url=placeholder");
+      parts.push(`[dsh] ${f.join(" · ")} (${c.path})`);
+    }
+    return parts.join("; ");
+  }
+  const dshDiag = dshDiagnosis();
 
   if (entries.length === 0) {
     out.hint = clientPrefix
       ? `No \`workled\` server configured for client "${clientPrefix}". Add it under \`mcp\` in that client's config or set WORKLED_MCP_URL.`
       : "No `workled` server configured. Add it under `mcp` in your agent config or set WORKLED_MCP_URL.";
+    if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
+    out.duration_ms = Date.now() - startedAt;
+    log(`done in ${out.duration_ms}ms (no workled server configured)`);
     console.log(JSON.stringify(out, null, 2));
     process.exitCode = out.exitCode;
     return;
   }
 
+  log("probing Bluetooth...");
   const bluetooth = await probeBluetooth().catch(() => ({
     available: false,
     powered: false,
     devicePaired: false,
-    deviceName: null,
+    deviceNames: [],
     error: "Bluetooth probe failed",
   }));
   out.bluetooth = bluetooth;
+  const btDeviceNames = bluetooth.deviceNames && bluetooth.deviceNames.length
+    ? bluetooth.deviceNames
+    : [];
+  log(
+    `Bluetooth ${bluetooth.available === true ? "available" : "unavailable"}` +
+      (btDeviceNames.length > 0
+        ? `, paired device(s): ${btDeviceNames.map((n) => `'${n}'`).join(", ")}`
+        : "")
+  );
 
   // Probe each unique URL once, in parallel. Distinct URLs can be checked
   // concurrently; per-URL retries (up to 3 with backoff) stay inside
@@ -1336,9 +1537,11 @@ async function runStatusMode() {
   const urls = [
     ...new Set(entries.filter((e) => e.url && e.enabled).map((e) => e.url)),
   ];
+  log(`probing ${urls.length} unique URL(s)...`);
   const results = new Map(
     await Promise.all(urls.map(async (u) => [u, await probeReachable(u)]))
   );
+  log("URL probes finished");
 
   out.clients = entries.map((e) => {
     const probe = e.url && e.enabled ? results.get(e.url) : null;
@@ -1352,6 +1555,11 @@ async function runStatusMode() {
     if (probe && probe.error) entry.error = probe.error;
     // Which attempt (1-based) succeeded, or how many were tried when failing.
     if (probe && probe.attempt) entry.attempt = probe.attempt;
+    // dsh-only install metadata: plugin vendored / patch file exists / workled
+    // row is present. Plain entries (JSON/YAML) omit these.
+    for (const k of ["_dshPluginInstalled", "_dshPatchExists", "_dshWorkledRow"]) {
+      if (k in e) entry[k] = e[k];
+    }
     return entry;
   });
 
@@ -1359,10 +1567,9 @@ async function runStatusMode() {
     out.ok = true;
     out.exitCode = 0;
     if (bluetooth && bluetooth.available === true && !bluetooth.devicePaired) {
-      const deviceName = bluetooth.deviceName || null;
       let hint = "Macro requires Bluetooth. Pair the device as a BLE HID keyboard.";
-      if (deviceName) {
-        hint += ` Found: ${deviceName}.`;
+      if (btDeviceNames.length > 0) {
+        hint += ` Found: ${btDeviceNames.join(", ")}.`;
       } else {
         hint += " Device not found — scan for devices whose name starts with 'HomeAnt' or 'workled' in your OS Bluetooth settings.";
       }
@@ -1374,22 +1581,28 @@ async function runStatusMode() {
         "if MCP was just configured, restart the agent/session so it loads the new config; " +
         "some agents also require manually allowing/trusting the MCP connection before they use it.";
     }
+    if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
   } else if (out.clients.some((c) => c.enabled === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
+    if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
   } else if (out.clients.some((c) => !c.url)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
+    if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
   } else {
     if (bluetooth && bluetooth.available === false) {
       out.hint = `Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name. Bluetooth is also unavailable: ${bluetooth.error || "no Bluetooth adapter detected"}.`;
     } else {
       let hint = "Device unreachable: verify power and Wi-Fi, or use the IP address instead of the .local name.";
-      if (bluetooth && bluetooth.deviceName) {
-        hint += ` Your paired device is '${bluetooth.deviceName}'.`;
+      if (btDeviceNames.length > 0) {
+        hint += ` Paired device(s): ${btDeviceNames.join(", ")}.`;
       }
       out.hint = hint;
     }
+    if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
   }
 
+  out.duration_ms = Date.now() - startedAt;
+  log(`done in ${out.duration_ms}ms (ok=${out.ok})`);
   console.log(JSON.stringify(out, null, 2));
   process.exitCode = out.exitCode;
 }

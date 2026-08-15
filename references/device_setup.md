@@ -99,7 +99,7 @@ git -C ~/.agents/skills/workled pull
 Fully global: every target path is derived from `homedir()`, never from cwd, so
 the same command runs from any directory on any shell. Both `install` and
 `uninstall` **require** an explicit target: `--client <name>` (opencode, kilo,
-openclaw, agy, hermes, pi, workbuddy) for one client, or `--client all` for
+openclaw, agy, hermes, dsh, pi, workbuddy) for one client, or `--client all` for
 every client. `--file` targets a single instruction file (reminder only).
 `index.js status` accepts the same optional `--client <name>` filter; default
 is **all clients**.
@@ -139,6 +139,7 @@ What every client's install flow does:
 - **openclaw** (best-effort; verify against a real Gateway): `message_received` → `thinking`; `before_tool_call` (tool name matches `question`) → `input`; `agent_end` → `idle` (or `error` on a failed run); `session_end` → `idle` fallback.
 - **agy** (hook CLI): `PreInvocation`/`PostInvocation` → `thinking`; `PreToolUse`/`PostToolUse` → `input` (only when the payload tool name matches `question`); `Stop` → `idle`.
 - **hermes** (shell hooks via the same hook CLI): `pre_llm_call` → `thinking`; `post_llm_call` → `idle`; `pre_tool_call` → `input` (only when the tool name matches `question`; `post_tool_call` is intentionally NOT registered so a returned input tool does not re-set `input`); `pre_approval_request` → `input`; `post_approval_response` → `thinking`; `on_session_start` → `thinking`; `on_session_end` → `idle`; `subagent_start`/`subagent_stop` → `thinking`.
+- **dsh (DeepSeek Harness)** (**native Cordis plugin** vended to `<dsh-home>/plugins/workled` and mounted via the `web` profile `cordis.patch.yml`; the plugin calls workled **directly over HTTP** — no hook CLI subprocess hop, no MCP client row). Bridge-source-validated event map (packages/core/agent-loop + packages/core/tools): `agent/session-start` → `thinking`; `agent/pre-step` → `thinking`; `tools/pre-execute` → `input` when the tool name contains `ask`/`question`/`confirm`/… (same keyword list as WorkBuddy), otherwise `thinking`; `tools/post-execute` → `thinking`; `agent/turn-stopping` → `idle`; `subagent/start` / `subagent/end` → `thinking`. A best-effort `*/error` wildcard routes any domain-level error event to `error`. Input windows that bypass tools still rely on the agent-side protocol (SKILL.md) to light `input`.
 - **pi** (extension): `agent_start` → `thinking`; `agent_settled` → `idle`; `session_shutdown` → `idle`; `tool_call` (input tools) → `input`; `session_start` → notify.
 
 After installing, run `node <skill-dir>/index.js status` and surface the JSON
@@ -147,8 +148,8 @@ client's MCP is not set up — guide the user through the MCP endpoint
 above.
 
 > **Prevent / detect a placeholder URL.** `install` resolves the MCP URL once:
-> `WORKLED_MCP_URL` → Bluetooth/mDNS discovery → placeholder
-> `http://<device-name>.local:18791/mcp`. If no real URL is known and the
+> `WORKLED_MCP_URL` → placeholder `http://<device-name>.local:18791/mcp`. If no
+> real URL is known and the
 > target config has **no existing `workled` entry** (e.g. after an earlier
 > uninstall), the placeholder is written. Fix it by editing the config URL to
 > the real device name/IP, or re-run install with
@@ -189,7 +190,7 @@ node <skill-dir>/index.js status
 ```
 
 The command scans the MCP config of every client (opencode global and project,
-agy/gemini, openclaw, pi, workbuddy), takes the first server named `workled`
+agy/gemini, openclaw, pi, workbuddy, hermes, dsh), takes the first server named `workled`
 (`WORKLED_MCP_URL` override wins), and checks reachability with a **stateless**
 `tools/call get_agent_state` probe. Each URL is probed up to 3 times
 with backoff; the successful attempt number is reported. Fields:
