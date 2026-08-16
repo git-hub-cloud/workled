@@ -38,7 +38,7 @@ const REMINDER = [
   "> when connected to a workled device via MCP, call `set_agent_state` on every agent state transition:",
   "> - `set_agent_state(\"thinking\")` while working",
   "> - `set_agent_state(\"idle\")` when the turn finishes; the user can continue with a new question",
-  "> - `set_agent_state(\"input\")` when you need the user to confirm a choice, pick an option, or reply — INCLUDING plain-text choice lists and built-in client modals (hermes destructive-command panel, clarify, prompt_toolkit confirmations). Client hooks only fire on tool / LLM / approval events; they do NOT see these. Call it yourself before rendering the options.",
+  "> - `set_agent_state(\"waiting\")` when you need the user to confirm a choice, pick an option, or reply — INCLUDING plain-text choice lists and built-in client modals. Client hooks only fire on tool / LLM / approval events; they do NOT see these. Call it yourself before rendering the options.",
   "> - `set_agent_state(\"error\")` on errors",
 ].join("\n");
 
@@ -917,7 +917,7 @@ function workledHookCommand(eventName) {
 // Each lifecycle event the workled hook should fire on. `matcher` (only for
 // PreToolUse) restricts the hook to a specific tool so it does NOT run on every
 // tool call — a bare PreToolUse hook would spawn a ~3.6s process per Bash/Read/
-// Write and stall the agent. The `input` state is emitted only when the matched
+// Write and stall the agent. The `waiting` state is emitted only when the matched
 // tool is one of the workled "input" tools (see getInputTools — a fixed
 // "question" substring match).
 const WORKLED_HOOK_SPECS = [
@@ -926,7 +926,7 @@ const WORKLED_HOOK_SPECS = [
   { event: "PreToolUse", matcher: "AskUserQuestion" },
   // PostToolUse maps to "thinking" (HOOK_MAP) so confirming an AskUserQuestion
   // returns the LED to the working state; it fires when the user answers, so it
-  // never touches the wait window that PreToolUse's "input" must cover.
+  // never touches the wait window that PreToolUse's "waiting" must cover.
   { event: "PostToolUse", matcher: "AskUserQuestion" },
 ];
 
@@ -1200,7 +1200,7 @@ const OPENCLAW_PLUGIN_MANIFEST = {
   id: "workled",
   name: "workled",
   description:
-    "Maps OpenClaw agent lifecycle events (thinking/idle/input/error) to the workled MCP set_agent_state tool driving the LED strip.",
+    "Maps OpenClaw agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   version: SKILL_VERSION,
   activation: { onStartup: true, onCapabilities: ["hook"] },
   configSchema: { type: "object", additionalProperties: false, properties: {} },

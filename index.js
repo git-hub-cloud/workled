@@ -169,7 +169,7 @@ export function getInputTools() {
 // Input-tool detection for the openclaw/pi adapters. Matches by substring
 // (case-insensitive) so tools like "AskUserQuestion" or "ask_question" hit
 // the fixed "question" pattern — an exact `includes(name)` would never fire
-// for those names and the input state would stay dark.
+// for those names and the waiting state would stay dark.
 export function isInputTool(name) {
   if (!name || typeof name !== "string") return false;
   return getInputTools().some((t) => name.toLowerCase().includes(t.toLowerCase()));
@@ -934,7 +934,7 @@ function setAgentState(state) {
   // Short-window dedup: only skip when the same state was successfully sent
   // VERY recently AND no other state is queued. This lets legitimate repeat
   // requests (new turn, animation reset, question → answered → back to
-  // thinking all resolve to "thinking" but separated by "input") reach the
+  // thinking all resolve to "thinking" but separated by "waiting") reach the
   // device so it can restart breath / pulse effects. A tight 200 ms window
   // still collapses accidental double-fires from clients that emit duplicate
   // lifecycle events in quick succession.
@@ -1027,7 +1027,7 @@ export const opencodeEntry = {
   id: "workled",
   name: "workled",
   description:
-    "Maps opencode agent lifecycle events (thinking/idle/input/error) to the workled MCP set_agent_state tool driving the LED strip.",
+    "Maps opencode agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   async register(ctx) {
     const directory = ctx && ctx.directory;
     projectDir = directory || projectDir;
@@ -1059,10 +1059,10 @@ export const opencodeEntry = {
             }
             return;
           }
-          // permission.asked -> input (tool approval popup shown);
+          // permission.asked -> waiting (tool approval popup shown);
           // permission.replied -> thinking (resolved).
           if (event.type === "permission.asked" || event.type === "question.asked") {
-            setAgentState("input");
+            setAgentState("waiting");
             return;
           }
           if (event.type === "permission.replied" || event.type === "question.replied" || event.type === "question.rejected") {
@@ -1083,10 +1083,10 @@ export const opencodeEntry = {
       "tool.execute.before": async (input) => {
         try {
           // Substring, case-insensitive match (isInputTool) so renamed tool
-          // variants (ask_question vs AskUserQuestion) still light up `input`.
+          // variants (ask_question vs AskUserQuestion) still light up `waiting`.
           const toolName = input && input.tool ? String(input.tool) : "";
           if (toolName && isInputTool(toolName)) {
-            setAgentState("input");
+            setAgentState("waiting");
           }
         } catch (err) {
           // Never block the tool pipeline; device unreachable is skipped gracefully.
@@ -1113,7 +1113,7 @@ export const openclawEntry = {
   id: "workled",
   name: "workled controller",
   description:
-    "Maps OpenClaw agent lifecycle events (thinking/idle/input/error) to the workled MCP set_agent_state tool driving the LED strip.",
+    "Maps OpenClaw agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   register(api) {
     // Inbound user message starts a turn -> thinking.
     api.on("before_agent_run", async (event, ctx) => {
@@ -1127,13 +1127,13 @@ export const openclawEntry = {
       }
     });
 
-    // Tool call that needs a user decision -> input
+    // Tool call that needs a user decision -> waiting
     api.on("before_tool_call", async (event) => {
       try {
         const name =
           (event && (event.toolName || event.tool || event.name)) || "";
         if (isInputTool(name)) {
-          setAgentState("input");
+          setAgentState("waiting");
         }
       } catch (err) {
         console.warn(`[workled] before_tool_call hook error: ${err && err.message}`);
@@ -1180,7 +1180,7 @@ export const piEntry = {
   id: "workled",
   name: "workled controller",
   description:
-    "Maps pi agent lifecycle events (thinking/idle/input/error) to the workled MCP set_agent_state tool driving the LED strip.",
+    "Maps pi agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   register(pi) {
     console.log("[workled] extension loaded");
 
@@ -1208,7 +1208,7 @@ export const piEntry = {
       const name =
         (event && (event.toolName || event.tool || event.name)) || "";
       if (isInputTool(name)) {
-        setAgentState("input");
+        setAgentState("waiting");
       }
     });
 
@@ -1236,15 +1236,15 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 // Event names are unique per client so no conflicts arise; the same mapping
 // serves all of them.
 //
-// PreToolUse maps to "tool": it resolves to "input" only when the payload
+// PreToolUse maps to "tool": it resolves to "waiting" only when the payload
 // references an input tool (AskUserQuestion etc., checked by extractToolName),
 // otherwise it is a no-op. PostToolUse maps to "thinking" — after any tool
 // returns the agent resumes working, so the LED returns to the working state.
 //
 // NOTE (WorkBuddy limitation): the host fires PreToolUse/PostToolUse for
 // AskUserQuestion at the moment the USER ANSWERS, NOT when the question is
-// rendered. So a hook can never light "input" during the wait window. The
-// agent MUST call set_agent_state("input") itself BEFORE rendering a question
+// rendered. So a hook can never light "waiting" during the wait window. The
+// agent MUST call set_agent_state("waiting") itself BEFORE rendering a question
 // (see SKILL.md). The hooks here are only a safety net for the answer moment.
 const HOOK_MAP = {
   // WorkBuddy (Claude Code-compatible hooks in ~/.workbuddy/settings.json)
@@ -1259,7 +1259,7 @@ const HOOK_MAP = {
   pre_llm_call: "thinking",
   post_llm_call: "idle",
   pre_tool_call: "tool",
-  pre_approval_request: "input",
+  pre_approval_request: "waiting",
   post_approval_response: "thinking",
   on_session_start: "thinking",
   on_session_end: "idle",
@@ -1315,7 +1315,7 @@ function resolveHookState(event, payload) {
   if (target === "tool") {
     const toolName = extractToolName(payload);
     if (!toolIsInput(toolName)) return null;
-    return "input";
+    return "waiting";
   }
   return target;
 }

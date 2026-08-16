@@ -120,7 +120,7 @@ test("shouldDedupState never dedups while another state is still queued", () => 
       lastSentState: "thinking",
       lastSentStateAtMs: 0,
       nowMs: 10,
-      pendingState: "input", // something still queued → no dedup
+      pendingState: "waiting", // something still queued → no dedup
     }),
     false,
     "dedup is off while a state is pending; we only collapse fully idle replays"

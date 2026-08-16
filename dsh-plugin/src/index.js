@@ -17,7 +17,7 @@
 // Event mapping:
 //   agent/session-start  -> thinking   (session opened)
 //   agent/pre-step       -> thinking   (every step, including user submit)
-//   tools/pre-execute    -> input iff tool name contains ask/question/...
+//   tools/pre-execute    -> waiting iff tool name contains ask/question/...
 //                        -> thinking otherwise
 //   tools/post-execute   -> thinking
 //   agent/turn-stopping  -> idle       (waiting on next user message)
@@ -25,7 +25,7 @@
 //   subagent/start       -> thinking
 //   subagent/end         -> thinking
 
-const WORKLED_STATE_RE = /^(thinking|idle|input|error)$/;
+const WORKLED_STATE_RE = /^(thinking|idle|waiting|error)$/;
 
 const INPUT_TOOL_KEYWORDS = [
   'question', 'confirm', 'ask', 'choose', 'select',
@@ -110,7 +110,7 @@ export function apply(ctx, config = {}) {
 
   ctx.on('tools/pre-execute', (exec, next) => {
     const name = exec?.tool?.name || exec?.name || '';
-    fire(isInputTool(name) ? 'input' : 'thinking');
+    fire(isInputTool(name) ? 'waiting' : 'thinking');
     return next();
   });
 
