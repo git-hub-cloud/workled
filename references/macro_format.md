@@ -28,140 +28,142 @@ one key**: the key names the segment type and the value carries its parameters.
 | `combo` | string | press and release a key combo |
 | `press` | string | hold a key combo down |
 | `release` | string | release a held key combo |
-| `delay` | int (ms) | wait a fixed time |
-| `delay_rand` | object `{min, max}` | wait a random time between MIN-MAX ms |
+| `delay` | int (ms) | wait a fixed time (min 20) |
+| `delay_rand` | object `{min, max}` | wait a random time between MIN-MAX ms (min 20) |
 | `text` | string | type ASCII text |
 | `password` | string | type a password stored in encrypted NVS |
-| `mouse_move` | object `{x, y}` | relative cursor move |
-| `mouse_scroll` | object `{wheel, pan?}` | wheel scroll |
+| `mouse_move` | object `{x, y}` | relative cursor move (-128..127) |
+| `mouse_scroll` | object `{wheel, pan?}` | wheel scroll (-128..127) |
 | `mouse_button` | object `{button, gesture?}` | click or hold a mouse button |
 
 ### combo
 
-Press and release a key combination.
-- `{"combo": "a"}` - press key and release
-- `{"combo": "shift+ctrl+a"}` - press key and release
+Press and release a key combination. Case-insensitive.
+
+- `{"combo": "a"}` — press key and release
+- `{"combo": "shift+ctrl+a"}` — press key combo and release
 
 ### press
 
-Press and hold.
-- `{"press": "space"}` - press key and not release
+Press and hold a key combo.
+
+- `{"press": "space"}` — press and hold
 
 ### release
 
-Release a key.
-- `{"release": "shift"}` - release key
-- `{"release": "ctrl+b"}` - release key
+Release a held key combo.
+
+- `{"release": "shift"}` — release key
+- `{"release": "ctrl+b"}` — release combo
 
 ### delay
 
 Wait N ms (min 20).
-- `{"delay": 50}` - delay 50 ms
+
+- `{"delay": 50}` — delay 50 ms
 
 ### delay_rand
 
-Random wait between MIN-MAX ms (min 20, MAX >= MIN).
-- `{"delay_rand": {"min": 100, "max": 500}}` - delay 100-500 ms
+Random wait between MIN and MAX ms (min 20, MAX >= MIN).
+
+- `{"delay_rand": {"min": 100, "max": 500}}`
 
 ### text
 
-Type ASCII text. JSON string escaping handles quotes, backslashes and
-whitespace automatically.
+Type ASCII text. JSON escaping handles quotes, backslashes and whitespace.
 
-- `{"text": "hello"}` - plain text
-- `{"text": "Abc123"}` - mixed case digits
-- `{"text": "hello world"}` - with spaces
-- `{"text": "hello\"world"}` - escaped quote
-- `{"text": "hello\\world"}` - escaped backslash
-- `{"text": "hello,world!"}` - punctuation supported
+- `{"text": "hello"}` — plain text
+- `{"text": "hello world"}` — with spaces
+- `{"text": "hello\"world"}` — escaped quote
+- `{"text": "hello\\world"}` — escaped backslash
 
 ### password
 
-Type password text. The password is stored in encrypted hardware NVS; the
-stored/queried macro shows `*` of identical length. A macro may contain
-multiple `password` segments.
+Type a password stored in encrypted hardware NVS. Stored/queried macros show
+`*` of identical length.
 
-- `{"password": "Abc123"}` - plain password
-- `{"password": "p@ss w0rd"}` - spaces and symbols supported
+- `{"password": "Abc123"}` — plain password
 
 ### mouse_move
 
-Move the mouse cursor by a relative delta. Both `x` and `y` are required and
-must be in -128..127.
-- `{"mouse_move": {"x": 30, "y": 0}}` - move right 30 px
-- `{"mouse_move": {"x": 0, "y": -40}}` - move up 40 px
+Move cursor by relative delta. Both `x` and `y` required, range -128..127.
+
+- `{"mouse_move": {"x": 30, "y": 0}}` — move right 30 px
+- `{"mouse_move": {"x": 0, "y": -40}}` — move up 40 px
 
 ### mouse_scroll
 
-Scroll the mouse wheel. `wheel` is required; `pan` (horizontal) is optional
-and defaults to 0. Both in -128..127.
-- `{"mouse_scroll": {"wheel": -3}}` - scroll down 3 notches
-- `{"mouse_scroll": {"wheel": 0, "pan": 3}}` - pan right
+Scroll the mouse wheel. `wheel` required; `pan` optional (default 0).
+Both in range -128..127.
+
+- `{"mouse_scroll": {"wheel": -3}}` — scroll down 3 notches
+- `{"mouse_scroll": {"wheel": 0, "pan": 3}}` — pan right
 
 ### mouse_button
 
-Click or hold a mouse button. `button`: left, right, middle. `gesture`:
-click (default), down, up.
-- `{"mouse_button": {"button": "left"}}` - left click
-- `{"mouse_button": {"button": "right", "gesture": "click"}}` - right click
-- `{"mouse_button": {"button": "left", "gesture": "down"}}` - press and hold left button
-- `{"mouse_button": {"button": "left", "gesture": "up"}}` - release left button
+Click or hold a mouse button. `button`: left, right, middle.
+`gesture`: click (default), down, up.
+
+- `{"mouse_button": {"button": "left"}}` — left click
+- `{"mouse_button": {"button": "right", "gesture": "click"}}` — right click
+- `{"mouse_button": {"button": "left", "gesture": "down"}}` — press and hold
+- `{"mouse_button": {"button": "left", "gesture": "up"}}` — release
 
 ## Key Names (case-insensitive)
 
 ### Letters
 
-| `a` | `b` | `c` | `d` | `e` | `f` | `g` | `h` | `i` | `j` | `k` | `l` |
+| a | b | c | d | e | f | g | h | i | j | k | l |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| `m` | `n` | `o` | `p` | `q` | `r` | `s` | `t` | `u` | `v` | `w` | `x` | `y` | `z` |
+| m | n | o | p | q | r | s | t | u | v | w | x | y | z |
 
 ### Digits
 
-| `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` |
+| 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|---|---|
 
 ### Function Keys
 
-| `f1` | `f2` | `f3` | `f4` | `f5` | `f6` |
+| f1 | f2 | f3 | f4 | f5 | f6 |
 |---|---|---|---|---|---|
-| `f7` | `f8` | `f9` | `f10` | `f11` | `f12` |
+| f7 | f8 | f9 | f10 | f11 | f12 |
 
 ### Navigation
 
-| `enter` | `esc` | `tab` | `space` | `backspace` | `delete` |
-|---|---|---|---|---|---|
-| `insert` | `home` | `end` | `page_up` | `page_down` |
+| enter | esc | escape | tab | space | backspace | delete |
+|---|---|---|---|---|---|---|
+| insert | home | end | page_up | page_down |
 
 ### Arrows
 
-| `up` | `down` | `left` | `right` |
+| up | down | left | right |
 |---|---|---|---|
 
 ### Lock Keys
 
-| `caps_lock` | `num_lock` | `scroll_lock` |
+| caps_lock | num_lock | scroll_lock |
 |---|---|---|
 
 ### System Keys
 
-| `print_screen` | `pause` | `menu` |
+| print_screen | pause | menu |
 |---|---|---|
 
 ### Media Keys
 
-| `mute` | `volume_up` | `volume_down` | `play_pause` | `next_track` | `previous_track` |
+| mute | volume_up | volume_down | play_pause | next_track | previous_track |
 |---|---|---|---|---|---|
 
 ### Modifier Keys
 
-| Modifier | Aliases |
+| Name | Aliases |
 |---|---|
 | `ctrl` | `left_ctrl`, `right_ctrl` |
 | `shift` | `left_shift`, `right_shift` |
-| `alt` | `left_alt`, `right_alt` |
+| `alt` | `left_alt`, `right_alt`, `option` |
 | `gui` | `left_gui`, `right_gui`, `command`, `cmd`, `meta`, `win` |
 
-Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `ctrl+alt+delete`.
+Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `ctrl+alt+delete`, `ctrl+win+v`.
 
 ## Examples
 
@@ -180,6 +182,13 @@ Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `c
   {"text": "Hello"},
   {"delay_rand": {"min": 100, "max": 200}},
   {"text": "World"}
+]
+```
+
+### type uppercase ABC:
+```json
+[
+  {"text": "ABC"}
 ]
 ```
 
@@ -228,7 +237,7 @@ Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `c
 ]
 ```
 
-### Windows: open Application notepad:
+### Windows: open Run dialog:
 ```json
 [
   {"combo": "gui+r"},
@@ -239,7 +248,7 @@ Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `c
 ```
 
 ### Windows unlock with long press:
-Bind to `long_press_start`. Locks the screen first, waits for the display to wake, then types the password and confirms:
+Recommended binding: `long_press`. Locks the screen first, waits for the display to wake, then types the password and confirms:
 ```json
 [
   {"combo": "gui+l"},
@@ -250,11 +259,18 @@ Bind to `long_press_start`. Locks the screen first, waits for the display to wak
 ]
 ```
 
-### WorkBuddy GUI client: toggle voice recording (click to record, click again to stop):
-Bind to `single_click`. WorkBuddy's voice input is a **toggle** — the same
-action starts recording and stops+submits it. The voice-input hotkey is `ctrl+d`:
+### WeChat voice message: start recording (hold to record):
+Recommended binding: `single_click`. Toggle voice recording on/off with touch effect:
 ```json
 [
-  {"combo": "ctrl+d"}
+  {"press": "ctrl+win"}
+]
+```
+
+### WeChat voice message: toggle recording (press once to start, press again to stop):
+Recommended binding: `single_click`. Toggle voice recording on/off:
+```json
+[
+  {"combo": "ctrl+win+shift"}
 ]
 ```

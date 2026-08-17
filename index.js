@@ -1401,15 +1401,30 @@ async function runHookMode() {
     const state = resolveHookState(event, payload);
     if (state) {
       setAgentState(state);
+      // The timeout timer must be clearable so the hook process exits as soon
+      // as the state send settles. Without the clearTimeout below the ref'd
+      // timer keeps the event loop alive for the full WORKLED_HOOK_TIMEOUT_MS,
+      // which makes the host (WorkBuddy) treat every hook as timed out and
+      // block the user prompt (HookBlockedError).
+      let timeoutTimer = null;
       try {
         const result = await Promise.race([
-          flushState(),
-          sleep(WORKLED_HOOK_TIMEOUT_MS).then(() => ({ state, sent: false, superseded: false, timeout: true })),
+          flushState().then((r) => {
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            return r;
+          }),
+          new Promise((resolve) => {
+            timeoutTimer = setTimeout(
+              () => resolve({ state, sent: false, superseded: false, timeout: true }),
+              WORKLED_HOOK_TIMEOUT_MS
+            );
+          }),
         ]);
         if (!result.sent && !result.superseded && !result.timeout) {
           console.warn(`[workled] hook: state ${result.state} not sent: ${result.error && result.error.message}`);
         }
       } catch (err) {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
         console.warn(`[workled] hook flush error: ${err && err.message}`);
       }
     }

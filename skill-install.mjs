@@ -940,7 +940,9 @@ const WORKLED_HOOK_SPECS = [
 ];
 
 // Write workled hooks into ~/.workbuddy/settings.json. Idempotent: any prior
-// workled entry for the same event is replaced first.
+// workled entry for the same event is replaced first. Note: specs are grouped
+// by event BEFORE filtering so that multiple matchers under one event (e.g. the
+// two Notification specs) are not dropped by each other's per-event filter.
 function registerWorkledSettingsHooks() {
   const settingsFile = join(h, ".workbuddy", "settings.json");
   const parsed = readJsonOrEmpty(settingsFile);
@@ -952,8 +954,13 @@ function registerWorkledSettingsHooks() {
   }
   const settings = parsed || {};
   if (!settings.hooks || typeof settings.hooks !== "object") settings.hooks = {};
+  // Group specs by event, preserving spec order within each group.
+  const specsByEvent = new Map();
   for (const spec of WORKLED_HOOK_SPECS) {
-    const ev = spec.event;
+    if (!specsByEvent.has(spec.event)) specsByEvent.set(spec.event, []);
+    specsByEvent.get(spec.event).push(spec);
+  }
+  for (const [ev, specs] of specsByEvent) {
     if (!Array.isArray(settings.hooks[ev])) settings.hooks[ev] = [];
     // Drop any prior workled entry for this event to stay idempotent.
     settings.hooks[ev] = settings.hooks[ev].filter(
@@ -970,11 +977,13 @@ function registerWorkledSettingsHooks() {
           )
         )
     );
-    const group = {
-      hooks: [{ type: "command", command: workledHookCommand(ev), timeout: WORKLED_HOOK_TIMEOUT_MS / 1000 }],
-    };
-    if (spec.matcher) group.matcher = spec.matcher;
-    settings.hooks[ev].push(group);
+    for (const spec of specs) {
+      const group = {
+        hooks: [{ type: "command", command: workledHookCommand(ev), timeout: WORKLED_HOOK_TIMEOUT_MS / 1000 }],
+      };
+      if (spec.matcher) group.matcher = spec.matcher;
+      settings.hooks[ev].push(group);
+    }
   }
   writeConfig(settingsFile, settings);
   return `Installed workled hooks -> ${settingsFile}`;
