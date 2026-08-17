@@ -68,31 +68,18 @@ After pairing, the device stays connected while in range. If it disconnects, re-
 
 ### Install the skill
 
-Choose one of the following methods to install the skill locally.
+Install it **through your agent**. Ask the agent
+to clone the repository into the skills directory your client scans, then run
+the client installer:
 
-#### Method 1 — Agent-based install (recommended)
-
-If your agent client provides a skill installer that accepts a remote URL,
-point it at the repository:
-
-```
-https://github.com/git-hub-cloud/workled
-```
-
-#### Method 2 — git clone (manual)
-
-Clone the repository into a directory your client scans for `skills/*/SKILL.md`.
-opencode scans the paths below automatically:
-
-```bash
+```text
 git clone https://github.com/git-hub-cloud/workled.git ~/.agents/skills/workled
+node ~/.agents/skills/workled/skill-install.mjs install --client <name>
 ```
 
-Keep up to date:
-
-```bash
-git -C ~/.agents/skills/workled pull
-```
+- Keep it up to date: `git -C ~/.agents/skills/workled pull`.
+- The skill manifest and the state protocol live in
+  [SKILL.md](https://github.com/git-hub-cloud/workled/blob/main/SKILL.md).
 
 ### Client integration
 
@@ -139,6 +126,7 @@ What every client's install flow does:
 - **openclaw** (best-effort; verify against a real Gateway): `message_received` → `thinking`; `before_tool_call` (tool name matches `question`) → `waiting`; `agent_end` → `idle` (or `error` on a failed run); `session_end` → `idle` fallback.
 - **agy** (hook CLI): `PreInvocation`/`PostInvocation` → `thinking`; `PreToolUse`/`PostToolUse` → `waiting` (only when the payload tool name matches `question`); `Stop` → `idle`.
 - **hermes** (shell hooks via the same hook CLI): `pre_llm_call` → `thinking`; `post_llm_call` → `idle`; `pre_tool_call` → `waiting` (only when the tool name matches `question`; `post_tool_call` is intentionally NOT registered so a returned input tool does not re-set `waiting`); `pre_approval_request` → `waiting`; `post_approval_response` → `thinking`; `on_session_start` → `thinking`; `on_session_end` → `idle`; `subagent_start`/`subagent_stop` → `thinking`.
+- **workbuddy** (Electron desktop app; its engine IS the CodeBuddy Code CLI run with `--serve`, hooks loaded from `~/.workbuddy/settings.json`): `UserPromptSubmit` → `thinking`; `Stop` → `idle`; `Notification` with matcher `permission_prompt` → `waiting` (fires when a tool approval dialog is SHOWN — render time); `Notification` with matcher `idle_prompt` → `idle` (session idle >60s, fallback for `Stop`); `PostToolUse` (matcher `AskUserQuestion`) → `thinking` (fires when the user answers). `PreToolUse` for `AskUserQuestion` is intentionally NOT installed: in this engine it fires at ANSWER time, which would light `waiting` after the user already confirmed. The AskUserQuestion wait window is lit **only** by the agent calling `set_agent_state("waiting")` BEFORE the call (see SKILL.md). Note the desktop app launches the engine with `--permission-mode bypassPermissions`, so approval dialogs — and thus `permission_prompt` — rarely fire there.
 - **dsh (DeepSeek Harness)** (**native Cordis plugin** vended to `<dsh-home>/plugins/workled` and mounted via the `web` profile `cordis.patch.yml`; the plugin calls workled **directly over HTTP** — no hook CLI subprocess hop, no MCP client row). Bridge-source-validated event map (packages/core/agent-loop + packages/core/tools): `agent/session-start` → `thinking`; `agent/pre-step` → `thinking`; `tools/pre-execute` → `waiting` when the tool name contains `ask`/`question`/`confirm`/… (same keyword list as WorkBuddy), otherwise `thinking`; `tools/post-execute` → `thinking`; `agent/turn-stopping` → `idle`; `subagent/start` / `subagent/end` → `thinking`. A best-effort `*/error` wildcard routes any domain-level error event to `error`. Input windows that bypass tools still rely on the agent-side protocol (SKILL.md) to light `waiting`.
 - **pi** (extension): `agent_start` → `thinking`; `agent_settled` → `idle`; `session_shutdown` → `idle`; `tool_call` (input tools) → `waiting`; `session_start` → notify.
 
@@ -155,17 +143,6 @@ above.
 > the real device name/IP, or re-run install with
 > `WORKLED_MCP_URL=http://<device-name>.local:18791/mcp` set. A config that
 > already holds a real URL is never downgraded to the placeholder.
-
-### Marker line (grep-friendly)
-
-```
-<!-- workled -->
-> when connected to a workled device via MCP, call `set_agent_state` on every agent state transition:
-> - `set_agent_state("thinking")` while working
-> - `set_agent_state("idle")` when the turn finishes; the user can continue with a new question
-> - `set_agent_state("waiting")` when you need the user to confirm a choice, pick an option, or reply — INCLUDING plain-text choice lists and built-in client modals. Client hooks only fire on tool / LLM / approval events; they do NOT see these. Call it yourself before rendering the options.
-> - `set_agent_state("error")` on errors
-```
 
 ## Verify
 

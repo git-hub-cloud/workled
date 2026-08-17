@@ -32,14 +32,15 @@ try {
   // fallback to default
 }
 const MARKER = "<!-- workled -->";
+// Keep this block verbatim in sync with SKILL.md "## Mandatory State Protocol"
+// (the State/When table): same four states, same order, same wording.
 const REMINDER = [
   MARKER,
-  "",
   "> when connected to a workled device via MCP, call `set_agent_state` on every agent state transition:",
-  "> - `set_agent_state(\"thinking\")` while working",
-  "> - `set_agent_state(\"idle\")` when the turn finishes; the user can continue with a new question",
-  "> - `set_agent_state(\"waiting\")` when you need the user to confirm a choice, pick an option, or reply — INCLUDING plain-text choice lists and built-in client modals. Client hooks only fire on tool / LLM / approval events; they do NOT see these. Call it yourself before rendering the options.",
-  "> - `set_agent_state(\"error\")` on errors",
+  "> - `set_agent_state(\"thinking\")` — first tool call of every reply; user submits a message",
+  "> - `set_agent_state(\"waiting\")` — call BEFORE asking the user for input: before invoking an input tool (`AskUserQuestion`/`question`/`ask`/`confirm`), before opening a client-side modal, before rendering a plain-text choice list / multi-option question",
+  "> - `set_agent_state(\"idle\")` — turn finished; session torn down",
+  "> - `set_agent_state(\"error\")` — runtime error / failed tool call occurred",
 ].join("\n");
 
 const h = homedir();
@@ -915,18 +916,26 @@ function workledHookCommand(eventName) {
 }
 
 // Each lifecycle event the workled hook should fire on. `matcher` (only for
-// PreToolUse) restricts the hook to a specific tool so it does NOT run on every
-// tool call — a bare PreToolUse hook would spawn a ~3.6s process per Bash/Read/
-// Write and stall the agent. The `waiting` state is emitted only when the matched
-// tool is one of the workled "input" tools (see getInputTools — a fixed
-// "question" substring match).
+// PreToolUse/PostToolUse/Notification) restricts the hook so it does NOT run on
+// every tool call — a bare PreToolUse hook would spawn a ~3.6s process per
+// Bash/Read/Write and stall the agent.
+//
+// AskUserQuestion timing (WorkBuddy/CodeBuddy): PreToolUse AND PostToolUse for
+// AskUserQuestion both fire at the moment the USER ANSWERS, not when the dialog
+// is rendered. A PreToolUse hook would therefore light "waiting" AFTER the user
+// already confirmed — exactly backwards — so it is intentionally NOT installed.
+// The AskUserQuestion wait window is lit by the agent calling
+// set_agent_state("waiting") itself BEFORE rendering the question (SKILL.md).
+// Notification is the only render-time hook: permission_prompt fires when a
+// tool approval dialog is SHOWN -> waiting; idle_prompt fires after ~60s of
+// session idle -> idle (fallback if Stop did not fire).
 const WORKLED_HOOK_SPECS = [
   { event: "UserPromptSubmit", matcher: null },
   { event: "Stop", matcher: null },
-  { event: "PreToolUse", matcher: "AskUserQuestion" },
-  // PostToolUse maps to "thinking" (HOOK_MAP) so confirming an AskUserQuestion
-  // returns the LED to the working state; it fires when the user answers, so it
-  // never touches the wait window that PreToolUse's "waiting" must cover.
+  { event: "Notification", matcher: "permission_prompt" },
+  { event: "Notification", matcher: "idle_prompt" },
+  // PostToolUse maps to "thinking" (HOOK_MAP) so answering an AskUserQuestion
+  // returns the LED to the working state; it fires when the user answers.
   { event: "PostToolUse", matcher: "AskUserQuestion" },
 ];
 

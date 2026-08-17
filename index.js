@@ -773,19 +773,36 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 
 async function discoverWorkledUrl(clientPrefix) {
   if (forcedMcpUrl) return forcedMcpUrl;
-  if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
   const now = Date.now();
-  if (workledUrl && now < workledUrlExpiry) return workledUrl;
-  const candidates = getWorkledCandidates(clientPrefix);
-  if (candidates.length === 0) return null;
 
-  // Pick the first configured URL directly, without probing (the server is
-  // stateless); a failed send clears the cache so the next event re-reads the
-  // config files from disk.
-  const url = candidates[0].url;
-  workledUrl = url;
-  workledUrlExpiry = now + WORKLED_URL_TTL_MS;
-  return url;
+  // Single shared cache for the resolved URL. On a cache miss we make the
+  // priority decision ONCE and store the winning URL in workledUrl — so the
+  // env-override reachability check and the final URL share ONE expiry and ONE
+  // code path instead of two parallel caches. WORKLED_MCP_URL wins only when it
+  // actually answers (probed with the same probeReachable every other client
+  // uses); a set-but-unreachable override falls back to the configured URL so
+  // it never breaks the live LED.
+  if (workledUrl === null || now >= workledUrlExpiry) {
+    const envUrl = process.env.WORKLED_MCP_URL;
+    if (envUrl && (await probeReachable(envUrl)).reachable) {
+      workledUrl = envUrl;
+      workledUrlExpiry = now + WORKLED_URL_TTL_MS;
+      return envUrl;
+    }
+    const candidates = getWorkledCandidates(clientPrefix);
+    if (candidates.length === 0) {
+      // Nothing resolved; force a re-eval on the next call instead of caching a
+      // dead null.
+      workledUrl = null;
+      workledUrlExpiry = 0;
+      return null;
+    }
+    // Pick the first configured URL directly, without probing (the server is
+    // stateless); a failed send calls invalidateDiscovery to re-read the config.
+    workledUrl = candidates[0].url;
+    workledUrlExpiry = now + WORKLED_URL_TTL_MS;
+  }
+  return workledUrl;
 }
 
 // Forget every cached URL/candidate so the next discovery re-reads the config
@@ -1241,14 +1258,22 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 // otherwise it is a no-op. PostToolUse maps to "thinking" — after any tool
 // returns the agent resumes working, so the LED returns to the working state.
 //
-// NOTE (WorkBuddy limitation): the host fires PreToolUse/PostToolUse for
+// NOTE (WorkBuddy/CodeBuddy): the host fires PreToolUse AND PostToolUse for
 // AskUserQuestion at the moment the USER ANSWERS, NOT when the question is
-// rendered. So a hook can never light "waiting" during the wait window. The
-// agent MUST call set_agent_state("waiting") itself BEFORE rendering a question
-// (see SKILL.md). The hooks here are only a safety net for the answer moment.
+// rendered. So a hook can never light "waiting" during the AskUserQuestion
+// wait window. The agent MUST call set_agent_state("waiting") itself BEFORE
+// rendering a question (see SKILL.md). The only render-time hook signal the
+// host offers is Notification, which fires when a permission/approval dialog
+// is SHOWN (resolved via payload.notification_type, see "notification" below).
 const HOOK_MAP = {
   // WorkBuddy (Claude Code-compatible hooks in ~/.workbuddy/settings.json)
   UserPromptSubmit: "thinking",
+  // Notification fires when a dialog is SHOWN (render time), not after the
+  // user answers. Resolved via payload.notification_type:
+  //   permission_prompt -> waiting (tool approval dialog displayed)
+  //   idle_prompt       -> idle   (session idle >60s, fallback for Stop)
+  //   auth_success/...  -> no-op
+  Notification: "notification",
   // agy / gemini (camelCase)
   Stop: "idle",
   PreInvocation: "thinking",
@@ -1316,6 +1341,15 @@ function resolveHookState(event, payload) {
     const toolName = extractToolName(payload);
     if (!toolIsInput(toolName)) return null;
     return "waiting";
+  }
+  if (target === "notification") {
+    // CodeBuddy/workbuddy Notification hook input carries notification_type.
+    // Only the dialog-shown types map to a state; auth_success and anything
+    // unknown are no-ops so the LED is not disturbed by incidental notices.
+    const ntype = (payload && (payload.notification_type || payload.notificationType)) || "";
+    if (ntype === "permission_prompt") return "waiting";
+    if (ntype === "idle_prompt") return "idle";
+    return null;
   }
   return target;
 }

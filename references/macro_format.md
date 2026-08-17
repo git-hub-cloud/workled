@@ -238,7 +238,8 @@ Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `c
 ]
 ```
 
-### Windows unlock: lock screen, wait for display wake time, then type:
+### Windows unlock with long press:
+Bind to `long_press_start`. Locks the screen first, waits for the display to wake, then types the password and confirms:
 ```json
 [
   {"combo": "gui+l"},
@@ -249,13 +250,11 @@ Modifiers are combined with other keys using `+`, e.g. `ctrl+c`, `shift+tab`, `c
 ]
 ```
 
-### Mac unlock: lock screen, wait for display wake time, then type:
+### WorkBuddy GUI client: toggle voice recording (click to record, click again to stop):
+Bind to `single_click`. WorkBuddy's voice input is a **toggle** — the same
+action starts recording and stops+submits it. The voice-input hotkey is `ctrl+d`:
 ```json
 [
-  {"combo": "ctrl+cmd+q"},
-  {"delay": 1000},
-  {"combo": "enter"},
-  {"password": "hello"},
-  {"combo": "enter"}
+  {"combo": "ctrl+d"}
 ]
 ```
