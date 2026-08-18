@@ -15,7 +15,7 @@
 // The event->state mapping is unified across all hook-based clients.
 //
 // Works with the workled MCP server over streamable HTTP. Discovery order:
-//   WORKLED_MCP_URL env -> opencode config (mcp.*.url) global + project.
+//   WORKLED_MCP_URL env -> opencode config (mcp.*.url).
 
 import { homedir } from "os";
 import { join } from "path";
@@ -23,7 +23,7 @@ import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome, sleep, dshHome, traeHome, resolveProjectRoot } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeHome } from "./utils.js";
 
 const HOME = homedir();
 const execFileAsync = promisify(execFile);
@@ -44,50 +44,44 @@ try {
 // servers in. Used by loadMcpServers() here and by the uninstall cleanup in
 // skill-install.mjs, so the client list and config paths cannot drift.
 //
-//   client  - "<name>.<scope>" (scope: global | project)
+//   client  - "<name>" identifier (e.g., "opencode", "kilo", "agy")
 //   key     - top-level key that holds the server map (mcp / mcpServers); the
 //             hermes YAML reader resolves "mcp_servers" internally
 //   format  - json (JSONC tolerated via stripJsonc) | yaml
-//   path    - resolved lazily so `projectDir` (cwd, updated on register) and
-//             $HERMES_HOME are always read at call time, never frozen at load.
+//   path    - resolved lazily so $HERMES_HOME is always read at call time,
+//             never frozen at load.
 //   type    - default `type` written for a fresh workled MCP entry; only set
 //             for clients that require an explicit transport declaration
 //             (opencode/kilo/workbuddy use "remote"). Clients that infer the
 //             transport from `url` (gemini/agy, openclaw, pi, hermes) omit it.
 export const MCP_SOURCES = [
-  // opencode (global + project)
-  { client: "opencode.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.json") },
-  { client: "opencode.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.jsonc") },
-  { client: "opencode.project", key: "mcp", format: "json", type: "remote", path: () => join(projectDir, "opencode.json") },
-  { client: "opencode.project", key: "mcp", format: "json", type: "remote", path: () => join(projectDir, "opencode.jsonc") },
+  // opencode
+  { client: "opencode", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.json") },
+  { client: "opencode", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.jsonc") },
   // kilo (opencode fork)
-  { client: "kilo.global", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "kilo", "kilo.jsonc") },
-  // agy / gemini (two possible global locations + project)
-  { client: "agy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "config", "mcp.json") },
-  { client: "agy.global", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "antigravity-cli", "mcp.json") },
-  { client: "agy.project", key: "mcpServers", format: "json", path: () => join(projectDir, ".gemini", "mcp.json") },
+  { client: "kilo", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "kilo", "kilo.jsonc") },
+  // agy / gemini
+  { client: "agy", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "config", "mcp.json") },
+  { client: "agy", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "antigravity-cli", "mcp.json") },
   // openclaw
-  { client: "openclaw.global", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
+  { client: "openclaw", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
   // pi
-  { client: "pi.global", key: "mcp", format: "json", path: () => join(HOME, ".pi", "mcp.json") },
+  { client: "pi", key: "mcp", format: "json", path: () => join(HOME, ".pi", "mcp.json") },
   // workbuddy (JSON, mcpServers key, ~/.workbuddy/mcp.json; Claude Code
   // compatible, so remote servers declare type: "remote")
-  { client: "workbuddy.global", key: "mcpServers", format: "json", type: "remote", path: () => join(HOME, ".workbuddy", "mcp.json") },
+  { client: "workbuddy", key: "mcpServers", format: "json", type: "remote", path: () => join(HOME, ".workbuddy", "mcp.json") },
   // hermes (YAML)
-  { client: "hermes.global", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
-  // dsh (DeepSeek Harness): workled is a native Cordis plugin under
-  // <dsh-home>/plugins/workled/, mounted via the `web` profile's
-  // cordis.patch.yml (format: `- insert:` with id: workled, config: {url,
-  // timeout, enabled}). format: "dsh-patch" triggers the dedicated parser in
-  // loadMcpServers that extracts config.url + enabled and also probes the
-  // vendored plugin dir existence.
-  { client: "dsh.global", key: "mcp", format: "dsh-patch", path: () => join(dshHome(), "profiles", "web", "cordis.patch.yml") },
-  // trae (Trae IDE, NOT Cursor): Trae is a VSCode fork whose global MCP
-  // config lives at <trae-home>/User/globalStorage/mcp.json (traeHome()
-  // resolves "Trae CN" vs "Trae" on Windows). Project config at .trae/mcp.json.
+  { client: "hermes", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
+  // dsh (DeepSeek Harness): workled is installed as a proper bundle under
+  // <dsh-home>/profiles/web/node_modules/workled/, registered in the web
+  // profile's package.json dsh.profile.bundles, with a config-override row
+  // in cordis.patch.yml (id: workled, name: workled, config: {url, timeout,
+  // enabled}). format: "dsh-patch" triggers the dedicated parser in loadMcpServers
+  // that extracts config.url + enabled.
+  { client: "dsh", key: "mcp", format: "dsh-patch", path: () => join(dshHome(), "profiles", "web", "cordis.patch.yml") },
+  // trae (Trae IDE, NOT Cursor): Trae is a VSCode fork.
   // mcpServers key, HTTP remote — type omitted (Trae infers transport from url).
-  { client: "trae.global", key: "mcpServers", format: "json", path: () => join(traeHome(), "User", "globalStorage", "mcp.json") },
-  { client: "trae.project", key: "mcpServers", format: "json", path: () => join(projectDir, ".trae", "mcp.json") },
+  { client: "trae", key: "mcpServers", format: "json", path: () => join(traeHome(), "User", "globalStorage", "mcp.json") },
 ];
 
 // Every client the skill installs to. `status` accepts an optional
@@ -135,10 +129,10 @@ export const CLIENT_TARGETS = {
     help: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
   },
   dsh: {
-    help: "plugin -> <dsh-home>/plugins/workled + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP) + reminder in AGENTS.md",
+    help: "plugin -> <dsh-home>/profiles/web/node_modules/workled (bundle) + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP) + reminder in AGENTS.md",
   },
   trae: {
-    help: "mcp    -> <trae-home>/User/globalStorage/mcp.json (global, mcpServers.workled) + .trae/mcp.json (project)",
+    help: "mcp    -> <trae-home>/User/globalStorage/mcp.json (mcpServers.workled)",
   },
   default: {
     help: "installed (targets: see SKILL.md)",
@@ -231,7 +225,6 @@ let hookClientPrefix = null;
 // a cordis.patch.yml plugin row that discovery cannot parse. When set, it wins
 // over every other discovery source for this process.
 let forcedMcpUrl = null;
-let projectDir = resolveProjectRoot();
 const seenUserMessages = new Set();
 let seenMessagesCleanedAt = Date.now();
 const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -932,7 +925,7 @@ async function sendLoop() {
         // config should be re-discovered immediately, so drop the cached URL
         // and candidate list for the next event.
         invalidateDiscovery();
-        console.warn(`[workled] setAgentState(${state}) failed after ${maxAttempts} attempts: ${lastErr.message || lastErr}`);
+        // console.warn(`[workled] setAgentState(${state}) failed after ${maxAttempts} attempts: ${lastErr.message || lastErr}`);
       }
     }
     // After the outer while-loop exits (pendingState became null) we know the
@@ -1046,8 +1039,6 @@ export const opencodeEntry = {
   description:
     "Maps opencode agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   async register(ctx) {
-    const directory = ctx && ctx.directory;
-    projectDir = directory || projectDir;
     try {
       await discoverWorkledUrl("opencode");
     } catch {

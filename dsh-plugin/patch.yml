@@ -2,7 +2,7 @@
 # The plugin source lives next to this file (./src/index.js).
 - insert:
     - id: workled
-      name: 'workled-dsh-plugin'
+      name: 'workled'
       # Config is overridden by the profile's cordis.patch.yml / env vars.
       # WORKLED_MCP_URL wins on every call; the url field is a fallback.
       config:

@@ -819,8 +819,8 @@ function removeMcpServerYaml(file, keyCandidates) {
   return null;
 }
 
-// Remove the `workled` MCP server entry from one MCP_SOURCES source (global or
-// project). JSON sources: drop obj[key].workled, then the key itself when
+// Remove the `workled` MCP server entry from one MCP_SOURCES source.
+// JSON sources: drop obj[key].workled, then the key itself when
 // empty; the config is rewritten in place via writeConfig (no backup file is
 // created). YAML sources (hermes) go through removeMcpServerYaml(), which
 // probes the historical MCP key candidates.
@@ -881,12 +881,12 @@ export function removeJsoncKey(text, key) {
   return text.slice(0, start) + text.slice(end);
 }
 
-// Remove the `workled` MCP server entry from every config source of one client
-// (global + project scope). Returns the list of removal messages produced by
+// Remove the `workled` MCP server entry from every config source of one client.
+// Returns the list of removal messages produced by
 // unregisterWorkledMcp(client) via removeMcpServer() (null results filtered
 // out); an empty array means no `workled` MCP server entry was found to remove.
 function unregisterWorkledMcp(client) {
-  return MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`) && !s.patchManaged)
+  return MCP_SOURCES.filter((s) => s.client === client && !s.patchManaged)
     .map((s) => removeMcpServer(s))
     .filter(Boolean);
 }
@@ -1148,11 +1148,11 @@ function addMcpServerYaml(file, key, serverName, entry) {
   return `Registered workled -> ${key} (${file})`;
 }
 
-// Register the workled MCP server for one client across its global config
+// Register the workled MCP server for one client across its config
 // sources (deduped by path). Mirrors unregisterWorkledMcp so install and
 // uninstall stay symmetric and every client's logic is identical.
 function registerWorkledMcp(client, entry) {
-  const sources = MCP_SOURCES.filter((s) => s.client.startsWith(`${client}.`) && !s.patchManaged);
+  const sources = MCP_SOURCES.filter((s) => s.client === client && !s.patchManaged);
   const seen = new Set();
   const msgs = [];
   for (const s of sources) {
@@ -1763,28 +1763,19 @@ function uninstallHermes() {
 //   2. drives the workled LED BY DIRECT HTTP to the workled MCP endpoint
 //      (tools/call set_agent_state JSON-RPC POST), no shell hop, no hook CLI.
 
-// cordis.patch.yml insert block: mounts ONLY the native plugin. No extra
-// hooks bridge or MCP-client rows needed because the plugin calls HTTP
-// directly with WORKLED_MCP_URL / config.url.
-//
-// IMPORTANT: `name` and `path` use RELATIVE paths (`../../plugins/workled/...`)
-// because the patch file lives at `<dsh-home>/profiles/web/cordis.patch.yml`
-// and dsh's cordis:include loader resolves the import specifier from that
-// directory. A bare npm package name would fail with ERR_MODULE_NOT_FOUND
-// (the plugin is vendored locally, not in node_modules); an absolute file://
-// URL would be user-specific and break when copied across machines. The
-// relative path is identical for every user because dsh's directory layout
-// is always `<dsh-home>/{profiles/web,plugins/workled}/...`.
+// cordis.patch.yml config-override block: the plugin is installed as a proper
+// bundle under <dsh-home>/profiles/web/node_modules/workled/, so the profile
+// patch only overrides the bundle's config (url / timeout / enabled). The
+// bundle's own patch.yml inserts the entry with name 'workled'; this overlay
+// finds it by id and patches config.
 function dshPatchBlock(url) {
   return [
-    "- insert:",
-    "    - id: workled",
-    "      name: '../../plugins/workled/src/index.js'",
-    "      path: '../../plugins/workled'",
-    "      config:",
-    `        url: '${url}'`,
-    "        timeout: 1500",
-    "        enabled: true",
+    "- id: workled",
+    "  name: workled",
+    "  config:",
+    `    url: '${url}'`,
+    "    timeout: 1500",
+    "    enabled: true",
   ].join("\n");
 }
 
@@ -1828,13 +1819,23 @@ function installDsh() {
   const home = dshHome();
   const url = process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
   mkdirSync(home, { recursive: true });
-  // A) Vend the native Cordis plugin to <dsh-home>/plugins/workled/.
+  // A) Install as a proper dsh bundle under the web profile's node_modules.
   const srcPlugin = join(scriptDir, "dsh-plugin");
-  const dstPlugin = join(home, "plugins", "workled");
+  const dstPlugin = join(home, "profiles", "web", "node_modules", "workled");
   cpDir(srcPlugin, dstPlugin);
-  // B) Mount plugin in the `web` profile cordis.patch.yml (dsh-web-app default).
+  // B) Register the bundle in the web profile's package.json.
   const profileDir = join(home, "profiles", "web");
   mkdirSync(profileDir, { recursive: true });
+  const pkgFile = join(profileDir, "package.json");
+  const pkg = readJsonOrEmpty(pkgFile) || {};
+  if (!pkg.dsh) pkg.dsh = {};
+  if (!pkg.dsh.profile) pkg.dsh.profile = {};
+  if (!Array.isArray(pkg.dsh.profile.bundles)) pkg.dsh.profile.bundles = [];
+  if (!pkg.dsh.profile.bundles.includes("workled")) {
+    pkg.dsh.profile.bundles.push("workled");
+  }
+  writeConfig(pkgFile, pkg);
+  // C) Mount plugin in the `web` profile cordis.patch.yml (config override).
   const patchFile = join(profileDir, "cordis.patch.yml");
   const block = dshPatchBlock(url);
   let content = "";
@@ -1845,20 +1846,40 @@ function installDsh() {
   rows.push(block.split("\n"));
   const written = rows.flat().join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
   writeFileSync(patchFile, written, "utf8");
-  return `Installed dsh Cordis plugin -> ${dstPlugin}\nInstalled dsh profile patch -> ${patchFile}`;
+  return `Installed dsh bundle -> ${dstPlugin}\nInstalled dsh profile patch -> ${patchFile}`;
 }
 
 function uninstallDsh() {
   const home = dshHome();
   const removed = [];
-  // A) Remove vendored plugin tree.
+  // A) Remove bundle from the web profile's node_modules.
+  const bundleDir = join(home, "profiles", "web", "node_modules", "workled");
+  if (existsSync(bundleDir)) {
+    removePath(bundleDir);
+    removed.push(`Removed dsh bundle dir ${bundleDir}`);
+    removeEmptyParent(dirname(bundleDir));
+  }
+  // Backward compat: also remove old vendored plugin tree if present.
   const pluginDir = join(home, "plugins", "workled");
   if (existsSync(pluginDir)) {
     removePath(pluginDir);
-    removed.push(`Removed dsh plugin dir ${pluginDir}`);
+    removed.push(`Removed old dsh plugin dir ${pluginDir}`);
     removeEmptyParent(dirname(pluginDir));
   }
-  // B) Strip workled rows from the `web` profile cordis.patch.yml.
+  // B) Unregister bundle from the web profile's package.json.
+  const pkgFile = join(home, "profiles", "web", "package.json");
+  if (existsSync(pkgFile)) {
+    const pkg = readJsonOrEmpty(pkgFile);
+    if (pkg && Array.isArray(pkg.dsh?.profile?.bundles)) {
+      pkg.dsh.profile.bundles = pkg.dsh.profile.bundles.filter((b) => b !== "workled");
+      if (pkg.dsh.profile.bundles.length === 0) delete pkg.dsh.profile.bundles;
+      if (Object.keys(pkg.dsh.profile || {}).length === 0) delete pkg.dsh.profile;
+      if (Object.keys(pkg.dsh || {}).length === 0) delete pkg.dsh;
+      writeConfig(pkgFile, pkg);
+      removed.push(`Removed workled from ${pkgFile}`);
+    }
+  }
+  // C) Strip workled rows from the `web` profile cordis.patch.yml.
   const patchFile = join(home, "profiles", "web", "cordis.patch.yml");
   if (existsSync(patchFile)) {
     const items = splitYamlTopItems(readFileSync(patchFile, "utf8"));
@@ -2036,9 +2057,8 @@ async function main() {
         break;
       }
       case "trae": {
-        // Trae (Cursor-compatible): pure MCP config — global ~/.cursor/mcp.json
-        // and project .trae/mcp.json, both with mcpServers key. No hook layer
-        // because the MCP server is called directly by the agent via MCP tools.
+        // Trae (Cursor-compatible): pure MCP config with mcpServers key.
+        // No hook layer because the MCP server is called directly by the agent via MCP tools.
         if (isInstall) {
           lines.push(...(await registerWorkledMcp("trae", mcpEntry)));
         } else {

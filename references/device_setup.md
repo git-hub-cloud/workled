@@ -39,8 +39,7 @@ Once the device is on the same network, its MCP endpoint is:
 http://<device-name>.local:18791/mcp
 ```
 
-Add the server to your agent config. For opencode, edit `opencode.json`
-(global `~/.config/opencode/opencode.json` or project-level `opencode.json`):
+Add the server to your agent config. For opencode, edit `~/.config/opencode/opencode.json`:
 
 ```jsonc
 {
@@ -83,7 +82,7 @@ node ~/.agents/skills/workled/skill-install.mjs install --client <name>
 
 ### Client integration
 
-Fully global: every target path is derived from `homedir()`, never from cwd, so
+Every target path is derived from `homedir()`, never from cwd, so
 the same command runs from any directory on any shell. Both `install` and
 `uninstall` **require** an explicit target: `--client <name>` (opencode, kilo,
 openclaw, agy, hermes, dsh, pi, workbuddy) for one client, or `--client all` for
@@ -166,7 +165,7 @@ reachability. Exit code is 0 when a workled config exists and is reachable,
 node <skill-dir>/index.js status
 ```
 
-The command scans the MCP config of every client (opencode global and project,
+The command scans the MCP config of every client (opencode,
 agy/gemini, openclaw, pi, workbuddy, hermes, dsh), takes the first server named `workled`
 (`WORKLED_MCP_URL` override wins), and checks reachability with a **stateless**
 `tools/call get_agent_state` probe. Each URL is probed up to 3 times

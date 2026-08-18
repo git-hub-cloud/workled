@@ -121,36 +121,3 @@ export function stripJsonc(src) {
   }
   return out;
 }
-
-/**
- * Walk up from `process.cwd()` to find the project root directory.
- * Project root is identified by the presence of a `.git/` directory (or
- * `.trae/mcp.json` / `.gemini/mcp.json` as fallback).  Directories inside
- * a `.agents/skills/` subtree are skipped — skill repos have their own
- * `.git` and prior buggy installs may leave `.trae/mcp.json` artifacts
- * there, both of which would otherwise fool the walker into stopping too
- * early.
- *
- * Returns the first matching ancestor, or `process.cwd()` if no project
- * marker is found.
- */
-export function resolveProjectRoot() {
-  let dir = process.cwd();
-  // `.git` is persistent (never deleted by install/uninstall) and exists
-  // at the project root.  `.trae/mcp.json` and `.gemini/mcp.json` are
-  // fallbacks for projects that don't use git.
-  const markers = [".git", ".trae/mcp.json", ".gemini/mcp.json"];
-  for (;;) {
-    // Skip directories inside .agents/skills/ — these are agent skill repos,
-    // not the project root.
-    if (!dir.includes(".agents" + sep + "skills" + sep)) {
-      for (const m of markers) {
-        if (existsSync(join(dir, m))) return dir;
-      }
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break; // filesystem root
-    dir = parent;
-  }
-  return process.cwd();
-}

@@ -259,7 +259,7 @@ Recommended binding: `long_press`. Locks the screen first, waits for the display
 ]
 ```
 
-### WeChat voice message: start recording (hold to record):
+### WeChat voice to text:
 Recommended binding: `single_click`. Toggle voice recording on/off with touch effect:
 ```json
 [
@@ -267,10 +267,10 @@ Recommended binding: `single_click`. Toggle voice recording on/off with touch ef
 ]
 ```
 
-### WeChat voice message: toggle recording (press once to start, press again to stop):
-Recommended binding: `single_click`. Toggle voice recording on/off:
+### WorkBuddy voice to text:
+Recommended binding: `single_click`. Toggle voice recording on/off without touch effect:
 ```json
 [
-  {"combo": "ctrl+win+shift"}
+  {"combo": "ctrl+d"}
 ]
 ```

@@ -9,7 +9,7 @@ import { dshHome } from "../utils.js";
 const SKILL_DIR = join(fileURLToPath(new URL("..", import.meta.url)));
 const INSTALLER = join(SKILL_DIR, "skill-install.mjs");
 const HOME = dshHome();
-const PLUGIN_DIR = join(HOME, "plugins", "workled");
+const PLUGIN_DIR = join(HOME, "profiles", "web", "node_modules", "workled");
 const PATCH_FILE = join(HOME, "profiles", "web", "cordis.patch.yml");
 const TEST_URL = "http://192.168.31.146:18791/mcp";
 
@@ -36,11 +36,10 @@ function run(args) {
 function patchHasWorkledRow() {
   if (!existsSync(PATCH_FILE)) return false;
   const text = readFileSync(PATCH_FILE, "utf8");
-  // The loader imports via a relative path `../../plugins/workled/src/index.js`
-  // (user-independent — dsh layout is always <dsh-home>/{profiles/web,plugins/workled}).
+  // The profile patch overrides the bundle's config: id: workled, name: workled.
   return (
     /id:\s*workled\b/.test(text) &&
-    /\.\.\/\.\.\/plugins\/workled\/src\/index\.js/.test(text)
+    /name:\s*workled\b/.test(text)
   );
 }
 
@@ -105,7 +104,7 @@ for (let cycle = 1; cycle <= 3; cycle++) {
 
   // Check patch file
   ok("patch file exists", existsSync(PATCH_FILE));
-  ok("patch has workled row (id: workled + workled-dsh-plugin)", patchHasWorkledRow());
+  ok("patch has workled row (id: workled + name: workled)", patchHasWorkledRow());
   const urlInPatch = patchHasUrl();
   ok("patch has correct URL", urlInPatch === TEST_URL, `got: ${urlInPatch}`);
 
@@ -136,16 +135,12 @@ for (let cycle = 1; cycle <= 3; cycle++) {
   if (existsSync(PATCH_FILE)) {
     const text = readFileSync(PATCH_FILE, "utf8");
     ok("patch file has no workled row", !patchHasWorkledRow());
-    ok("patch file has no workled-dsh-plugin", !text.includes("workled-dsh-plugin"));
-    ok("patch file has no workled-mcp", !text.includes("workled-mcp"));
-    ok("patch file has no workled-hooks", !text.includes("workled-hooks"));
   } else {
     ok("patch file removed (acceptable)", true);
   }
 
-  // Check no orphan files from the v2 install (legacy v1 hooks.json is not
-  // our concern — v2 uninstall only cleans up what v2 install created).
-  ok("no plugins/workled dir leftover", !existsSync(PLUGIN_DIR));
+  // Check no leftover bundle dir from the install
+  ok("no node_modules/workled dir leftover", !existsSync(PLUGIN_DIR));
 
   console.log("");
 }
@@ -174,8 +169,9 @@ if (origPatch !== null) {
 }
 
 // Restore plugin directory: the last uninstall cycle removed it, so if the
-// original state had the plugin installed, reinstall it now. The patch file
-// alone is not enough — the loader imports ../../plugins/workled/src/index.js.
+// original state had the plugin installed, reinstall it now. The bundle is
+// registered in package.json + cordis.patch.yml, so uninstall removes the
+// node_modules/workled dir.
 if (origPluginExisted && !existsSync(PLUGIN_DIR)) {
   try {
     run(["install", "--client", "dsh"]);
