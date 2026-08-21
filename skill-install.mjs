@@ -21,7 +21,14 @@ import { stripJsonc, hermesHome, sleep, dshHome } from "./utils.js";
 import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
-const corePath = join(scriptDir, "index.js");
+function resolveCorePath() {
+  const globalIndex = join(homedir(), ".agents", "skills", "workled", "index.js");
+  if (existsSync(globalIndex)) {
+    return globalIndex;
+  }
+  return join(scriptDir, "index.js");
+}
+const corePath = resolveCorePath();
 // SKILL_VERSION: single-sourced from _meta.json, with a fallback so a missing
 // or corrupt registry file never crashes the installer (index.js guards the
 // same read).
@@ -724,11 +731,18 @@ export function removeJsoncEntry(text, key, serverName) {
 // ---- hook command construction (agy / hermes) -------------------------------
 
 function hookCommand(eventName) {
-  // Windows paths need quotes; JSON handles escaping via JSON.stringify.
+  // No quotes around corePath: JSON.stringify already escapes the string for
+  // JSON output. Wrapping the path in double quotes inside the template would
+  // produce literal \" characters in the JSON value, which some clients
+  // (notably agy / Gemini CLI on Windows) misinterpret as part of the path,
+  // yielding commands like:
+  //   node "C:\...\config\"C:\...\skills\workled\index.js"
+  // that fail with MODULE_NOT_FOUND. Keeping the path unquoted avoids this.
+  // Windows paths used here contain no spaces, so quoting is unnecessary.
   // The event->state mapping is unified across all hook-based clients.
   // Agents that don't echo the event name in stdin (agy, hermes) get it
   // appended explicitly; others resolve it from the payload.
-  const base = `node "${corePath}" hook`;
+  const base = `node ${corePath} hook`;
   return eventName ? `${base} --event ${eventName}` : base;
 }
 
@@ -1203,8 +1217,11 @@ function uninstallAgy() {
   const json = readJsonOrEmpty(hooksFile);
   if (!json || !json[AGY_HOOK_ID]) return `No agy workled hooks at ${hooksFile}`;
   delete json[AGY_HOOK_ID];
-  // Always write back — never delete hooks.json even if now empty;
-  // other tools or clients may rely on the file's existence.
+  if (Object.keys(json).length === 0) {
+    removePath(hooksFile);
+    removeEmptyParent(dirname(hooksFile));
+    return `Removed empty agy hooks.json -> ${hooksFile}`;
+  }
   writeConfig(hooksFile, json);
   return `Removed agy workled hooks -> ${hooksFile}`;
 }
@@ -1907,13 +1924,12 @@ function printHelp() {
   console.log(`workled skill installer
 
 Usage:
-  node skill-install.mjs install|uninstall --client <name>|all
+  node skill-install.mjs install|uninstall --client <name>
   node skill-install.mjs install|uninstall --file <instruction-file>
 
 ${CLIENTS.map((c) => `  ${c.padEnd(10)} ${targetHelp(c)}`).join("\n")}
   --file     generic: only the reminder (clients not in the list use this method)
-  --client   REQUIRED -- the invoking agent passes its own client name, or
-             "all" to apply the operation to every client
+  --client   REQUIRED -- the invoking agent passes its own client name
 `);
 }
 
@@ -1942,24 +1958,22 @@ async function main() {
   }
 
   // Target client resolution: both actions (install AND uninstall) require an
-  // explicit target. The invoking agent passes its own client name, or "all"
-  // to apply the operation to every client. Omitted => error listing the
-  // client enum so the agent can pick its own client or all.
+  // explicit target. The invoking agent passes its own client name.
   const clientIdx = args.indexOf("--client");
   const clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
-  if (clientArg && clientArg !== "all" && !CLIENTS.includes(clientArg)) {
-    console.error(`Unknown client: ${clientArg}\nSupported clients: ${CLIENTS.join(", ")}, all`);
+  if (clientArg && !CLIENTS.includes(clientArg)) {
+    console.error(`Unknown client: ${clientArg}\nSupported clients: ${CLIENTS.join(", ")}`);
     process.exit(1);
   }
   if (!clientArg) {
     console.error(
       `No target client for ${action}.\n` +
-      `Pass --client <name> to ${action} only your own client, or --client all to ${action} every client.\n` +
-      `Clients: ${CLIENTS.join(", ")}, all`
+      `Pass --client <name> to ${action} only your own client.\n` +
+      `Clients: ${CLIENTS.join(", ")}`
     );
     process.exit(1);
   }
-  const targets = clientArg === "all" ? CLIENTS : [clientArg];
+  const targets = [clientArg];
 
   // Resolve the MCP URL once (discovers the real workled device name when
   // possible) so every client's install registers the same, correct endpoint.
@@ -2087,7 +2101,7 @@ async function main() {
   if (failedClients.length) {
     console.error(
       `\n⚠ ${failedClients.length} client(s) failed to ${action}: ${failedClients.join(", ")}.\n` +
-      `  Re-run \`node skill-install.mjs ${action} --client ${failedClients.length === 1 ? failedClients[0] : "all"}\` in a fresh turn to finish.`
+      `  Re-run \`node skill-install.mjs ${action} --client ${failedClients.join(", ")}\` in a fresh turn to finish.`
     );
     process.exitCode = 1;
   }
@@ -2097,30 +2111,33 @@ async function main() {
   // deliberately left untouched — the tool never deletes user-visible
   // backup files.
 
-  // After install, point the agent at the diagnostic command so it can check
-  // MCP reachability and surface the result (hint) to the user. The hint is
-  // the same regardless of which client was targeted: --client only affects
-  // which client gets installed/uninstalled, not how `index.js status` is run.
+  // After install, run status check ONLY for the client that was just installed.
+  // This avoids noise from unrelated clients (e.g. dsh diagnostic when installing pi).
   if (action === "install" && !fileArg) {
     // Run status check to see if MCP is configured
     const { spawnSync } = await import("child_process");
     // Use process.execPath (the same Node this installer runs under) instead
     // of a bare "node": the status check then works even when the user's PATH
     // has no Node entry (e.g. invoked through an IDE-managed runtime).
-    const statusResult = spawnSync(process.execPath, [corePath, "status"], {
+    // Pass --client so status only reports on the target client.
+    const statusArgs = [corePath, "status", "--client", targets[0]];
+    const statusResult = spawnSync(process.execPath, statusArgs, {
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     });
     if (statusResult.stdout) {
       try {
         const status = JSON.parse(statusResult.stdout);
-        if (!status.ok) {
+        // status.ok = false means device unreachable, NOT "not configured".
+        // "Not configured" = no workled entries at all (clients.length === 0).
+        if (status.clients && status.clients.length === 0) {
           console.log("");
           console.log("⚠ WORKLED MCP SERVER NOT CONFIGURED");
           console.log("   Please add the MCP server to your client config:");
           console.log("   See device_setup.md for instructions.");
           console.log("   Or run: node " + corePath + " status to check current state.");
         } else {
+          // Configured but maybe unreachable — show the actual hint.
           console.log("   " + status.hint);
         }
       } catch {

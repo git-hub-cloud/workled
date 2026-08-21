@@ -18,7 +18,7 @@
 //   WORKLED_MCP_URL env -> opencode config (mcp.*.url).
 
 import { homedir } from "os";
-import { join } from "path";
+import { join, resolve } from "path";
 import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
@@ -122,7 +122,7 @@ export const CLIENT_TARGETS = {
   },
   pi: {
     label: "extension",
-    dest: () => join(HOME, ".pi", "agent", "extensions", "workled.ts"),
+    dest: () => join(HOME, ".pi", "agent", "extensions", "workled", "index.ts"),
     agents: () => join(HOME, ".pi", "AGENTS.md"),
   },
   workbuddy: {
@@ -157,7 +157,7 @@ let nextRpcId = 1;
 // prompt_input, permission_approval etc.) so input detection fires on
 // every interactive tool regardless of client spelling.
 export function getInputTools() {
-  return ["question", "confirm", "ask", "choose", "select", "prompt", "input", "approval"];
+  return ["question", "confirm", "ask", "choose", "select", "prompt", "input", "approval", "questionnaire"];
 }
 
 // Input-tool detection for the openclaw/pi adapters. Matches by substring
@@ -1210,15 +1210,31 @@ export const piEntry = {
       setAgentState("idle");
     });
 
+    let lastWasWaiting = false;
+
     pi.on("tool_call", async (event) => {
       // Best-effort input detection: pi has no built-in question tool, but
       // extensions may register interactive tools. Match by tool name.
       const name =
         (event && (event.toolName || event.tool || event.name)) || "";
-      if (isInputTool(name)) {
+      const isInput = isInputTool(name);
+
+      if (isInput) {
         setAgentState("waiting");
+        lastWasWaiting = true;
+      } else if (lastWasWaiting) {
+        // Previous tool was an input tool (waiting), now a regular tool runs -> thinking
+        setAgentState("thinking");
+        lastWasWaiting = false;
       }
     });
+
+    // Note: pi's "input" event fires when USER submits input, not when agent asks.
+    // It does NOT map to waiting state. The waiting state is triggered by
+    // the agent calling input tools (question, ask, confirm, questionnaire, etc.).
+    //
+    // Pi has NO built-in permission prompts (docs: "No permission popups.").
+    // Custom permission flows must be built via extensions (see confirm-destructive.ts).
 
     pi.on("session_start", async (_event, ctx) => {
       try {
@@ -1441,6 +1457,16 @@ async function runHookMode() {
 
 // ---- status mode (diagnostics) ---------------------------------------------
 
+function isFatalNetworkError(err) {
+  if (!err) return false;
+  const msg = (err.message || String(err)).toLowerCase();
+  const code = err.code || (err.cause && err.cause.code) || "";
+  const hardCodes = ["ENOTFOUND", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ERR_INVALID_URL"];
+  if (hardCodes.includes(code)) return true;
+  if (msg.includes("enotfound") || msg.includes("econnrefused") || msg.includes("ehostunreach") || msg.includes("invalid url") || msg.includes("fetch failed")) return true;
+  return false;
+}
+
 // Reachability probe: a bare stateless tools/call to get_agent_state. No
 // initialize handshake or session needed (the server serves stateless
 // requests), and it also verifies the endpoint is really a workled server:
@@ -1450,13 +1476,21 @@ async function runHookMode() {
 // succeeded so `status` can distinguish a flaky-but-working link from a dead
 // one.
 async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+  if (!url || typeof url !== "string" || url.includes("<device-name>")) {
+    return { reachable: false, error: "placeholder URL", attempt: 0 };
+  }
   let lastErr = null;
+  let attemptsMade = 0;
   for (let attempt = 1; attempt <= DEFAULT_MAX_ATTEMPTS; attempt++) {
+    attemptsMade = attempt;
     try {
       await rpc(url, "tools/call", { name: "get_agent_state", arguments: {} }, timeoutMs);
       return { reachable: true, error: null, attempt };
     } catch (err) {
       lastErr = err;
+      if (isFatalNetworkError(err)) {
+        break;
+      }
       if (attempt < DEFAULT_MAX_ATTEMPTS) {
         await sleepWithJitter(DEFAULT_RETRY_DELAY_MS, attempt - 1);
       }
@@ -1465,7 +1499,7 @@ async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   return {
     reachable: false,
     error: (lastErr && lastErr.message) || String(lastErr),
-    attempt: DEFAULT_MAX_ATTEMPTS,
+    attempt: attemptsMade,
   };
 }
 
@@ -1648,7 +1682,7 @@ async function runStatusMode() {
 }
 
 if (process.argv[1]) {
-  const isMain = fileURLToPath(import.meta.url) === process.argv[1];
+  const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
   if (isMain) {
     const sub = process.argv[2];
     if (sub === "hook") {

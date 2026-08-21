@@ -85,13 +85,12 @@ node ~/.agents/skills/workled/skill-install.mjs install --client <name>
 Every target path is derived from `homedir()`, never from cwd, so
 the same command runs from any directory on any shell. Both `install` and
 `uninstall` **require** an explicit target: `--client <name>` (opencode, kilo,
-openclaw, agy, hermes, dsh, pi, workbuddy) for one client, or `--client all` for
-every client. `--file` targets a single instruction file (reminder only).
+openclaw, agy, hermes, dsh, pi, workbuddy). `--file` targets a single instruction file (reminder only).
 `index.js status` accepts the same optional `--client <name>` filter; default
 is **all clients**.
 
 ```
-node <skill-dir>/skill-install.mjs install|uninstall --client <name>|all
+node <skill-dir>/skill-install.mjs install|uninstall --client <name>
 node <skill-dir>/skill-install.mjs install|uninstall --file <any-instruction-file>   # generic clients (reminder only)
 node <skill-dir>/skill-install.mjs --help
 node <skill-dir>/index.js status [--client <name>]    # filter optional; default all
@@ -102,15 +101,8 @@ Examples:
 ```
 node <skill-dir>/skill-install.mjs install --client opencode
 node <skill-dir>/skill-install.mjs uninstall --client opencode
-node <skill-dir>/skill-install.mjs install --client all
-node <skill-dir>/skill-install.mjs uninstall --client all
 node <skill-dir>/index.js status --client opencode
 ```
-
-> **Targets are explicit.** A bare `install` / `uninstall` (no `--client`)
-> errors with the client enum and a hint to pass `--client <name>` — your own
-> client — or `--client all`. Omitted never means "all"; deliberately pass
-> `--client all` only when you intend to apply the operation to every client.
 
 What every client's install flow does:
 
