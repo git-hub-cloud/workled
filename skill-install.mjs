@@ -17,7 +17,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { stripJsonc, hermesHome, sleep, dshHome } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeCodeHooksHome } from "./utils.js";
 import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -728,21 +728,17 @@ export function removeJsoncEntry(text, key, serverName) {
   return text.slice(0, removeFrom) + text.slice(removeTo);
 }
 
-// ---- hook command construction (agy / hermes) -------------------------------
+// ---- hook command construction (hermes) -------------------------------
 
 function hookCommand(eventName) {
-  // No quotes around corePath: JSON.stringify already escapes the string for
-  // JSON output. Wrapping the path in double quotes inside the template would
-  // produce literal \" characters in the JSON value, which some clients
-  // (notably agy / Gemini CLI on Windows) misinterpret as part of the path,
-  // yielding commands like:
-  //   node "C:\...\config\"C:\...\skills\workled\index.js"
-  // that fail with MODULE_NOT_FOUND. Keeping the path unquoted avoids this.
-  // Windows paths used here contain no spaces, so quoting is unnecessary.
-  // The event->state mapping is unified across all hook-based clients.
-  // Agents that don't echo the event name in stdin (agy, hermes) get it
-  // appended explicitly; others resolve it from the payload.
-  const base = `node ${corePath} hook`;
+  // Cross-platform: invoke `node` from PATH as a bare command name so the line
+  // parses under any shell (bash for Claude Code/workbuddy, PowerShell for
+  // TraeCode). Quote corePath only when it contains spaces — otherwise leave it
+  // bare. Note for hermes/YAML: JSON.stringify escapes the quotes correctly for
+  // the YAML scalar, and keeping the path bare (no manual wrapping) avoids the
+  // window path/backslash corruption documented below.
+  const core = /\s/.test(corePath) ? `"${corePath}"` : corePath;
+  const base = `node ${core} hook`;
   return eventName ? `${base} --event ${eventName}` : base;
 }
 
@@ -923,10 +919,24 @@ async function resolveWorkledMcpUrl() {
 // `hooks` field), NOT from the skill directory. These fire automatically on each
 // lifecycle event — independent of agent discipline — so the workled LED tracks
 // state reliably across new sessions without re-reminding the agent.
-function workledHookCommand(eventName) {
-  // Use the same node that runs this installer (managed runtime) and the
-  // installed index.js; both paths are absolute and stable on this machine.
-  return `"${process.execPath}" "${corePath}" hook --event ${eventName} --client workbuddy`;
+export function workledHookCommand(eventName, client, url) {
+  // Cross-platform hook command. We intentionally invoke `node` from PATH (a
+  // bare command name with no spaces) rather than the absolute process.execPath
+  // ("C:\Program Files\nodejs\node.exe" on Windows). This single form parses
+  // equally under a POSIX shell (Claude Code / workbuddy run hooks via bash)
+  // and Windows PowerShell (TraeCode): a spaced "quoted path first" token is a
+  // parse error in PowerShell (needs the `&` call operator) yet the same string
+  // would run `&` as a background operator in bash — so absolute-node forms
+  // can never satisfy both. Only corePath is quoted, and only when it has
+  // spaces, so the command stays valid on every shell.
+  const core = /\s/.test(corePath) ? `"${corePath}"` : corePath;
+  let cmd = `node ${core} hook --event ${eventName} --client ${client}`;
+  // The hook discovers the MCP URL at runtime from its own configuration
+  // (mcp.json / WORKLED_MCP_URL), so no --url is inlined here. This keeps the
+  // command stable across installs and avoids any shell/sandbox mangling of the
+  // URL argument. The `url` parameter is accepted for call compatibility but is
+  // intentionally unused by the generated command.
+  return cmd;
 }
 
 // Each lifecycle event the workled hook should fire on. `matcher` (only for
@@ -953,88 +963,162 @@ const WORKLED_HOOK_SPECS = [
   { event: "PostToolUse", matcher: "AskUserQuestion" },
 ];
 
-// Write workled hooks into ~/.workbuddy/settings.json. Idempotent: any prior
-// workled entry for the same event is replaced first. Note: specs are grouped
-// by event BEFORE filtering so that multiple matchers under one event (e.g. the
-// two Notification specs) are not dropped by each other's per-event filter.
-function registerWorkledSettingsHooks() {
-  const settingsFile = join(h, ".workbuddy", "settings.json");
-  const parsed = readJsonOrEmpty(settingsFile);
-  // Never overwrite a settings.json that exists but cannot be parsed: the
-  // user's other settings would be lost. Warn and bail out instead.
-  if (parsed === null && existsSync(settingsFile)) {
-    console.warn(`SKIPPED writing hooks: ${settingsFile} is unreadable, not modified`);
-    return `SKIPPED workled hooks -> ${settingsFile} (unreadable, not modified)`;
+// Generic, disk-backed hook installer shared by the hook-driven clients
+// (workbuddy: ~/.workbuddy/settings.json, traecode: <home>/.trae-cn/hooks.json).
+// The client marker drives both the generated `--client` command and group
+// matching via the shared merge core, so no path/client is hard-coded here.
+function installWorkledHooks(hooksFile, { client, version, url }) {
+  const parsed = readJsonOrEmpty(hooksFile);
+  // Never overwrite a config that exists but cannot be parsed: the user's
+  // other hooks/settings would be lost. Warn and bail out instead.
+  if (parsed === null && existsSync(hooksFile)) {
+    console.warn(`SKIPPED writing hooks: ${hooksFile} is unreadable, not modified`);
+    return `SKIPPED workled hooks -> ${hooksFile} (unreadable, not modified)`;
   }
-  const settings = parsed || {};
-  if (!settings.hooks || typeof settings.hooks !== "object") settings.hooks = {};
-  // Group specs by event, preserving spec order within each group.
-  const specsByEvent = new Map();
-  for (const spec of WORKLED_HOOK_SPECS) {
-    if (!specsByEvent.has(spec.event)) specsByEvent.set(spec.event, []);
-    specsByEvent.get(spec.event).push(spec);
-  }
-  for (const [ev, specs] of specsByEvent) {
-    if (!Array.isArray(settings.hooks[ev])) settings.hooks[ev] = [];
-    // Drop any prior workled entry for this event to stay idempotent.
-    settings.hooks[ev] = settings.hooks[ev].filter(
-      (group) =>
-        !(
-          group &&
-          Array.isArray(group.hooks) &&
-          group.hooks.some(
-            (hk) =>
-              hk &&
-              typeof hk.command === "string" &&
-              hk.command.includes("workled") &&
-              hk.command.includes(`hook --event ${ev}`)
-          )
-        )
-    );
-    for (const spec of specs) {
-      const group = {
-        hooks: [{ type: "command", command: workledHookCommand(ev), timeout: WORKLED_HOOK_TIMEOUT_MS / 1000 }],
-      };
-      if (spec.matcher) group.matcher = spec.matcher;
-      settings.hooks[ev].push(group);
-    }
-  }
-  writeConfig(settingsFile, settings);
-  return `Installed workled hooks -> ${settingsFile}`;
+  const merged = mergeClientHooks(parsed || {}, {
+    client,
+    commandForEvent: (ev) => workledHookCommand(ev, client, url),
+    version,
+  });
+  writeConfig(hooksFile, merged);
+  return `Installed workled hooks -> ${hooksFile}`;
 }
 
-// Remove only the workled hooks from ~/.workbuddy/settings.json, leaving every
-// other hook and setting untouched.
-function unregisterWorkledSettingsHooks() {
-  const settingsFile = join(h, ".workbuddy", "settings.json");
-  const settings = readJsonOrEmpty(settingsFile);
-  if (!settings || !settings.hooks) return `No workled hooks at ${settingsFile}`;
-  let removed = false;
-  for (const ev of Object.keys(settings.hooks)) {
-    const before = Array.isArray(settings.hooks[ev]) ? settings.hooks[ev].length : 0;
-    if (Array.isArray(settings.hooks[ev])) {
-      settings.hooks[ev] = settings.hooks[ev].filter(
-        (group) =>
-          !(
-            group &&
-            Array.isArray(group.hooks) &&
-            group.hooks.some(
-              (hk) =>
-                hk &&
-                typeof hk.command === "string" &&
-                hk.command.includes("workled") &&
-                hk.command.includes("hook --event")
-            )
-          )
-      );
-    }
-    if ((settings.hooks[ev] || []).length === 0) delete settings.hooks[ev];
-    if ((settings.hooks[ev] || []).length < before) removed = true;
+// Generic uninstaller that mirrors installWorkledHooks. `allowDeleteFile` lets
+// a dedicated hooks file (traecode) holding nothing but the schema `version` be
+// deleted entirely so uninstall leaves nothing behind; it is false for a
+// settings file (workbuddy) that may carry unrelated user settings.
+function uninstallWorkledHooks(hooksFile, { client, allowDeleteFile }) {
+  const cfg = readJsonOrEmpty(hooksFile);
+  if (!cfg || !cfg.hooks) return `No workled hooks at ${hooksFile}`;
+  const { config: stripped, changed } = stripClientHooks(cfg, client);
+  if (!changed) return `No workled hooks at ${hooksFile}`;
+  if (stripped.hooks && Object.keys(stripped.hooks).length === 0) delete stripped.hooks;
+  if (allowDeleteFile && Object.keys(stripped).filter((k) => k !== "version").length === 0) {
+    if (existsSync(hooksFile)) removePath(hooksFile);
+    removeEmptyParent(dirname(hooksFile));
+    return `Removed workled hooks -> ${hooksFile} (deleted empty config)`;
   }
-  if (!removed) return `No workled hooks at ${settingsFile}`;
-  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
-  writeConfig(settingsFile, settings);
-  return `Removed workled hooks -> ${settingsFile}`;
+  writeConfig(hooksFile, stripped);
+  return `Removed workled hooks -> ${hooksFile}`;
+}
+
+// Group the workled hook specs by event, preserving spec order within each
+// event. Grouping BEFORE filtering keeps multiple matchers under one event
+// (e.g. the two Notification specs) from dropping each other.
+function groupWorkledSpecs() {
+  const byEvent = new Map();
+  for (const spec of WORKLED_HOOK_SPECS) {
+    if (!byEvent.has(spec.event)) byEvent.set(spec.event, []);
+    byEvent.get(spec.event).push(spec);
+  }
+  return byEvent;
+}
+
+// Pure: detect a hook group that belongs to workled for a specific client,
+// matched safely on the client-scoped command (e.g. `--client traecode` or
+// `--client workbuddy`). This single predicate is shared by every client.
+function isClientWorkledGroup(group, client) {
+  const marker = `--client ${client}`;
+  return (
+    group &&
+    Array.isArray(group.hooks) &&
+    group.hooks.some(
+      (hk) =>
+        hk &&
+        typeof hk.command === "string" &&
+        hk.command.includes("workled") &&
+        hk.command.includes(marker)
+    )
+  );
+}
+
+// Pure (testable without touching disk): return a NEW hooks config with the
+// workled hook groups for `client` upserted. Any prior workled group for the
+// same client/event is replaced first, unrelated hooks are preserved. A schema
+// `version` is only injected when provided (traecode uses 1; workbuddy does not).
+export function mergeClientHooks(cfg, { client, commandForEvent, version }) {
+  const out = { ...(cfg || {}) };
+  if (typeof version === "number" && typeof out.version !== "number") out.version = version;
+  if (!out.hooks || typeof out.hooks !== "object") out.hooks = {};
+  for (const [ev, specs] of groupWorkledSpecs()) {
+    if (!Array.isArray(out.hooks[ev])) out.hooks[ev] = [];
+    out.hooks[ev] = out.hooks[ev].filter((group) => !isClientWorkledGroup(group, client));
+    for (const spec of specs) {
+      const group = {
+        hooks: [
+          {
+            type: "command",
+            command: commandForEvent(ev),
+            timeout: WORKLED_HOOK_TIMEOUT_MS / 1000,
+          },
+        ],
+      };
+      if (spec.matcher) group.matcher = spec.matcher;
+      out.hooks[ev].push(group);
+    }
+  }
+  return out;
+}
+
+// Pure: return a NEW hooks config with only the workled hook groups for
+// `client` removed, plus a `changed` flag. Unrelated hooks are preserved.
+export function stripClientHooks(cfg, client) {
+  const out = { ...(cfg || {}) };
+  if (!out.hooks || typeof out.hooks !== "object") return { config: out, changed: false };
+  const hooks = {};
+  let changed = false;
+  for (const ev of Object.keys(out.hooks)) {
+    if (!Array.isArray(out.hooks[ev])) {
+      hooks[ev] = out.hooks[ev];
+      continue;
+    }
+    const kept = out.hooks[ev].filter((group) => !isClientWorkledGroup(group, client));
+    if (kept.length !== out.hooks[ev].length) changed = true;
+    if (kept.length) hooks[ev] = kept;
+  }
+  out.hooks = hooks;
+  return { config: out, changed };
+}
+
+// --- Per-client install/uninstall (hook-driven clients) ---------------------
+// These aggregate every file/setting a single client needs, so the client
+// dispatch in install()/uninstall() reads as a plain per-client switch. The
+// generic installWorkledHooks/uninstallWorkledHooks below are the shared
+// implementation; only the target file, client marker and version differ.
+
+// WorkBuddy: MCP server + lifecycle hooks, both written automatically.
+async function installWorkbuddy(mcpEntry) {
+  const lines = [];
+  lines.push(...(await registerWorkledMcp("workbuddy", mcpEntry)));
+  lines.push(installWorkledHooks(join(h, ".workbuddy", "settings.json"), { client: "workbuddy", url: mcpEntry && mcpEntry.url }));
+  return lines;
+}
+
+async function uninstallWorkbuddy() {
+  const lines = [];
+  lines.push(...unregisterWorkledMcp("workbuddy"));
+  lines.push(uninstallWorkledHooks(join(h, ".workbuddy", "settings.json"), { client: "workbuddy" }));
+  return lines;
+}
+
+// TraeCode (VSCode fork) reads a GLOBAL MCP config at <user-data>/User/mcp.json
+// (the VSCode convention it inherits) for servers shared by every workspace, so
+// the workled MCP server is written there directly. Its lifecycle hooks go to
+// <home>/.trae-cn/hooks.json using the Claude Code-style schema (version 1 +
+// hooks.<Event>[]). Both are therefore wired automatically on install.
+function installTraecode(mcpEntry) {
+  return [
+    ...registerWorkledMcp("traecode", mcpEntry),
+    installWorkledHooks(join(traeCodeHooksHome(), "hooks.json"), { client: "traecode", version: 1, url: mcpEntry && mcpEntry.url }),
+  ];
+}
+
+function uninstallTraecode() {
+  return [
+    ...unregisterWorkledMcp("traecode"),
+    uninstallWorkledHooks(join(traeCodeHooksHome(), "hooks.json"), { client: "traecode", allowDeleteFile: true }),
+  ];
 }
 
 // Inverse of removeMcpServer: write the `workled` server entry into one MCP
@@ -1178,54 +1262,6 @@ function registerWorkledMcp(client, entry) {
 }
 
 // ---- per-client install/uninstall -------------------------------------------
-
-const HOOK_EVENTS = {
-  agy: ["PreInvocation", "PostInvocation", "PreToolUse", "PostToolUse", "Stop"],
-};
-
-// agy (Antigravity) hook name used as the top-level key in hooks.json.
-const AGY_HOOK_ID = "workled";
-
-// agy (Antigravity): hooks.json at ~/.gemini/config/hooks.json. The top-level
-// key is a hook id (AGY_HOOK_ID). Simple events (PreInvocation/PostInvocation/
-// Stop) are arrays of { type, command }; tool events (PreToolUse/PostToolUse)
-// are arrays of { matcher, hooks: [{ type, command }] }. agy does NOT send the
-// event name in stdin, so it is passed via --event.
-function agyCommandShape(ev) {
-  const cmd = hookCommand(ev);
-  if (ev === "PreToolUse" || ev === "PostToolUse") {
-    return { matcher: "*", hooks: [{ type: "command", command: cmd }] };
-  }
-  return { type: "command", command: cmd };
-}
-
-function installAgy() {
-  const hooksFile = join(h, ".gemini", "config", "hooks.json");
-  const json = readJsonOrEmpty(hooksFile) || {};
-  const root = json && typeof json === "object" ? json : {};
-  const entry = {};
-  for (const ev of HOOK_EVENTS.agy) {
-    entry[ev] = [agyCommandShape(ev)];
-  }
-  root[AGY_HOOK_ID] = entry;
-  writeConfig(hooksFile, root);
-  return `Installed agy hooks -> ${hooksFile}`;
-}
-
-function uninstallAgy() {
-  const hooksFile = join(h, ".gemini", "config", "hooks.json");
-  const json = readJsonOrEmpty(hooksFile);
-  if (!json || !json[AGY_HOOK_ID]) return `No agy workled hooks at ${hooksFile}`;
-  delete json[AGY_HOOK_ID];
-  if (Object.keys(json).length === 0) {
-    removePath(hooksFile);
-    removeEmptyParent(dirname(hooksFile));
-    return `Removed empty agy hooks.json -> ${hooksFile}`;
-  }
-  writeConfig(hooksFile, json);
-  return `Removed agy workled hooks -> ${hooksFile}`;
-}
-
 // openclaw: the Gateway loads standalone plugin files listed in
 // ~/.openclaw/openclaw.json `plugins.load.paths`. Each plugin needs a sibling
 // `openclaw.plugin.json` manifest (id + configSchema, validated cold), and the
@@ -2031,13 +2067,6 @@ async function main() {
         else lines.push(...unregisterWorkledMcp("openclaw"));
         break;
       }
-      case "agy": {
-        lines.push(isInstall ? installAgy() : uninstallAgy());
-        lines.push(isInstall ? appendReminder(join(h, ".gemini", "AGENTS.md")) : removeReminder(join(h, ".gemini", "AGENTS.md")));
-        if (isInstall) lines.push(...(await registerWorkledMcp("agy", mcpEntry)));
-        else lines.push(...unregisterWorkledMcp("agy"));
-        break;
-      }
       case "hermes": {
         const hh = hermesHome();
         lines.push(isInstall ? installHermes() : uninstallHermes());
@@ -2056,27 +2085,29 @@ async function main() {
         break;
       }
       case "workbuddy": {
-        // WorkBuddy is a pure-MCP client with no per-client hook layer, so the
-        // state protocol is enforced by user-level hooks in settings.json
-        // (installed below) rather than by agent discipline. Install registers
-        // both the MCP server entry and the lifecycle hooks; uninstall removes
-        // both.
-        if (isInstall) {
-          lines.push(...(await registerWorkledMcp("workbuddy", mcpEntry)));
-          lines.push(registerWorkledSettingsHooks());
-        } else {
-          lines.push(...unregisterWorkledMcp("workbuddy"));
-          lines.push(unregisterWorkledSettingsHooks());
-        }
+        // WorkBuddy is a pure-MCP client whose state protocol is enforced by
+        // user-level lifecycle hooks (settings.json) rather than by agent
+        // discipline; install wires MCP + hooks, uninstall removes both.
+        lines.push(...(isInstall ? await installWorkbuddy(mcpEntry) : await uninstallWorkbuddy()));
         break;
       }
-      case "trae": {
-        // Trae (Cursor-compatible): pure MCP config with mcpServers key.
-        // No hook layer because the MCP server is called directly by the agent via MCP tools.
+      case "traecode": {
+        // TraeCode (VSCode fork) reads a GLOBAL MCP config at
+        // <user-data>/User/mcp.json (shared by every workspace) plus lifecycle
+        // hooks at <home>/.trae-cn/hooks.json — both are wired automatically.
+        // MCP is picked up after a reload; if the URL is the <device-name>
+        // placeholder the user must still replace it in Settings → MCP, and the
+        // Hooks config needs manual enabling in Settings > Hooks to fire.
         if (isInstall) {
-          lines.push(...(await registerWorkledMcp("trae", mcpEntry)));
+          lines.push(...installTraecode(mcpEntry));
+          lines.push(
+            "TraeCode: MCP written to <user-data>/User/mcp.json (reload to pick it up). Replace <device-name> in Settings → MCP if a placeholder was written, and enable the workled hooks in Settings → Hooks for agent-state tracking."
+          );
         } else {
-          lines.push(...unregisterWorkledMcp("trae"));
+          lines.push(...uninstallTraecode());
+          lines.push(
+            "TraeCode: workled MCP entry and hooks removed; the server you added via Settings → MCP (if any) stays as you configured it."
+          );
         }
         break;
       }

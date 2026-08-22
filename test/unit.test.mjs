@@ -7,11 +7,13 @@ import {
   isInputTool,
   resolveMergedUrl,
   resolveMcpType,
+  traecodeReminderText,
   shouldDedupState,
   drainFlushPromisesForState,
   CLIENTS,
   CLIENT_TARGETS,
 } from "../index.js";
+import { mergeClientHooks, stripClientHooks, workledHookCommand } from "../skill-install.mjs";
 
 const PLACEHOLDER = "http://<device-name>.local:18791/mcp";
 const REAL = "http://HomeAnt-A919.local:18791/mcp";
@@ -20,7 +22,7 @@ test("getInputTools covers common interactive-tool naming patterns", () => {
   // Coverage for AskUserQuestion / AskUserConfirm / choose_option /
   // select_choice / prompt_input / permission_approval and friends.
   assert.deepEqual(getInputTools(), [
-    "question", "confirm", "ask", "choose", "select", "prompt", "input", "approval",
+    "question", "confirm", "ask", "choose", "select", "prompt", "input", "approval", "questionnaire",
   ]);
 });
 
@@ -59,6 +61,37 @@ test("resolveMcpType writes the source default for a fresh entry", () => {
   // No existing type and no default -> null (field omitted entirely).
   assert.equal(resolveMcpType(undefined, undefined), null);
   assert.equal(resolveMcpType(null, ""), null);
+});
+
+test("traecodeReminderText fires for a --client traecode / unfiltered scan", () => {
+  // Explicit traecode filter -> reminder present.
+  const note = traecodeReminderText({ clientPrefix: "traecode" });
+  assert.equal(typeof note, "string");
+  assert.ok(note.includes("Settings → Hooks"));
+  assert.ok(note.includes("device-name"));
+  // Unfiltered scan (no clientPrefix) treats traecode as in scope too.
+  assert.ok(traecodeReminderText({}).includes("Settings"));
+});
+
+test("traecodeReminderText fires when a traecode entry is in the scan results", () => {
+  const note = traecodeReminderText({
+    clientPrefix: "traecode",
+    clients: [{ client: "traecode", reachable: true }],
+  });
+  assert.ok(note.includes("Settings → Hooks"));
+});
+
+test("traecodeReminderText stays quiet for non-traecode-only scans", () => {
+  // A non-traecode --client filter (and no traecode entry) gets no reminder.
+  assert.equal(traecodeReminderText({ clientPrefix: "opencode" }), "");
+  assert.equal(
+    traecodeReminderText({ clientPrefix: "opencode", clients: [{ client: "env" }] }),
+    ""
+  );
+});
+
+test("traecodeReminderText matches traecode worktrees by prefix", () => {
+  assert.ok(traecodeReminderText({ clientPrefix: "traecode" }).includes("Settings"));
 });
 
 test("CLIENT_TARGETS covers every client (with default fallback)", () => {
@@ -181,4 +214,183 @@ test("drainFlushPromisesForState settles a state=null (drain) waiter on any stat
   drainFlushPromisesForState(list2, null, { state: null, sent: true });
   assert.equal(list2.length, 0);
   assert.ok(settled.has("drainWaiter2"));
+});
+
+// --- Client-parameterised hook core (traecode) ------------------------------
+//
+// TraeCode's global Hooks live in <home>/.trae-cn/hooks.json using the Claude
+// Code-style schema (version 1 + hooks.<Event>[]). The generic mergeClientHooks
+// drives traecode exactly as installTraecode() does; stripClientHooks removes
+// only the traecode-scoped workled groups. Both are pure and disk-free.
+
+// Every event in WORKLED_HOOK_SPECS should be present after a fresh merge.
+const SPEC_EVENTS = ["UserPromptSubmit", "Stop", "Notification", "PostToolUse"];
+const cmdFor = (e) => `node workled hook --event ${e} --client traecode`;
+const mergeTraecode = (cfg) => mergeClientHooks(cfg, { client: "traecode", commandForEvent: cmdFor, version: 1 });
+const stripTraecode = (cfg) => stripClientHooks(cfg, "traecode");
+
+test("workledHookCommand is shell-portable (no absolute node, no `&`)", () => {
+  // One command string must parse under both bash (workbuddy/Claude Code) and
+  // PowerShell (TraeCode). A spaced "quoted absolute path" first token would be
+  // a parse error in PowerShell (needs `&`) while `&` is a background operator
+  // in bash — so we must start with a bare `node`, never the absolute binary.
+  const cmd = workledHookCommand("Notification", "traecode");
+  assert.ok(cmd.startsWith("node "), `hook command must start with bare node, got: ${cmd}`);
+  assert.ok(!cmd.includes("Program Files"), "must not embed the spaced absolute node path");
+  assert.ok(!cmd.includes("& "), "must not use the PowerShell-only `&` call operator");
+  assert.ok(cmd.includes("--event Notification"));
+  assert.ok(cmd.includes("--client traecode"));
+});
+
+test("workledHookCommand never inlines the MCP URL (config discovery at runtime)", () => {
+  // The hook discovers the device URL from its own configuration (mcp.json /
+  // WORKLED_MCP_URL) at runtime, so --url must never be baked into the command.
+  // Keeping the command URL-free also avoids any shell/sandbox mangling of a
+  // raw or base64-encoded URL argument.
+  const real = "http://HomeAnt-2831.local:18791/mcp";
+  assert.ok(!workledHookCommand("Stop", "traecode", real).includes("--url"), "real URL must not be inlined");
+  assert.ok(!workledHookCommand("Stop", "traecode", real).includes("b64:"), "no base64 encoding");
+  assert.ok(!workledHookCommand("Stop", "traecode", "http://<device-name>.local:18791/mcp").includes("--url"), "placeholder must not be inlined");
+  assert.ok(!workledHookCommand("Stop", "traecode").includes("--url"), "bare command stays bare");
+});
+
+test("mergeClientHooks('traecode') builds a valid bare hooks config from nothing", () => {
+  const merged = mergeTraecode(undefined);
+  assert.equal(merged.version, 1);
+  assert.ok(merged.hooks, "hooks map required");
+  for (const ev of SPEC_EVENTS) {
+    assert.ok(Array.isArray(merged.hooks[ev]), `event ${ev} must be an array`);
+    assert.ok(merged.hooks[ev].length >= 1, `event ${ev} must have at least one group`);
+  }
+  // Notification carries two matchers (permission_prompt + idle_prompt); every
+  // group must route through the traecode client command.
+  for (const ev of SPEC_EVENTS) {
+    for (const group of merged.hooks[ev]) {
+      assert.ok(group.hooks[0].type === "command");
+      assert.ok(group.hooks[0].command.includes("--client traecode"));
+      assert.equal(typeof group.hooks[0].timeout, "number");
+    }
+  }
+});
+
+test("mergeClientHooks('traecode') preserves unrelated hooks and version", () => {
+  const base = {
+    version: 3,
+    hooks: {
+      Stop: [{ hooks: [{ type: "command", command: "echo user-hook", timeout: 5 }] }],
+    },
+  };
+  const merged = mergeTraecode(base);
+  assert.equal(merged.version, 3, "existing version kept");
+  assert.deepEqual(merged.hooks.Stop[0], base.hooks.Stop[0], "unrelated Stop group preserved");
+  // The workled group is appended after the unrelated one.
+  assert.ok(merged.hooks.Stop.some((g) => g.hooks[0].command.includes("--client traecode")));
+});
+
+test("mergeClientHooks('traecode') is idempotent: re-merging replaces, not duplicates", () => {
+  const once = mergeTraecode(undefined);
+  const twice = mergeTraecode(once);
+  for (const ev of SPEC_EVENTS) {
+    assert.equal(twice.hooks[ev].length, once.hooks[ev].length, `${ev} must not grow`);
+    // Every workled group is traced to our command; no double writes.
+    assert.equal(
+      twice.hooks[ev].filter((g) => g.hooks[0].command.includes("--client traecode")).length,
+      once.hooks[ev].filter((g) => g.hooks[0].command.includes("--client traecode")).length
+    );
+  }
+});
+
+test("mergeClientHooks('traecode') embeds matchers for the Notification events", () => {
+  const merged = mergeTraecode(undefined);
+  const matchers = merged.hooks.Notification.map((g) => g.matcher);
+  assert.ok(matchers.includes("permission_prompt"));
+  assert.ok(matchers.includes("idle_prompt"));
+  // PostToolUse is restricted to AskUserQuestion so the hook does not spawn a
+  // process on every tool call.
+  const post = merged.hooks.PostToolUse.map((g) => g.matcher);
+  assert.ok(post.includes("AskUserQuestion"));
+});
+
+test("stripClientHooks('traecode') removes all traecode workled groups and reports changed", () => {
+  const merged = mergeTraecode(undefined);
+  const { config, changed } = stripTraecode(merged);
+  assert.equal(changed, true);
+  for (const ev of SPEC_EVENTS) {
+    assert.ok(!config.hooks[ev], `${ev} fully stripped`);
+  }
+  // The pure helper empties the hooks map; deleting the now-empty `hooks` key
+  // is left to the caller (uninstallTraecode), so it stays an empty object.
+  assert.deepEqual(config.hooks, {});
+});
+
+test("stripClientHooks('traecode') is a no-op when there are no traecode workled groups", () => {
+  const cfg = { version: 1, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo x" }] }] } };
+  const { config, changed } = stripTraecode(cfg);
+  assert.equal(changed, false);
+  assert.deepEqual(config, cfg);
+});
+
+test("stripClientHooks('traecode') keeps unrelated hooks while dropping only traecode groups", () => {
+  const cfg = {
+    version: 1,
+    hooks: {
+      Stop: [
+        { hooks: [{ type: "command", command: "echo keep-me" }] },
+        { hooks: [{ type: "command", command: cmdFor("Stop") }] },
+      ],
+      UserPromptSubmit: [{ hooks: [{ type: "command", command: cmdFor("UserPromptSubmit") }] }],
+    },
+  };
+  const { config, changed } = stripTraecode(cfg);
+  assert.equal(changed, true);
+  assert.deepEqual(config.hooks.Stop, [{ hooks: [{ type: "command", command: "echo keep-me" }] }]);
+  assert.ok(!config.hooks.UserPromptSubmit, "UserPromptSubmit fully stripped");
+});
+
+// The shared client-parameterised core (mergeClientHooks / stripClientHooks)
+// backs BOTH workbuddy and traecode, differing only in the `client` marker. These
+// tests lock in that behaviour: isolation between clients, no version leakage
+// for workbuddy, and a clean round-trip.
+const wbCmdFor = (e) => `node workled hook --event ${e} --client workbuddy`;
+
+test("mergeClientHooks('workbuddy') builds hooks without injecting a schema version", () => {
+  const merged = mergeClientHooks({ note: "keep" }, { client: "workbuddy", commandForEvent: wbCmdFor });
+  assert.equal(merged.note, "keep", "unrelated settings preserved");
+  assert.deepEqual(merged.version, undefined, "version not injected for workbuddy");
+  assert.ok(merged.hooks.UserPromptSubmit[0].hooks[0].command.includes("--client workbuddy"));
+});
+
+test("stripClientHooks is client-isolated: one client's strip leaves the other intact", () => {
+  // Build a config carrying both a workbuddy and a traecode workled group.
+  const wb = mergeClientHooks({}, { client: "workbuddy", commandForEvent: wbCmdFor });
+  const both = mergeClientHooks(wb, { client: "traecode", commandForEvent: cmdFor, version: 1 });
+
+  // Strip only workbuddy -> traecode groups survive.
+  const noWb = stripClientHooks(both, "workbuddy");
+  assert.equal(noWb.changed, true);
+  assert.ok(noWb.config.hooks.UserPromptSubmit.length, "traecode groups kept");
+  assert.ok(
+    noWb.config.hooks.UserPromptSubmit.every((g) => g.hooks[0].command.includes("--client traecode")),
+    "only traecode groups remain"
+  );
+  assert.ok(!noWb.config.hooks.UserPromptSubmit.some((g) => g.hooks[0].command.includes("--client workbuddy")));
+
+  // Strip only traecode -> workbuddy groups survive.
+  const noTrae = stripClientHooks(both, "traecode");
+  assert.equal(noTrae.changed, true);
+  assert.ok(noTrae.config.hooks.UserPromptSubmit.length, "workbuddy groups kept");
+  assert.ok(
+    noTrae.config.hooks.UserPromptSubmit.every((g) => g.hooks[0].command.includes("--client workbuddy")),
+    "only workbuddy groups remain"
+  );
+});
+
+test("mergeClientHooks('workbuddy') is idempotent and round-trips clean", () => {
+  const once = mergeClientHooks({}, { client: "workbuddy", commandForEvent: wbCmdFor });
+  const twice = mergeClientHooks(once, { client: "workbuddy", commandForEvent: wbCmdFor });
+  assert.equal(twice.hooks.Notification.length, once.hooks.Notification.length);
+  const { config, changed } = stripClientHooks(twice, "workbuddy");
+  assert.equal(changed, true);
+  assert.deepEqual(config.hooks, {});
+  assert.deepEqual(config.version, undefined);
 });

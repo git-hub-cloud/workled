@@ -8,7 +8,7 @@
 //   openclawEntry   - openclaw adapter (register(api) hooks api.on events)
 //   piEntry         - pi adapter (register(pi) hooks pi.on events)
 //
-// CLI hook mode for agy/hermes (short-lived, stdin JSON):
+// CLI hook mode for hermes (short-lived, stdin JSON):
 //   node index.js hook [--event <name>]
 // Reads the hook payload from stdin, maps the event to a state, sends it over
 // MCP (awaiting completion so the process stays alive), and prints `{}`.
@@ -23,7 +23,7 @@ import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome, sleep, dshHome, traeHome } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeCodeUserDir } from "./utils.js";
 
 const HOME = homedir();
 const execFileAsync = promisify(execFile);
@@ -44,7 +44,7 @@ try {
 // servers in. Used by loadMcpServers() here and by the uninstall cleanup in
 // skill-install.mjs, so the client list and config paths cannot drift.
 //
-//   client  - "<name>" identifier (e.g., "opencode", "kilo", "agy")
+//   client  - "<name>" identifier (e.g., "opencode", "kilo")
 //   key     - top-level key that holds the server map (mcp / mcpServers); the
 //             hermes YAML reader resolves "mcp_servers" internally
 //   format  - json (JSONC tolerated via stripJsonc) | yaml
@@ -53,16 +53,13 @@ try {
 //   type    - default `type` written for a fresh workled MCP entry; only set
 //             for clients that require an explicit transport declaration
 //             (opencode/kilo/workbuddy use "remote"). Clients that infer the
-//             transport from `url` (gemini/agy, openclaw, pi, hermes) omit it.
+//             transport from `url` (openclaw, pi, hermes) omit it.
 export const MCP_SOURCES = [
   // opencode
   { client: "opencode", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.json") },
   { client: "opencode", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.jsonc") },
   // kilo (opencode fork)
   { client: "kilo", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "kilo", "kilo.jsonc") },
-  // agy / gemini
-  { client: "agy", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "config", "mcp.json") },
-  { client: "agy", key: "mcpServers", format: "json", path: () => join(HOME, ".gemini", "antigravity-cli", "mcp.json") },
   // openclaw
   { client: "openclaw", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
   // pi
@@ -79,9 +76,11 @@ export const MCP_SOURCES = [
   // enabled}). format: "dsh-patch" triggers the dedicated parser in loadMcpServers
   // that extracts config.url + enabled.
   { client: "dsh", key: "mcp", format: "dsh-patch", path: () => join(dshHome(), "profiles", "web", "cordis.patch.yml") },
-  // trae (Trae IDE, NOT Cursor): Trae is a VSCode fork.
-  // mcpServers key, HTTP remote — type omitted (Trae infers transport from url).
-  { client: "trae", key: "mcpServers", format: "json", path: () => join(traeHome(), "User", "globalStorage", "mcp.json") },
+  // traecode (VSCode fork): global MCP config at <user-data>/User/mcp.json
+  // (the VSCode convention TraeCode inherits). HTTP-type workled server is
+  // declared bare `{ url, enabled }` — no `type` field. The lifecycle hooks
+  // live separately in ~/.trae-cn/hooks.json (see skill-install.mjs).
+  { client: "traecode", key: "mcpServers", format: "json", path: () => join(traeCodeUserDir(), "User", "mcp.json") },
 ];
 
 // Every client the skill installs to. `status` accepts an optional
@@ -114,9 +113,6 @@ export const CLIENT_TARGETS = {
   openclaw: {
     help: "entry  -> ~/.openclaw/plugins/workled/ + openclaw.plugin.json + openclaw.json (load.paths + entries) + reminder in AGENTS.md",
   },
-  agy: {
-    help: "hooks  -> ~/.gemini/config/hooks.json            + reminder in AGENTS.md",
-  },
   hermes: {
     help: "hooks  -> <hermes-home>/config.yaml (~/.hermes on unix, %LOCALAPPDATA%\\hermes on Windows) + reminder in AGENTS.md",
   },
@@ -131,8 +127,8 @@ export const CLIENT_TARGETS = {
   dsh: {
     help: "plugin -> <dsh-home>/profiles/web/node_modules/workled (bundle) + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP) + reminder in AGENTS.md",
   },
-  trae: {
-    help: "mcp    -> <trae-home>/User/globalStorage/mcp.json (mcpServers.workled)",
+  traecode: {
+    help: "mcp    -> <user-data>/User/mcp.json (global mcpServers.workled) + hooks -> ~/.trae-cn/hooks.json",
   },
   default: {
     help: "installed (targets: see SKILL.md)",
@@ -192,6 +188,24 @@ export function resolveMcpType(existingType, defaultType) {
   return null;
 }
 
+// Pure decision for the status hint. The traecode install writes the workled
+// server into the GLOBAL MCP config (<user-data>/User/mcp.json), so MCP needs
+// only a reload — unless the URL is the <device-name> placeholder, which the
+// user must still replace. The lifecycle hooks are written to
+// <home>/.trae-cn/hooks.json but must also be enabled manually in
+// Settings → Hooks to fire. Returns the reminder text when the traecode client
+// is in scope (the user filtered to it, or a traecode entry is present),
+// otherwise "". Accepts an optional list of scanned client entries so a
+// traecode entry can also trigger the reminder.
+export function traecodeReminderText({ clientPrefix = null, clients = [] } = {}) {
+  const traecodeFilter = !clientPrefix || String(clientPrefix).startsWith("traecode");
+  const hasTraecodeEntry =
+    Array.isArray(clients) &&
+    clients.some((c) => c && c.client && String(c.client).startsWith("traecode"));
+  if (!(traecodeFilter || hasTraecodeEntry)) return "";
+  return "traecode: verify the device-name in Settings → MCP (reload to pick up the config) and enable the workled hooks in Settings → Hooks for agent-state tracking.";
+}
+
 function sleepWithJitter(baseMs, attempt) {
   // Exponential backoff with jitter: base * 2^attempt * (0.5 ~ 1.5)
   const expDelay = baseMs * Math.pow(2, attempt);
@@ -220,11 +234,6 @@ async function execWithRetry(cmd, args, opts, maxAttempts = 2) {
 let workledUrl = null;
 let workledUrlExpiry = 0;
 let hookClientPrefix = null;
-// Optional URL forced from the hook CLI (--url). dsh installs write the URL
-// inline into its workled-hooks.json commands because dsh's MCP config lives in
-// a cordis.patch.yml plugin row that discovery cannot parse. When set, it wins
-// over every other discovery source for this process.
-let forcedMcpUrl = null;
 const seenUserMessages = new Set();
 let seenMessagesCleanedAt = Date.now();
 const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -765,7 +774,6 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
 }
 
 async function discoverWorkledUrl(clientPrefix) {
-  if (forcedMcpUrl) return forcedMcpUrl;
   const now = Date.now();
 
   // Single shared cache for the resolved URL. On a cache miss we make the
@@ -1254,9 +1262,9 @@ export const piEntry = {
 // We wrap the openclawEntry adapter so the gateway can load the plugin directly.
 export default { register: openclawEntry.register, activate: openclawEntry.register };
 
-// ---- CLI hook mode (agy / hermes) -------------------------------------------
+// ---- CLI hook mode (hermes) -------------------------------------------
 
-// Event name -> state, unified across every hook-based client (agy, hermes).
+// Event name -> state, unified across every hook-based client (hermes).
 // Event names are unique per client so no conflicts arise; the same mapping
 // serves all of them.
 //
@@ -1281,7 +1289,7 @@ const HOOK_MAP = {
   //   idle_prompt       -> idle   (session idle >60s, fallback for Stop)
   //   auth_success/...  -> no-op
   Notification: "notification",
-  // agy / gemini (camelCase)
+  // hermes (camelCase)
   Stop: "idle",
   PreInvocation: "thinking",
   PostInvocation: "thinking",
@@ -1374,14 +1382,8 @@ async function runHookMode() {
     const clientIdx = argv.indexOf("--client");
     const clientArg = clientIdx >= 0 ? argv[clientIdx + 1] : null;
     if (clientArg) hookClientPrefix = clientArg;
-    // --url: explicit MCP endpoint for clients whose config discovery cannot
-    // parse the MCP wiring (dsh mounts @deepseek-ai/dsh-mcp-client in a
-    // cordis.patch.yml plugin row). Wins over every other source.
-    const urlIdx = argv.indexOf("--url");
-    const urlArg = urlIdx >= 0 ? argv[urlIdx + 1] : null;
-    if (urlArg) forcedMcpUrl = urlArg;
 
-    // Read the hook JSON payload from stdin (agy may pass the event name via
+    // Read the hook JSON payload from stdin (hermes may pass the event name via
     // --event instead). Never block on stdin: if the host never closes it
     // (e.g. a hook event with no payload), proceed after a short grace period
     // so this short-lived process always exits and never stalls the host's
@@ -1574,11 +1576,20 @@ async function runStatusMode() {
   }
   const dshDiag = dshDiagnosis();
 
+  // The traecode install writes global MCP to <user-data>/User/mcp.json;
+  // surface the reload/enable reminder (via the pure helper) whenever the
+  // traecode client is in scope.
+  const appendTraecodeNote = () => {
+    const note = traecodeReminderText({ clientPrefix, clients: out.clients });
+    if (note) out.hint = out.hint ? `${out.hint} ${note}` : note;
+  };
+
   if (entries.length === 0) {
     out.hint = clientPrefix
       ? `No \`workled\` server configured for client "${clientPrefix}". Add it under \`mcp\` in that client's config or set WORKLED_MCP_URL.`
       : "No `workled` server configured. Add it under `mcp` in your agent config or set WORKLED_MCP_URL.";
     if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
+    appendTraeNote();
     out.duration_ms = Date.now() - startedAt;
     log(`done in ${out.duration_ms}ms (no workled server configured)`);
     console.log(JSON.stringify(out, null, 2));
@@ -1675,6 +1686,12 @@ async function runStatusMode() {
     if (dshDiag) out.hint += ` For dsh: ${dshDiag}.`;
   }
 
+  // Surface the reload/enable reminder whenever the traecode client is in scope
+  // (no-op otherwise). The helper decides internally from the --client filter
+  // and the scanned entries, and appends on top of whatever reachable/disabled/
+  // unreachable hint was chosen above.
+  appendTraecodeNote();
+
   out.duration_ms = Date.now() - startedAt;
   log(`done in ${out.duration_ms}ms (ok=${out.ok})`);
   console.log(JSON.stringify(out, null, 2));
@@ -1682,7 +1699,16 @@ async function runStatusMode() {
 }
 
 if (process.argv[1]) {
-  const isMain = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+  const selfPath = fileURLToPath(import.meta.url);
+  // The installed (global) copy is invoked via a different absolute path than
+  // the source/workspace copy (e.g. C:\Users\<u>\.agents\skills\workled vs the
+  // workspace .agents\skills\workled), so a strict full-path comparison wrongly
+  // yields isMain=no and silently skips the hook/status dispatch. Fall back to
+  // the resolved basename so the entry file boots regardless of install path.
+  const isMain =
+    (process.argv[1] && resolve(process.argv[1]) === resolve(selfPath)) ||
+    (process.argv[1] && resolve(process.argv[1]).toLowerCase().replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ===
+      resolve(selfPath).toLowerCase().replace(/\\/g, "/").split("/").filter(Boolean).at(-1));
   if (isMain) {
     const sub = process.argv[2];
     if (sub === "hook") {

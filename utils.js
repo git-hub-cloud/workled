@@ -2,7 +2,6 @@
 
 import { homedir } from "os";
 import { join, dirname, sep } from "path";
-import { existsSync } from "fs";
 
 // Shared async delay, used by index.js (retry/discovery backoff) and
 // skill-install.mjs (openclaw config-stabilisation polling).
@@ -33,34 +32,29 @@ export function dshHome() {
   return join(homedir(), ".dsh");
 }
 
-// Resolve the Trae IDE user-data directory (NOT ~/.cursor — that is Cursor's
-// path, a different product). Trae is a VSCode fork; its global MCP config
-// lives at <trae-home>/User/globalStorage/mcp.json. $TRAE_HOME env wins;
-// otherwise the per-platform user-data dir is used. On Windows the Chinese
-// edition ships as "Trae CN" alongside the international "Trae", so the first
-// existing directory wins (Trae CN preferred when both are present).
-export function traeHome() {
-  const env = process.env.TRAE_HOME;
-  if (env && env.trim()) return env.trim();
-  const dirs = traeCandidateHomes();
-  for (const d of dirs) {
-    if (existsSync(d)) return d;
-  }
-  return dirs[0]; // fall back to the international-edition path
+// Resolve TraeCode's global Hooks config directory. TraeCode is a VSCode fork;
+// its global Hooks (Settings > Hooks) live in a `.trae-cn` folder under the
+// user's home directory — distinct from the per-edition user-data dir
+// (%APPDATA%\Trae CN etc.). Windows uses %userprofile%/.trae-cn/hooks.json;
+// macOS/Linux use ~/.trae-cn/hooks.json.
+export function traeCodeHooksHome() {
+  return join(homedir(), ".trae-cn");
 }
 
-// Per-platform candidate Trae user-data directories (Trae CN first on Windows
-// because the Chinese edition is the common install there).
-function traeCandidateHomes() {
+// Resolve TraeCode's per-user data dir, where its GLOBAL MCP config lives at
+// <dir>/User/mcp.json (the VSCode convention TraeCode inherits). Tools in that
+// file are shared by every workspace, mirroring a Settings > MCP "global"
+// entry. Windows uses %APPDATA%\Trae CN; macOS/Linux use the platform config
+// dir. Note: TraeCode HTTP-type MCP servers are declared bare `{ url,
+// enabled }` here — no `type` field.
+export function traeCodeUserDir() {
   if (process.platform === "win32") {
-    const appdata = process.env.APPDATA;
-    const base = appdata && appdata.trim() ? appdata.trim() : join(homedir(), "AppData", "Roaming");
-    return [join(base, "Trae CN"), join(base, "Trae")];
+    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Trae CN");
   }
   if (process.platform === "darwin") {
-    return [join(homedir(), "Library", "Application Support", "Trae")];
+    return join(homedir(), "Library", "Application Support", "Trae");
   }
-  return [join(homedir(), ".config", "Trae")];
+  return join(homedir(), ".config", "trae");
 }
 
 /**
