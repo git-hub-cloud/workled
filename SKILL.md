@@ -75,6 +75,9 @@ deployment steps: [device_setup.md](references/device_setup.md)
 If the device is not responding, run `node <skill-dir>/index.js status`
 and follow the JSON `hint` it prints.
 
+## Video Demo
+https://www.bilibili.com/video/BV1FK4k6WEKe
+
 ## Contributing
 
 - Repository: https://github.com/git-hub-cloud/workled
