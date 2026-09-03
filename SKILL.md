@@ -1,6 +1,11 @@
 ---
 name: workled
-description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, waiting, error). Use when connected to a workled device via MCP, controlling the agents state indicator, or configuring HID macros."
+description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, waiting, error). Use when connected to a workled device, controlling the agent state indicator, or configuring touch macros."
+description_zh: "通过 MCP 控制 workled 指示灯与触控宏，在每次智能体状态切换（思考/等待/空闲/错误）时同步灯效"
+description_en: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, waiting, error). Use when connected to a workled device, controlling the agent state indicator, or configuring touch macros."
+version: "0.1.16"
+display_name: "workled"
+display_name_en: "workled"
 ---
 
 # workled MCP Controller
@@ -16,18 +21,6 @@ varies by host — look for the server whose tools include *set_agent_state* in 
 | `waiting` | **Call BEFORE asking the user for input** — before invoking an input tool (`AskUserQuestion`/`question`/`ask`/`confirm`), before opening a client-side modal, and before rendering a plain-text choice list / multi-option question. |
 | `idle` | Turn finished; session torn down |
 | `error` | Runtime error / failed tool call occurred |
-
-**Per-turn procedure (execute every turn, in order):**
-
-1. Turn starting / user message received → `set_agent_state("thinking")` — **first action, before any other tool call**.
-2. Before rendering options / choices / opening any modal / asking a question → `set_agent_state("waiting")` — **BEFORE** the input tool call, not after the user answers. When the user answers/confirms → `set_agent_state("thinking")`.
-3. End of turn, work done, no more output pending → `set_agent_state("idle")`.
-4. Runtime error / failed tool call → `set_agent_state("error")`.
-
-**Pre-Reply Gate — check BEFORE emitting your final visible message:**
-- [ ] Did I call `set_agent_state` at least once this turn?
-- [ ] Does the LED state match what I'm about to show (idle if done, waiting if asking, thinking if still working)?
-- If either is **NO**, emit the correct `set_agent_state` call **first**, then the reply.
 
 ## MCP Tool Reference
 
@@ -63,19 +56,18 @@ Use `type:"solid"` unless the user asks for an animation. Map a color name to HS
 
 Rule of thumb: hue 0-359 picks the hue, saturation 0-255 (0 = white/pastel, 255 = vivid), value 0-255 brightness. Pastel/white tones use low saturation; vivid tones use 255.
 
-## Macro Format
-
-Full macro reference [macro_format.md](references/macro_format.md)
-
-## Setup & Troubleshooting
-
-Supported clients, install/uninstall commands, per-client event mapping, and full device
-deployment steps: [device_setup.md](references/device_setup.md)
+## Troubleshooting
 
 If the device is not responding, run `node <skill-dir>/index.js status`
 and follow the JSON `hint` it prints.
 
+## Reference
+
+- Macro format reference [macro_format.md](references/macro_format.md)
+- Device setup reference [device_setup.md](references/device_setup.md)
+
 ## Video Demo
+
 https://www.bilibili.com/video/BV1FK4k6WEKe
 
 ## Contributing

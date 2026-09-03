@@ -14,6 +14,7 @@ import {
   splitTopLevelBlock,
   installHermesHooks,
   uninstallHermesHooks,
+  ensureHermesAutoAccept,
 } from "../skill-install.mjs";
 
 const ENTRY = { url: "http://HomeAnt-A919.local:18791/mcp", enabled: true, type: "remote" };
@@ -363,4 +364,51 @@ hooks:
   // content (pre_tool_call has echo hello, post_llm_call has ls).
   assert.ok(cleaned.includes("pre_tool_call:"));
   assert.ok(cleaned.includes("post_llm_call:"));
+});
+
+// --- hermes hooks_auto_accept + post_tool_call coverage ---------------
+
+test("installHermesHooks now includes post_tool_call alongside pre_tool_call", () => {
+  const out = installHermesHooks("");
+  assert.ok(out.includes("post_tool_call:"), "post_tool_call event registered");
+  assert.ok(out.includes("pre_tool_call:"), "pre_tool_call event registered");
+  // Every installed event must carry a workled hook --event command.
+  assert.ok(out.includes("hook --event post_tool_call"));
+});
+
+test("ensureHermesAutoAccept inserts hooks_auto_accept before the hooks block", () => {
+  const withHooks = `model: "gpt"
+hooks:
+  pre_tool_call:
+    - command: "x"
+`;
+  const out = ensureHermesAutoAccept(withHooks);
+  const lines = out.split("\n");
+  const autoIdx = lines.findIndex((l) => l.startsWith("hooks_auto_accept:"));
+  const hooksIdx = lines.findIndex((l) => l.startsWith("hooks:"));
+  assert.ok(autoIdx >= 0, "hooks_auto_accept added");
+  assert.equal(lines[autoIdx], "hooks_auto_accept: true");
+  assert.ok(autoIdx < hooksIdx, "hooks_auto_accept placed before hooks");
+});
+
+test("ensureHermesAutoAccept replaces an existing false value in place", () => {
+  const out = ensureHermesAutoAccept("hooks_auto_accept: false\nhooks:\n  a:\n    - command: x\n");
+  assert.ok(out.includes("hooks_auto_accept: true"));
+  assert.equal(out.includes("false"), false, "false value overwritten to true");
+});
+
+test("ensureHermesAutoAccept appends when there is no hooks block", () => {
+  const bare = "model: gpt\n";
+  const out = ensureHermesAutoAccept(bare);
+  assert.ok(out.endsWith("hooks_auto_accept: true"));
+});
+
+test("ensureHermesAutoAccept is idempotent", () => {
+  const once = ensureHermesAutoAccept("hooks:\n  a:\n    - command: x\n");
+  const twice = ensureHermesAutoAccept(once);
+  assert.equal(
+    twice.split("\n").filter((l) => l.startsWith("hooks_auto_accept:")).length,
+    1,
+    "no duplicate hooks_auto_accept"
+  );
 });

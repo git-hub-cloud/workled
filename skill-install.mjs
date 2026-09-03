@@ -3,7 +3,7 @@
 // Usage client targets: run `node skill-install.mjs --help`.
 
 import { homedir } from "os";
-import { dirname, join, resolve } from "path";
+import { dirname, join, resolve, sep } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 import {
   copyFileSync,
@@ -23,33 +23,26 @@ import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveM
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 function resolveCorePath() {
   const globalIndex = join(homedir(), ".agents", "skills", "workled", "index.js");
-  if (existsSync(globalIndex)) {
-    return globalIndex;
-  }
-  return join(scriptDir, "index.js");
+  const chosen = existsSync(globalIndex) ? globalIndex : join(scriptDir, "index.js");
+  // Normalize to forward slashes so the emitted hook/MCP command bytes are
+  // identical on Windows and POSIX. Backslashes would otherwise (a) mangle the
+  // path under Hermes' shlex.split on Windows and (b) change the command text
+  // vs. the forward-slash form already in the shell-hook allowlist, silently
+  // invalidating every byte-exact approval. `sep` handles win32 vs posix.
+  return chosen.split(sep).join("/");
 }
 const corePath = resolveCorePath();
-// SKILL_VERSION: single-sourced from _meta.json, with a fallback so a missing
-// or corrupt registry file never crashes the installer (index.js guards the
-// same read).
+// SKILL_VERSION: single-sourced from SKILL.md frontmatter (the `version` field),
+// with a fallback so a missing or corrupt frontmatter never crashes the installer.
+// (_meta.json was deprecated and removed; the version now lives only in SKILL.md.)
 let SKILL_VERSION = "";
 try {
-  SKILL_VERSION = JSON.parse(stripJsonc(readFileSync(join(scriptDir, "_meta.json"), "utf8"))).version || "";
+  const skillMd = readFileSync(join(scriptDir, "SKILL.md"), "utf8");
+  const m = skillMd.match(/^version:\s*"?(.*?)"?\s*$/m);
+  if (m) SKILL_VERSION = m[1];
 } catch {
   // fallback to default
 }
-const MARKER = "<!-- workled -->";
-// Keep this block verbatim in sync with SKILL.md "## Mandatory State Protocol"
-// (the State/When table): same four states, same order, same wording.
-const REMINDER = [
-  MARKER,
-  "> when connected to a workled device via MCP, call `set_agent_state` on every agent state transition:",
-  "> - `set_agent_state(\"thinking\")` — first tool call of every reply; user submits a message",
-  "> - `set_agent_state(\"waiting\")` — call BEFORE asking the user for input: before invoking an input tool (`AskUserQuestion`/`question`/`ask`/`confirm`), before opening a client-side modal, before rendering a plain-text choice list / multi-option question",
-  "> - `set_agent_state(\"idle\")` — turn finished; session torn down",
-  "> - `set_agent_state(\"error\")` — runtime error / failed tool call occurred",
-].join("\n");
-
 const h = homedir();
 
 // ---- safe path removal ----------------------------------------------------
@@ -130,102 +123,6 @@ function removeEmptyParent(dir) {
   } catch {
     // not empty, missing, or rejected by the safe-delete shim — leave it.
   }
-}
-
-// ---- instruction file helpers -----------------------------------------------
-
-// Strip every existing workled reminder block from *content* and return the
-// trimmed remainder.  Used by appendReminder so stale duplicate markers (e.g.
-// from prior installs / manual edits) are purged before the canonical block
-// is written.
-function stripAllReminderBlocks(content) {
-  const lines = content.split("\n");
-  const out = [];
-  let skip = false;
-  for (const line of lines) {
-    const t = line.trim();
-    if (t === MARKER) {
-      // Don't append the marker — it will be rewritten by the caller.
-      skip = true;
-      continue;
-    }
-    if (skip) {
-      // Drop every line of the reminder block (blockquote lines and blank
-      // lines) until the first non-reminder line ends the block. Only "> "
-      // lines and blanks belong to the canonical REMINDER block; "- " lines
-      // are never treated as block content so a user's own list that follows
-      // the reminder is preserved.
-      if (t === "" || t.startsWith("> ")) continue;
-      skip = false;
-    }
-    out.push(line);
-  }
-  return out.join("\n").trimEnd();
-}
-
-function appendReminder(file) {
-  if (!existsSync(file)) {
-    writeFileSync(file, REMINDER + "\n", "utf8");
-    return `Created reminder -> ${file}`;
-  }
-  const content = readFileSync(file, "utf8");
-  // Normalize: strip leading BOM and ensure we start from a clean baseline.
-  // This prevents empty/whitespace-only files from getting a stray leading
-  // newline before the reminder block.
-  const cleaned = content.replace(/^\ufeff/, "").trimEnd();
-
-  // Strip every stale reminder block first, then write the canonical one
-  // in its place.  The prior code only handled the first block and left
-  // duplicates (from repeated installs or manual edits) in place.
-  const remainder = stripAllReminderBlocks(cleaned);
-  const nl = remainder.length > 0 ? "\n" : "";
-  writeFileSync(file, remainder + nl + REMINDER + "\n", "utf8");
-  return `Reminded via workled -> ${file}`;
-}
-
-function removeReminder(file) {
-  if (!existsSync(file)) {
-    return `No instruction file at ${file}`;
-  }
-  const original = readFileSync(file, "utf8");
-  if (!original.includes(MARKER)) {
-    return `No workled reminder -> ${file}`;
-  }
-  const lines = original.split("\n");
-  const out = [];
-  let skip = false;
-  for (const line of lines) {
-    const t = line.trim();
-    if (t === MARKER) {
-      skip = true;
-      continue;
-    }
-    if (skip) {
-      // Drop every line of the reminder block (blockquote lines and blank
-      // lines) until the first non-reminder line ends the block. Only "> "
-      // lines and blanks belong to the canonical REMINDER block; "- " lines
-      // are never treated as block content so a user's own list that follows
-      // the reminder is preserved.
-      if (t === "" || t.startsWith("> ")) continue;
-      skip = false;
-    }
-    out.push(line);
-  }
-  const result = out.join("\n").trimEnd();
-  if (result === original.trimEnd()) {
-    return `No workled reminder -> ${file}`;
-  }
-  // If the file is now empty, delete it entirely instead of leaving a 0-byte
-  // stub. We do NOT delete files that still contain user content. This avoids
-  // breaking clients whose config directories require their instruction file
-  // to exist (rare) while keeping empty-after-cleanup files clean.
-  if (result === "") {
-    removePath(file);
-    removeEmptyParent(dirname(file));
-    return `Removed workled-only instruction file -> ${file}`;
-  }
-  writeFileSync(file, result + "\n", "utf8");
-  return `Cleaned reminder -> ${file}`;
 }
 
 // ---- JSON / JSONC merge helpers ---------------------------------------------
@@ -1297,16 +1194,18 @@ function readOpenclawConfig() {
   }
 }
 
-async function installOpenclaw() {
-  const destDir = join(openclawPluginDir(), "workled");
-  const dest = join(destDir, "index.js");
+// openclaw install, manifest + config portion only. The entry file is written
+// by the shared plugin-file path (see the generic loop in main()), which calls
+// this after writing ~/.openclaw/plugins/workled/index.js. Path is single-
+// sourced from CLIENT_TARGETS.openclaw.dest().
+async function installOpenclawManifest() {
+  const dest = CLIENT_TARGETS.openclaw.dest();
+  const destDir = dirname(dest);
+  // The entry file is already written by the caller; ensure the dir exists for
+  // the manifest (idempotent on re-run).
   mkdirSync(destDir, { recursive: true });
 
-  // Write the entry file (imports the core via an absolute URL, so no
-  // dependency files need copying into the plugin dir)
-  writeFileSync(dest, openclawEntryFile(), "utf8");
-
-  // Write plugin manifest
+  // Write plugin manifest (lives in the same plugin dir as the entry file)
   writeFileSync(
     join(destDir, "openclaw.plugin.json"),
     JSON.stringify(OPENCLAW_PLUGIN_MANIFEST, null, 2) + "\n",
@@ -1363,11 +1262,11 @@ async function installOpenclaw() {
     await sleep(2000);
     const final = readOpenclawConfig();
     if (!final.plugins?.entries?.workled) {
-      return `Installed openclaw entry + manifest -> ${dest}\n⚠ Config update may have been rolled back by Gateway restart. Run the install again or restart the Gateway manually.`;
+      return `Installed openclaw manifest -> ${destDir}\n⚠ Config update may have been rolled back by Gateway restart. Run the install again or restart the Gateway manually.`;
     }
   }
 
-  return `Installed openclaw entry + manifest + config -> ${dest}\nRegistered in openclaw.json plugins.load.paths and plugins.entries.workled (restart the Gateway to load)`;
+  return `Installed openclaw manifest + config -> ${destDir}\nRegistered in openclaw.json plugins.load.paths and plugins.entries.workled (restart the Gateway to load)`;
 }
 
 // Strip every workled entry from an openclaw config object, returning the
@@ -1458,6 +1357,7 @@ function entryFile(lines) {
 // opencode: the plugins dir auto-loads EVERY exported function as a plugin, so
 // the installed file exposes a single plugin function that adapts the entry's
 // register() into opencode's factory shape.
+// Dest (CLIENT_TARGETS.opencode.dest()): ~/.config/opencode/plugins/workled.js
 function opencodeEntryFile() {
   return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
@@ -1466,6 +1366,7 @@ function opencodeEntryFile() {
 }
 
 // openclaw: Gateway loads via plugins.load.paths; wraps the entry with the SDK.
+// Dest (CLIENT_TARGETS.openclaw.dest()): ~/.openclaw/plugins/workled/index.js
 function openclawEntryFile() {
   return entryFile([
     `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";`,
@@ -1475,6 +1376,7 @@ function openclawEntryFile() {
 }
 
 // pi: extensions take the default export as (pi: ExtensionAPI) => void.
+// Dest (CLIENT_TARGETS.pi.dest()): ~/.pi/agent/extensions/workled/index.ts
 function piEntryFile() {
   return entryFile([
     `import { piEntry } from "${fileUrl(corePath)}";`,
@@ -1485,6 +1387,7 @@ function piEntryFile() {
 // kilo (Anomaly) is an opencode fork: Event/Hooks types are identical to
 // opencode, so it reuses opencodeEntry. The installed file is a module
 // descriptor (default export { id, server }) in the single `plugin/` dir.
+// Dest (CLIENT_TARGETS.kilo.dest()): ~/.config/kilo/plugin/workled.js
 function kiloEntryFile() {
   return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
@@ -1495,14 +1398,18 @@ function kiloEntryFile() {
   ]);
 }
 
-// Entry-file generators for the plugin-file clients (opencode / kilo / pi).
-// Target paths and labels live in CLIENT_TARGETS (index.js); this table only
-// adds what cannot be data — the generated entry content — so client paths are
-// maintained in exactly one place. Keys must be a subset of CLIENTS.
+// Entry-file generators for the plugin-file clients (opencode / kilo / pi /
+// openclaw). Target paths and labels live in CLIENT_TARGETS (index.js); this
+// table only adds what cannot be data — the generated entry content — so
+// client paths are maintained in exactly one place. Keys must be a subset of
+// CLIENTS. openclaw additionally needs a plugin manifest + openclaw.json
+// registration, which is owned by installOpenclawManifest() (the entry file
+// itself is written by the same generic loop as the other plugin clients).
 const PLUGIN_CLIENTS = {
   opencode: opencodeEntryFile,
   kilo: kiloEntryFile,
   pi: piEntryFile,
+  openclaw: openclawEntryFile,
 };
 
 // hermes: shell hooks are declared in <hermes-home>/config.yaml under a
@@ -1518,6 +1425,7 @@ function hermesHookEvents() {
     "pre_llm_call",
     "post_llm_call",
     "pre_tool_call",
+    "post_tool_call",
     "pre_approval_request",
     "post_approval_response",
     "on_session_start",
@@ -1778,12 +1686,44 @@ export function uninstallHermesHooks(yamlText) {
   return [...before, ...rebuilt, ...after].join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
+// Ensure a top-level `hooks_auto_accept: true` exists. Hermes gates each shell
+// hook on a byte-exact (event, command) consent for non-interactive runs
+// (gateway/cron/CI) unless hooks_auto_accept is set; without it freshly
+// installed hooks are silently skipped. Pure text edit; preserves comments and
+// every other top-level key. Cross-platform by construction (plain YAML text).
+// Exported for unit tests.
+export function ensureHermesAutoAccept(yamlText) {
+  const lines = yamlText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (/^hooks_auto_accept\s*:/.test(lines[i])) {
+      lines[i] = lines[i].replace(/^hooks_auto_accept\s*:.*/, "hooks_auto_accept: true");
+      return lines.join("\n");
+    }
+  }
+  // Not present: insert before the `hooks:` block (or append at the end).
+  const idx = lines.findIndex((l) => /^hooks\s*:/.test(l));
+  if (idx >= 0) lines.splice(idx, 0, "hooks_auto_accept: true");
+  else lines.push("hooks_auto_accept: true");
+  return lines.join("\n");
+}
+
+// Reverse of ensureHermesAutoAccept: drop the exact top-level
+// `hooks_auto_accept: true` line introduced for workled. A user's own value
+// (anything other than bare `true`) is left untouched.
+function removeHermesAutoAccept(yamlText) {
+  return yamlText
+    .split("\n")
+    .filter((l) => !/^hooks_auto_accept\s*:\s*true\s*$/.test(l))
+    .join("\n");
+}
+
 function installHermes() {
   const cfg = join(hermesHome(), "config.yaml");
   mkdirSync(dirname(cfg), { recursive: true });
   const existing = existsSync(cfg) ? readFileSync(cfg, "utf8") : "";
-  writeFileSync(cfg, installHermesHooks(existing), "utf8");
-  return `Installed hermes shell hooks -> ${cfg}`;
+  const withHooks = installHermesHooks(existing);
+  writeFileSync(cfg, ensureHermesAutoAccept(withHooks), "utf8");
+  return `Installed hermes shell hooks + hooks_auto_accept -> ${cfg}`;
 }
 
 function uninstallHermes() {
@@ -1794,7 +1734,8 @@ function uninstallHermes() {
   // (user hooks, MCP servers, model/terminal settings, ...) is preserved.
   // The workled MCP server entry is removed separately by
   // unregisterWorkledMcp("hermes") via removeMcpServerYaml().
-  const cleaned = uninstallHermesHooks(content);
+  let cleaned = uninstallHermesHooks(content);
+  cleaned = removeHermesAutoAccept(cleaned);
   if (cleaned === content) return `No hermes workled hooks at ${cfg}`;
   if (cleaned.trim() === "") {
     removePath(cfg);
@@ -1949,11 +1890,10 @@ function uninstallDsh() {
 // ---- CLI ----------------------------------------------------------------------
 
 // Render one client's --help line from CLIENT_TARGETS: plugin clients use the
-// structured dest/label (plus the standard AGENTS.md reminder suffix), the
-// others carry ready-made help text.
+// structured dest/label, the others carry ready-made help text.
 function targetHelp(name) {
   const t = CLIENT_TARGETS[name] ?? CLIENT_TARGETS.default;
-  return t.help || `${t.label} -> ${t.dest()} + reminder in AGENTS.md`;
+  return t.help || `${t.label} -> ${t.dest()}`;
 }
 
 function printHelp() {
@@ -1961,10 +1901,8 @@ function printHelp() {
 
 Usage:
   node skill-install.mjs install|uninstall --client <name>
-  node skill-install.mjs install|uninstall --file <instruction-file>
 
 ${CLIENTS.map((c) => `  ${c.padEnd(10)} ${targetHelp(c)}`).join("\n")}
-  --file     generic: only the reminder (clients not in the list use this method)
   --client   REQUIRED -- the invoking agent passes its own client name
 `);
 }
@@ -1977,20 +1915,9 @@ async function main() {
   }
 
   const action = args[0]; // install | uninstall
-  const fileIdx = args.indexOf("--file");
-  const fileArg = fileIdx >= 0 ? args[fileIdx + 1] : null;
-
   if (action !== "install" && action !== "uninstall") {
     printHelp();
     process.exit(1);
-  }
-
-  // Generic mode: only the reminder, no client target involved. Handled here so
-  // `uninstall --file` (and `install --file`) works without a `--client` flag.
-  if (fileArg) {
-    const out = action === "install" ? appendReminder(fileArg) : removeReminder(fileArg);
-    console.log(out);
-    return;
   }
 
   // Target client resolution: both actions (install AND uninstall) require an
@@ -2037,15 +1964,20 @@ async function main() {
     switch (c) {
       case "opencode":
       case "kilo":
-      case "pi": {
-        const t = CLIENT_TARGETS[c]; // { label, dest, agents } — plugin client
+      case "pi":
+      case "openclaw": {
+        const t = CLIENT_TARGETS[c]; // { label, dest } — plugin-file client
         const dest = t.dest();
         const destDir = dirname(dest);
         if (isInstall) {
           mkdirSync(destDir, { recursive: true });
           writeFileSync(dest, PLUGIN_CLIENTS[c](), "utf8");
           lines.push(`Installed ${c} ${t.label} -> ${dest}`);
-          lines.push(appendReminder(t.agents()));
+          // openclaw additionally writes the plugin manifest + openclaw.json
+          // registration; its entry file is generated by the same shared path.
+          if (c === "openclaw") {
+            lines.push(await installOpenclawManifest());
+          }
           lines.push(...(await registerWorkledMcp(c, mcpEntry)));
         } else {
           if (existsSync(dest)) {
@@ -2055,22 +1987,18 @@ async function main() {
           } else {
             lines.push(`No ${c} ${t.label} at ${dest}`);
           }
-          lines.push(removeReminder(t.agents()));
+          // openclaw: drop the manifest + openclaw.json registration (the whole
+          // plugin dir, including the entry, is removed by uninstallOpenclaw).
+          if (c === "openclaw") {
+            lines.push(await uninstallOpenclaw());
+          }
           lines.push(...unregisterWorkledMcp(c));
         }
-        break;
-      }
-      case "openclaw": {
-        lines.push(await (isInstall ? installOpenclaw() : uninstallOpenclaw()));
-        lines.push(isInstall ? appendReminder(join(h, ".openclaw", "AGENTS.md")) : removeReminder(join(h, ".openclaw", "AGENTS.md")));
-        if (isInstall) lines.push(...(await registerWorkledMcp("openclaw", mcpEntry)));
-        else lines.push(...unregisterWorkledMcp("openclaw"));
         break;
       }
       case "hermes": {
         const hh = hermesHome();
         lines.push(isInstall ? installHermes() : uninstallHermes());
-        lines.push(isInstall ? appendReminder(join(hh, "AGENTS.md")) : removeReminder(join(hh, "AGENTS.md")));
         if (isInstall) lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
         else lines.push(...unregisterWorkledMcp("hermes"));
         break;
@@ -2078,10 +2006,8 @@ async function main() {
       case "dsh": {
         const dh = dshHome();
         lines.push(isInstall ? installDsh() : uninstallDsh());
-        // Reminder lives at the Harness home (install/uninstall symmetric);
         // dsh's MCP + hooks wiring is fully owned by installDsh/uninstallDsh
         // (cordis.patch.yml + workled-hooks.json), so no separate MCP step.
-        lines.push(isInstall ? appendReminder(join(dh, "AGENTS.md")) : removeReminder(join(dh, "AGENTS.md")));
         break;
       }
       case "workbuddy": {
@@ -2144,7 +2070,7 @@ async function main() {
 
   // After install, run status check ONLY for the client that was just installed.
   // This avoids noise from unrelated clients (e.g. dsh diagnostic when installing pi).
-  if (action === "install" && !fileArg) {
+  if (action === "install") {
     // Run status check to see if MCP is configured
     const { spawnSync } = await import("child_process");
     // Use process.execPath (the same Node this installer runs under) instead
@@ -2180,7 +2106,9 @@ async function main() {
 
 // Run only when invoked directly (not when imported by the test suite, which
 // needs the exported JSONC editor helpers without triggering an install).
-const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const isMain =
+  (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) ||
+  (process.argv[1] && resolve(process.argv[1]).split(/[\\/]/).at(-1) === fileURLToPath(import.meta.url).split(/[\\/]/).at(-1));
 if (isMain) {
   main().catch((err) => {
     console.error(`install.mjs error: ${err && err.stack}`);
