@@ -84,13 +84,16 @@ node ~/.agents/skills/workled/skill-install.mjs install --client <name>
 
 Every target path is derived from `homedir()`, never from cwd, so
 the same command runs from any directory on any shell. Both `install` and
-`uninstall` **require** an explicit target: `--client <name>` (opencode, kilo,
-openclaw, traecode, hermes, dsh, pi, workbuddy).
+`uninstall` take an **optional** `--client <name>` (opencode, kilo, openclaw,
+trae-cn, hermes, dsh, pi, workbuddy): omit it to **auto-detect** the running
+client; pass it explicitly when several clients are installed (ambiguous) or to
+target a *different* client (e.g. from an opencode chat, "install workled in
+kilocode" → `--client kilocode`).
 `index.js status` accepts the same optional `--client <name>` filter; default
 is **all clients**.
 
 ```
-node <skill-dir>/skill-install.mjs install|uninstall --client <name>
+node <skill-dir>/skill-install.mjs install|uninstall [--client <name>]
 node <skill-dir>/skill-install.mjs --help
 node <skill-dir>/index.js status [--client <name>]    # filter optional; default all
 ```
@@ -106,7 +109,7 @@ node <skill-dir>/index.js status --client opencode
 What every client's install flow does:
 
 1. **Client-level hook / plugin / entry** — covers the Enter → first-output gap (the window the agent cannot reach): calls `set_agent_state("thinking")` when the user submits a message.
-2. **MCP entry** — registers the `workled` server in the client's MCP config (opencode/kilo/openclaw/traecode/pi/workbuddy register it; hermes uses a YAML block).
+2. **MCP entry** — registers the `workled` server in the client's MCP config (opencode/kilo/openclaw/trae-cn/pi/workbuddy register it; hermes uses a YAML block).
 3. **Uninstall** — removes the hook/entry and the MCP entry. Everything else in the config files is preserved verbatim.
 
 After installing, run `node <skill-dir>/index.js status` and surface the JSON
@@ -146,17 +149,37 @@ node <skill-dir>/index.js status
 ```
 
 The command scans the MCP config of every client (opencode,
-traecode, openclaw, pi, workbuddy, hermes, dsh), takes the first server named `workled`
-(`WORKLED_MCP_URL` override wins), and checks reachability with a **stateless**
-`tools/call get_agent_state` probe. Each URL is probed up to 3 times
-with backoff; the successful attempt number is reported. Fields:
+trae-cn, openclaw, pi, workbuddy, hermes, dsh) and lists every server named
+`workled` (`WORKLED_MCP_URL`, if set, is reported first as the `env` entry),
+checking each reachability with a **stateless** `tools/call get_agent_state`
+probe. Each URL is probed up to 2 times with backoff (the attempt count is not
+shown in the output). Fields:
 
-- `WORKLED_MCP_URL` — the override value, or `null`
-- `workled` — `{ client, enabled, url, reachable, attempt, error? }`, or `null`
-  when no `workled` server is configured; `attempt` is the probe attempt that
-  succeeded (1-3)
-- `clients` — one entry per discovered client config (`client`, `path`,
-  `enabled`, `url`, `reachable`, `attempt`)
+- `bluetooth` — `{ available, powered, devicePaired, deviceNames, error? }`; BLE pairing
+  matters for the touch-pad macros (the LED + macro only need Wi-Fi)
+- `clients` — one entry per discovered MCP config. Every functional client
+  requires an MCP server (that is how the agent calls the device), so only
+  MCP-configured clients appear here. Fields per entry:
+  - `client` — the client id (or `env` for the `WORKLED_MCP_URL` override)
+  - `mcpPath` — path of the MCP config file that declares the server
+    (for `env`, the literal `WORKLED_MCP_URL`)
+  - `mcpUrl` — the configured workled server URL
+  - `mcpEnable` — whether the server is enabled (absent `enabled` ⇒ `true`);
+    omitted for the `env` override entry
+  - `mcpUrlReachable` — whether the URL answered a stateless `get_agent_state` probe
+  - `WORKLED_MCP_URL` — present only on the `env` override entry; holds the
+    override URL. The `env` entry has no config file, so unlike real clients it
+    emits no `mcpPath` / `mcpUrl` / `mcpEnable`
+  - `mcpConfig` — `mcpEnable && mcpUrl` both present (a working server entry);
+    omitted for the `env` override entry
+  - `plugin` — the actual installed plugin/hooks artifact path for that client
+    (generated entry file, or the config/hooks file carrying the workled
+    marker), or `null` when not installed; omitted for the `env` override entry
+  - `skill` — the per-client skill directory where SKILL.md is installed
+    (e.g. `~/.workbuddy/skills/workled`; openclaw uses
+    `~/.openclaw/workspace/skills/workled` since its TUI installs there), or
+    `null` when not installed for that client; omitted for the `env` override
+    entry
 - `hint` — a concrete next step for the current state
 - `ok` / `exitCode` — success flag and process exit code
 

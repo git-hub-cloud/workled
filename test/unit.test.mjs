@@ -7,7 +7,7 @@ import {
   isInputTool,
   resolveMergedUrl,
   resolveMcpType,
-  traecodeReminderText,
+  traeCnReminderText,
   shouldDedupState,
   drainFlushPromisesForState,
   CLIENTS,
@@ -63,35 +63,35 @@ test("resolveMcpType writes the source default for a fresh entry", () => {
   assert.equal(resolveMcpType(null, ""), null);
 });
 
-test("traecodeReminderText fires for a --client traecode / unfiltered scan", () => {
-  // Explicit traecode filter -> reminder present.
-  const note = traecodeReminderText({ clientPrefix: "traecode" });
+test("traeCnReminderText fires for a --client trae-cn / unfiltered scan", () => {
+  // Explicit trae-cn filter -> reminder present.
+  const note = traeCnReminderText({ clientPrefix: "trae-cn" });
   assert.equal(typeof note, "string");
   assert.ok(note.includes("Settings → Hooks"));
   assert.ok(note.includes("device-name"));
-  // Unfiltered scan (no clientPrefix) treats traecode as in scope too.
-  assert.ok(traecodeReminderText({}).includes("Settings"));
+  // Unfiltered scan (no clientPrefix) treats trae-cn as in scope too.
+  assert.ok(traeCnReminderText({}).includes("Settings"));
 });
 
-test("traecodeReminderText fires when a traecode entry is in the scan results", () => {
-  const note = traecodeReminderText({
-    clientPrefix: "traecode",
-    clients: [{ client: "traecode", reachable: true }],
+test("traeCnReminderText fires when a trae-cn entry is in the scan results", () => {
+  const note = traeCnReminderText({
+    clientPrefix: "trae-cn",
+    clients: [{ client: "trae-cn", reachable: true }],
   });
   assert.ok(note.includes("Settings → Hooks"));
 });
 
-test("traecodeReminderText stays quiet for non-traecode-only scans", () => {
-  // A non-traecode --client filter (and no traecode entry) gets no reminder.
-  assert.equal(traecodeReminderText({ clientPrefix: "opencode" }), "");
+test("traeCnReminderText stays quiet for non-trae-cn-only scans", () => {
+  // A non-trae-cn --client filter (and no trae-cn entry) gets no reminder.
+  assert.equal(traeCnReminderText({ clientPrefix: "opencode" }), "");
   assert.equal(
-    traecodeReminderText({ clientPrefix: "opencode", clients: [{ client: "env" }] }),
+    traeCnReminderText({ clientPrefix: "opencode", clients: [{ client: "env" }] }),
     ""
   );
 });
 
-test("traecodeReminderText matches traecode worktrees by prefix", () => {
-  assert.ok(traecodeReminderText({ clientPrefix: "traecode" }).includes("Settings"));
+test("traeCnReminderText matches trae-cn worktrees by prefix", () => {
+  assert.ok(traeCnReminderText({ clientPrefix: "trae-cn" }).includes("Settings"));
 });
 
 test("CLIENT_TARGETS covers every client (with default fallback)", () => {
@@ -216,30 +216,30 @@ test("drainFlushPromisesForState settles a state=null (drain) waiter on any stat
   assert.ok(settled.has("drainWaiter2"));
 });
 
-// --- Client-parameterised hook core (traecode) ------------------------------
+// --- Client-parameterised hook core (trae-cn) ------------------------------
 //
-// TraeCode's global Hooks live in <home>/.trae-cn/hooks.json using the Claude
+// trae-cn's global Hooks live in <home>/.trae-cn/hooks.json using the Claude
 // Code-style schema (version 1 + hooks.<Event>[]). The generic mergeClientHooks
-// drives traecode exactly as installTraecode() does; stripClientHooks removes
-// only the traecode-scoped workled groups. Both are pure and disk-free.
+// drives trae-cn exactly as installTraeCn() does; stripClientHooks removes
+// only the trae-cn-scoped workled groups. Both are pure and disk-free.
 
 // Every event in WORKLED_HOOK_SPECS should be present after a fresh merge.
 const SPEC_EVENTS = ["UserPromptSubmit", "Stop", "Notification", "PostToolUse"];
-const cmdFor = (e) => `node workled hook --event ${e} --client traecode`;
-const mergeTraecode = (cfg) => mergeClientHooks(cfg, { client: "traecode", commandForEvent: cmdFor, version: 1 });
-const stripTraecode = (cfg) => stripClientHooks(cfg, "traecode");
+const cmdFor = (e) => `node workled hook --event ${e} --client trae-cn`;
+const mergeTraeCn = (cfg) => mergeClientHooks(cfg, { client: "trae-cn", commandForEvent: cmdFor, version: 1 });
+const stripTraeCn = (cfg) => stripClientHooks(cfg, "trae-cn");
 
 test("workledHookCommand is shell-portable (no absolute node, no `&`)", () => {
   // One command string must parse under both bash (workbuddy/Claude Code) and
-  // PowerShell (TraeCode). A spaced "quoted absolute path" first token would be
+  // PowerShell (trae-cn). A spaced "quoted absolute path" first token would be
   // a parse error in PowerShell (needs `&`) while `&` is a background operator
   // in bash — so we must start with a bare `node`, never the absolute binary.
-  const cmd = workledHookCommand("Notification", "traecode");
+  const cmd = workledHookCommand("Notification", "trae-cn");
   assert.ok(cmd.startsWith("node "), `hook command must start with bare node, got: ${cmd}`);
   assert.ok(!cmd.includes("Program Files"), "must not embed the spaced absolute node path");
   assert.ok(!cmd.includes("& "), "must not use the PowerShell-only `&` call operator");
   assert.ok(cmd.includes("--event Notification"));
-  assert.ok(cmd.includes("--client traecode"));
+  assert.ok(cmd.includes("--client trae-cn"));
 });
 
 test("workledHookCommand never inlines the MCP URL (config discovery at runtime)", () => {
@@ -248,14 +248,14 @@ test("workledHookCommand never inlines the MCP URL (config discovery at runtime)
   // Keeping the command URL-free also avoids any shell/sandbox mangling of a
   // raw or base64-encoded URL argument.
   const real = "http://HomeAnt-2831.local:18791/mcp";
-  assert.ok(!workledHookCommand("Stop", "traecode", real).includes("--url"), "real URL must not be inlined");
-  assert.ok(!workledHookCommand("Stop", "traecode", real).includes("b64:"), "no base64 encoding");
-  assert.ok(!workledHookCommand("Stop", "traecode", "http://<device-name>.local:18791/mcp").includes("--url"), "placeholder must not be inlined");
-  assert.ok(!workledHookCommand("Stop", "traecode").includes("--url"), "bare command stays bare");
+  assert.ok(!workledHookCommand("Stop", "trae-cn", real).includes("--url"), "real URL must not be inlined");
+  assert.ok(!workledHookCommand("Stop", "trae-cn", real).includes("b64:"), "no base64 encoding");
+  assert.ok(!workledHookCommand("Stop", "trae-cn", "http://<device-name>.local:18791/mcp").includes("--url"), "placeholder must not be inlined");
+  assert.ok(!workledHookCommand("Stop", "trae-cn").includes("--url"), "bare command stays bare");
 });
 
-test("mergeClientHooks('traecode') builds a valid bare hooks config from nothing", () => {
-  const merged = mergeTraecode(undefined);
+test("mergeClientHooks('trae-cn') builds a valid bare hooks config from nothing", () => {
+  const merged = mergeTraeCn(undefined);
   assert.equal(merged.version, 1);
   assert.ok(merged.hooks, "hooks map required");
   for (const ev of SPEC_EVENTS) {
@@ -263,45 +263,45 @@ test("mergeClientHooks('traecode') builds a valid bare hooks config from nothing
     assert.ok(merged.hooks[ev].length >= 1, `event ${ev} must have at least one group`);
   }
   // Notification carries two matchers (permission_prompt + idle_prompt); every
-  // group must route through the traecode client command.
+  // group must route through the trae-cn client command.
   for (const ev of SPEC_EVENTS) {
     for (const group of merged.hooks[ev]) {
       assert.ok(group.hooks[0].type === "command");
-      assert.ok(group.hooks[0].command.includes("--client traecode"));
+      assert.ok(group.hooks[0].command.includes("--client trae-cn"));
       assert.equal(typeof group.hooks[0].timeout, "number");
     }
   }
 });
 
-test("mergeClientHooks('traecode') preserves unrelated hooks and version", () => {
+test("mergeClientHooks('trae-cn') preserves unrelated hooks and version", () => {
   const base = {
     version: 3,
     hooks: {
       Stop: [{ hooks: [{ type: "command", command: "echo user-hook", timeout: 5 }] }],
     },
   };
-  const merged = mergeTraecode(base);
+  const merged = mergeTraeCn(base);
   assert.equal(merged.version, 3, "existing version kept");
   assert.deepEqual(merged.hooks.Stop[0], base.hooks.Stop[0], "unrelated Stop group preserved");
   // The workled group is appended after the unrelated one.
-  assert.ok(merged.hooks.Stop.some((g) => g.hooks[0].command.includes("--client traecode")));
+  assert.ok(merged.hooks.Stop.some((g) => g.hooks[0].command.includes("--client trae-cn")));
 });
 
-test("mergeClientHooks('traecode') is idempotent: re-merging replaces, not duplicates", () => {
-  const once = mergeTraecode(undefined);
-  const twice = mergeTraecode(once);
+test("mergeClientHooks('trae-cn') is idempotent: re-merging replaces, not duplicates", () => {
+  const once = mergeTraeCn(undefined);
+  const twice = mergeTraeCn(once);
   for (const ev of SPEC_EVENTS) {
     assert.equal(twice.hooks[ev].length, once.hooks[ev].length, `${ev} must not grow`);
     // Every workled group is traced to our command; no double writes.
     assert.equal(
-      twice.hooks[ev].filter((g) => g.hooks[0].command.includes("--client traecode")).length,
-      once.hooks[ev].filter((g) => g.hooks[0].command.includes("--client traecode")).length
+      twice.hooks[ev].filter((g) => g.hooks[0].command.includes("--client trae-cn")).length,
+      once.hooks[ev].filter((g) => g.hooks[0].command.includes("--client trae-cn")).length
     );
   }
 });
 
-test("mergeClientHooks('traecode') embeds matchers for the Notification events", () => {
-  const merged = mergeTraecode(undefined);
+test("mergeClientHooks('trae-cn') embeds matchers for the Notification events", () => {
+  const merged = mergeTraeCn(undefined);
   const matchers = merged.hooks.Notification.map((g) => g.matcher);
   assert.ok(matchers.includes("permission_prompt"));
   assert.ok(matchers.includes("idle_prompt"));
@@ -311,26 +311,26 @@ test("mergeClientHooks('traecode') embeds matchers for the Notification events",
   assert.ok(post.includes("AskUserQuestion"));
 });
 
-test("stripClientHooks('traecode') removes all traecode workled groups and reports changed", () => {
-  const merged = mergeTraecode(undefined);
-  const { config, changed } = stripTraecode(merged);
+test("stripClientHooks('trae-cn') removes all trae-cn workled groups and reports changed", () => {
+  const merged = mergeTraeCn(undefined);
+  const { config, changed } = stripTraeCn(merged);
   assert.equal(changed, true);
   for (const ev of SPEC_EVENTS) {
     assert.ok(!config.hooks[ev], `${ev} fully stripped`);
   }
   // The pure helper empties the hooks map; deleting the now-empty `hooks` key
-  // is left to the caller (uninstallTraecode), so it stays an empty object.
+  // is left to the caller (uninstallTraeCn), so it stays an empty object.
   assert.deepEqual(config.hooks, {});
 });
 
-test("stripClientHooks('traecode') is a no-op when there are no traecode workled groups", () => {
+test("stripClientHooks('trae-cn') is a no-op when there are no trae-cn workled groups", () => {
   const cfg = { version: 1, hooks: { Stop: [{ hooks: [{ type: "command", command: "echo x" }] }] } };
-  const { config, changed } = stripTraecode(cfg);
+  const { config, changed } = stripTraeCn(cfg);
   assert.equal(changed, false);
   assert.deepEqual(config, cfg);
 });
 
-test("stripClientHooks('traecode') keeps unrelated hooks while dropping only traecode groups", () => {
+test("stripClientHooks('trae-cn') keeps unrelated hooks while dropping only trae-cn groups", () => {
   const cfg = {
     version: 1,
     hooks: {
@@ -341,14 +341,14 @@ test("stripClientHooks('traecode') keeps unrelated hooks while dropping only tra
       UserPromptSubmit: [{ hooks: [{ type: "command", command: cmdFor("UserPromptSubmit") }] }],
     },
   };
-  const { config, changed } = stripTraecode(cfg);
+  const { config, changed } = stripTraeCn(cfg);
   assert.equal(changed, true);
   assert.deepEqual(config.hooks.Stop, [{ hooks: [{ type: "command", command: "echo keep-me" }] }]);
   assert.ok(!config.hooks.UserPromptSubmit, "UserPromptSubmit fully stripped");
 });
 
 // The shared client-parameterised core (mergeClientHooks / stripClientHooks)
-// backs BOTH workbuddy and traecode, differing only in the `client` marker. These
+// backs BOTH workbuddy and trae-cn, differing only in the `client` marker. These
 // tests lock in that behaviour: isolation between clients, no version leakage
 // for workbuddy, and a clean round-trip.
 const wbCmdFor = (e) => `node workled hook --event ${e} --client workbuddy`;
@@ -361,22 +361,22 @@ test("mergeClientHooks('workbuddy') builds hooks without injecting a schema vers
 });
 
 test("stripClientHooks is client-isolated: one client's strip leaves the other intact", () => {
-  // Build a config carrying both a workbuddy and a traecode workled group.
+  // Build a config carrying both a workbuddy and a trae-cn workled group.
   const wb = mergeClientHooks({}, { client: "workbuddy", commandForEvent: wbCmdFor });
-  const both = mergeClientHooks(wb, { client: "traecode", commandForEvent: cmdFor, version: 1 });
+  const both = mergeClientHooks(wb, { client: "trae-cn", commandForEvent: cmdFor, version: 1 });
 
-  // Strip only workbuddy -> traecode groups survive.
+  // Strip only workbuddy -> trae-cn groups survive.
   const noWb = stripClientHooks(both, "workbuddy");
   assert.equal(noWb.changed, true);
-  assert.ok(noWb.config.hooks.UserPromptSubmit.length, "traecode groups kept");
+  assert.ok(noWb.config.hooks.UserPromptSubmit.length, "trae-cn groups kept");
   assert.ok(
-    noWb.config.hooks.UserPromptSubmit.every((g) => g.hooks[0].command.includes("--client traecode")),
-    "only traecode groups remain"
+    noWb.config.hooks.UserPromptSubmit.every((g) => g.hooks[0].command.includes("--client trae-cn")),
+    "only trae-cn groups remain"
   );
   assert.ok(!noWb.config.hooks.UserPromptSubmit.some((g) => g.hooks[0].command.includes("--client workbuddy")));
 
-  // Strip only traecode -> workbuddy groups survive.
-  const noTrae = stripClientHooks(both, "traecode");
+  // Strip only trae-cn -> workbuddy groups survive.
+  const noTrae = stripClientHooks(both, "trae-cn");
   assert.equal(noTrae.changed, true);
   assert.ok(noTrae.config.hooks.UserPromptSubmit.length, "workbuddy groups kept");
   assert.ok(

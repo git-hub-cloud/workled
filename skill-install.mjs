@@ -17,13 +17,20 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { stripJsonc, hermesHome, sleep, dshHome, traeCodeHooksHome } from "./utils.js";
-import { MCP_SOURCES, CLIENTS, CLIENT_TARGETS, WORKLED_HOOK_TIMEOUT_MS, resolveMergedUrl, resolveMcpType } from "./index.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeCnHooksHome } from "./utils.js";
+import { CLIENTS, CLIENT_TARGETS, detectClient, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
+
+// Build every path with forward slashes so commands, emitted hooks/MCP configs,
+// status output, and uninstall messages read identically on Windows and POSIX.
+// Node's fs and dirname accept forward slashes on Windows, so using `joinP`
+// for every path is safe and makes ALL paths cross-platform consistent.
+const joinP = (...a) => String(join(...a)).split(/[\\/]+/).join("/");
+
 function resolveCorePath() {
-  const globalIndex = join(homedir(), ".agents", "skills", "workled", "index.js");
-  const chosen = existsSync(globalIndex) ? globalIndex : join(scriptDir, "index.js");
+  const globalIndex = joinP(homedir(), ".agents", "skills", "workled", "index.js");
+  const chosen = existsSync(globalIndex) ? globalIndex : joinP(scriptDir, "index.js");
   // Normalize to forward slashes so the emitted hook/MCP command bytes are
   // identical on Windows and POSIX. Backslashes would otherwise (a) mangle the
   // path under Hermes' shlex.split on Windows and (b) change the command text
@@ -37,7 +44,7 @@ const corePath = resolveCorePath();
 // (_meta.json was deprecated and removed; the version now lives only in SKILL.md.)
 let SKILL_VERSION = "";
 try {
-  const skillMd = readFileSync(join(scriptDir, "SKILL.md"), "utf8");
+  const skillMd = readFileSync(joinP(scriptDir, "SKILL.md"), "utf8");
   const m = skillMd.match(/^version:\s*"?(.*?)"?\s*$/m);
   if (m) SKILL_VERSION = m[1];
 } catch {
@@ -101,7 +108,7 @@ function removeTreeRobust(p) {
     let entries = [];
     try { entries = readdirSync(p); } catch { entries = []; }
     for (const entry of entries) {
-      removeTreeRobust(join(p, entry));
+      removeTreeRobust(joinP(p, entry));
     }
     // Directory should be empty now — remove it bottom-up.
     try { rmdirSync(p, { recursive: false }); } catch {}
@@ -630,7 +637,7 @@ export function removeJsoncEntry(text, key, serverName) {
 function hookCommand(eventName) {
   // Cross-platform: invoke `node` from PATH as a bare command name so the line
   // parses under any shell (bash for Claude Code/workbuddy, PowerShell for
-  // TraeCode). Quote corePath only when it contains spaces — otherwise leave it
+  // trae-cn). Quote corePath only when it contains spaces — otherwise leave it
   // bare. Note for hermes/YAML: JSON.stringify escapes the quotes correctly for
   // the YAML scalar, and keeping the path bare (no manual wrapping) avoids the
   // window path/backslash corruption documented below.
@@ -643,7 +650,7 @@ function hookCommand(eventName) {
 
 // YAML top-level keys that may hold an MCP server map. hermes versioned its
 // config key over time, so each candidate is probed in order (the first block
-// that exists wins). Only used for YAML sources; JSON sources use source.key.
+// that exists wins). Only used for YAML configs; JSON configs use the client's mcpKey.
 const MCP_KEY_CANDIDATES = ["mcp_servers", "mcpServers", "mcp-servers", "servers"];
 
 // Remove the `workled` server from a YAML MCP block in <file>. Candidates are
@@ -726,25 +733,29 @@ function removeMcpServerYaml(file, keyCandidates) {
   return null;
 }
 
-// Remove the `workled` MCP server entry from one MCP_SOURCES source.
+// Remove the `workled` MCP server entry from one client's MCP config.
 // JSON sources: drop obj[key].workled, then the key itself when
 // empty; the config is rewritten in place via writeConfig (no backup file is
 // created). YAML sources (hermes) go through removeMcpServerYaml(), which
 // probes the historical MCP key candidates.
 // Returns null when nothing was touched.
-function removeMcpServer(source) {
-  if (source.format === "yaml") {
-    const candidates = [source.key, ...MCP_KEY_CANDIDATES.filter((k) => k !== source.key)];
-    return removeMcpServerYaml(source.path(), candidates);
+function removeMcpServer(client) {
+  const t = CLIENT_TARGETS[client];
+  if (!t?.mcpPath) return null;
+  const file = t.mcpPath();
+  const key = t.mcpKey;
+  const format = t.mcpFormat;
+  if (format === "yaml") {
+    const candidates = [key, ...MCP_KEY_CANDIDATES.filter((k) => k !== key)];
+    return removeMcpServerYaml(file, candidates);
   }
-  const file = source.path();
   if (!existsSync(file)) return null;
   const raw = readFileSync(file, "utf8");
   if (!isValidJsonc(raw)) return null;
-  let edited = removeJsoncEntry(raw, source.key, "workled");
+  let edited = removeJsoncEntry(raw, key, "workled");
   if (edited == null) return null; // no workled entry here
   // Drop the map too when uninstall emptied it (replaces the old `delete obj[key]`).
-  const dropped = removeJsoncKey(edited, source.key);
+  const dropped = removeJsoncKey(edited, key);
   if (dropped != null) edited = dropped;
   // Safety net: if surgery produced an unparseable file, leave it untouched.
   if (!isValidJsonc(edited)) return null;
@@ -756,10 +767,10 @@ function removeMcpServer(source) {
     if (stripJsonc(finalRaw).replace(/\s/g, "") === "{}") {
       removePath(file);
       removeEmptyParent(dirname(file));
-      return `Removed workled from ${source.key} -> ${file} (deleted empty config)`;
+      return `Removed workled from ${key} -> ${file} (deleted empty config)`;
     }
   }
-  return `Removed workled from ${source.key} -> ${file}`;
+  return `Removed workled from ${key} -> ${file}`;
 }
 
 // Remove a top-level <key> entry (the whole `"key": {...}`) from raw JSONC
@@ -793,9 +804,10 @@ export function removeJsoncKey(text, key) {
 // unregisterWorkledMcp(client) via removeMcpServer() (null results filtered
 // out); an empty array means no `workled` MCP server entry was found to remove.
 function unregisterWorkledMcp(client) {
-  return MCP_SOURCES.filter((s) => s.client === client && !s.patchManaged)
-    .map((s) => removeMcpServer(s))
-    .filter(Boolean);
+  const t = CLIENT_TARGETS[client];
+  if (!t?.mcpPath) return [];
+  const msg = removeMcpServer(client);
+  return msg ? [msg] : [];
 }
 
 // Resolve the workled MCP server URL, in priority order:
@@ -821,7 +833,7 @@ export function workledHookCommand(eventName, client, url) {
   // bare command name with no spaces) rather than the absolute process.execPath
   // ("C:\Program Files\nodejs\node.exe" on Windows). This single form parses
   // equally under a POSIX shell (Claude Code / workbuddy run hooks via bash)
-  // and Windows PowerShell (TraeCode): a spaced "quoted path first" token is a
+  // and Windows PowerShell (trae-cn): a spaced "quoted path first" token is a
   // parse error in PowerShell (needs the `&` call operator) yet the same string
   // would run `&` as a background operator in bash — so absolute-node forms
   // can never satisfy both. Only corePath is quoted, and only when it has
@@ -861,7 +873,7 @@ const WORKLED_HOOK_SPECS = [
 ];
 
 // Generic, disk-backed hook installer shared by the hook-driven clients
-// (workbuddy: ~/.workbuddy/settings.json, traecode: <home>/.trae-cn/hooks.json).
+// (workbuddy: ~/.workbuddy/settings.json, trae-cn: <home>/.trae-cn/hooks.json).
 // The client marker drives both the generated `--client` command and group
 // matching via the shared merge core, so no path/client is hard-coded here.
 function installWorkledHooks(hooksFile, { client, version, url }) {
@@ -882,7 +894,7 @@ function installWorkledHooks(hooksFile, { client, version, url }) {
 }
 
 // Generic uninstaller that mirrors installWorkledHooks. `allowDeleteFile` lets
-// a dedicated hooks file (traecode) holding nothing but the schema `version` be
+// a dedicated hooks file (trae-cn) holding nothing but the schema `version` be
 // deleted entirely so uninstall leaves nothing behind; it is false for a
 // settings file (workbuddy) that may carry unrelated user settings.
 function uninstallWorkledHooks(hooksFile, { client, allowDeleteFile }) {
@@ -913,7 +925,7 @@ function groupWorkledSpecs() {
 }
 
 // Pure: detect a hook group that belongs to workled for a specific client,
-// matched safely on the client-scoped command (e.g. `--client traecode` or
+// matched safely on the client-scoped command (e.g. `--client trae-cn` or
 // `--client workbuddy`). This single predicate is shared by every client.
 function isClientWorkledGroup(group, client) {
   const marker = `--client ${client}`;
@@ -933,7 +945,7 @@ function isClientWorkledGroup(group, client) {
 // Pure (testable without touching disk): return a NEW hooks config with the
 // workled hook groups for `client` upserted. Any prior workled group for the
 // same client/event is replaced first, unrelated hooks are preserved. A schema
-// `version` is only injected when provided (traecode uses 1; workbuddy does not).
+// `version` is only injected when provided (trae-cn uses 1; workbuddy does not).
 export function mergeClientHooks(cfg, { client, commandForEvent, version }) {
   const out = { ...(cfg || {}) };
   if (typeof version === "number" && typeof out.version !== "number") out.version = version;
@@ -947,7 +959,12 @@ export function mergeClientHooks(cfg, { client, commandForEvent, version }) {
           {
             type: "command",
             command: commandForEvent(ev),
-            timeout: WORKLED_HOOK_TIMEOUT_MS / 1000,
+            // Host-side watchdog cap. The hook now returns immediately (the
+            // actual device send is delegated to a detached `send` child, so the
+            // host never waits on the device link). This cap only needs to cover
+            // node startup + stdin-read overhead + spawning that child; a small
+            // fixed budget is enough and never blocks the prompt.
+            timeout: 5,
           },
         ],
       };
@@ -988,59 +1005,64 @@ export function stripClientHooks(cfg, client) {
 async function installWorkbuddy(mcpEntry) {
   const lines = [];
   lines.push(...(await registerWorkledMcp("workbuddy", mcpEntry)));
-  lines.push(installWorkledHooks(join(h, ".workbuddy", "settings.json"), { client: "workbuddy", url: mcpEntry && mcpEntry.url }));
+  lines.push(installWorkledHooks(joinP(h, ".workbuddy", "settings.json"), { client: "workbuddy", url: mcpEntry && mcpEntry.url }));
   return lines;
 }
 
 async function uninstallWorkbuddy() {
   const lines = [];
   lines.push(...unregisterWorkledMcp("workbuddy"));
-  lines.push(uninstallWorkledHooks(join(h, ".workbuddy", "settings.json"), { client: "workbuddy" }));
+  lines.push(uninstallWorkledHooks(joinP(h, ".workbuddy", "settings.json"), { client: "workbuddy" }));
   return lines;
 }
 
-// TraeCode (VSCode fork) reads a GLOBAL MCP config at <user-data>/User/mcp.json
+// trae-cn (VSCode fork) reads a GLOBAL MCP config at <user-data>/User/mcp.json
 // (the VSCode convention it inherits) for servers shared by every workspace, so
 // the workled MCP server is written there directly. Its lifecycle hooks go to
 // <home>/.trae-cn/hooks.json using the Claude Code-style schema (version 1 +
 // hooks.<Event>[]). Both are therefore wired automatically on install.
-function installTraecode(mcpEntry) {
+function installTraeCn(mcpEntry) {
   return [
-    ...registerWorkledMcp("traecode", mcpEntry),
-    installWorkledHooks(join(traeCodeHooksHome(), "hooks.json"), { client: "traecode", version: 1, url: mcpEntry && mcpEntry.url }),
+    ...registerWorkledMcp("trae-cn", mcpEntry),
+    installWorkledHooks(joinP(traeCnHooksHome(), "hooks.json"), { client: "trae-cn", version: 1, url: mcpEntry && mcpEntry.url }),
   ];
 }
 
-function uninstallTraecode() {
+function uninstallTraeCn() {
   return [
-    ...unregisterWorkledMcp("traecode"),
-    uninstallWorkledHooks(join(traeCodeHooksHome(), "hooks.json"), { client: "traecode", allowDeleteFile: true }),
+    ...unregisterWorkledMcp("trae-cn"),
+    uninstallWorkledHooks(joinP(traeCnHooksHome(), "hooks.json"), { client: "trae-cn", allowDeleteFile: true }),
   ];
 }
 
-// Inverse of removeMcpServer: write the `workled` server entry into one MCP
-// source (JSON or YAML). For JSON, an existing `type` is preserved and a fresh
-// entry is written with the source's default `type` (see MCP_SOURCES), so
-// clients that require an explicit transport declaration (opencode/kilo/
-// workbuddy use "remote") never get a bare `{ url, enabled }` entry that the
-// client would ignore.
-function addMcpServer(source, entry) {
-  if (source.format === "yaml") {
-    return addMcpServerYaml(source.path(), source.key, "workled", entry);
+// Inverse of removeMcpServer: write the `workled` server entry into one
+// client's MCP config (JSON or YAML). For JSON, an existing `type` is
+// preserved and a fresh entry is written with the client's default `type`
+// (see CLIENT_TARGETS.mcpType), so clients that require an explicit transport
+// declaration (opencode/kilo/workbuddy use "remote") never get a bare
+// `{ url, enabled }` entry that the client would ignore.
+function addMcpServer(client, entry) {
+  const t = CLIENT_TARGETS[client];
+  if (!t?.mcpPath) return null;
+  const file = t.mcpPath();
+  const key = t.mcpKey;
+  const format = t.mcpFormat;
+  const defaultType = t.mcpType;
+  if (format === "yaml") {
+    return addMcpServerYaml(file, key, "workled", entry);
   }
-  const file = source.path();
   // A corrupt existing config must never be flattened to {} and written back,
   // or the user's other servers would be lost. Skip the source with a warning
   // instead; a missing file still falls through to creating a fresh entry.
   const raw = existsSync(file) ? readFileSync(file, "utf8") : null;
   if (raw != null && !isValidJsonc(raw)) {
-    return `SKIPPED workled -> ${source.key} (${file}): config file unreadable, not modified`;
+    return `SKIPPED workled -> ${key} (${file}): config file unreadable, not modified`;
   }
   const obj = raw == null ? {} : JSON.parse(stripJsonc(raw));
   const map =
-    obj[source.key] && typeof obj[source.key] === "object"
-      ? obj[source.key]
-      : (obj[source.key] = {});
+    obj[key] && typeof obj[key] === "object"
+      ? obj[key]
+      : (obj[key] = {});
   const existing = map.workled && typeof map.workled === "object" ? map.workled : {};
   // Never downgrade a working URL to the <device-name> placeholder: if the new
   // entry carries the placeholder but an existing real URL is present, keep the
@@ -1048,15 +1070,15 @@ function addMcpServer(source, entry) {
   // unavailable (placeholder path) yet a valid config already exists.
   const url = resolveMergedUrl(existing.url, entry.url);
   const desired = { url, enabled: entry.enabled !== false };
-  // Existing type wins; otherwise fall back to the source's default so fresh
+  // Existing type wins; otherwise fall back to the client's default so fresh
   // installs carry the transport declaration their client requires.
-  const type = resolveMcpType(existing.type, source.type);
+  const type = resolveMcpType(existing.type, defaultType);
   if (type) desired.type = type;
 
   if (raw == null) {
     // No file yet: create a minimal one with just the workled server.
-    writeConfig(file, { [source.key]: { workled: desired } });
-    return `Registered workled -> ${source.key} (${file})`;
+    writeConfig(file, { [key]: { workled: desired } });
+    return `Registered workled -> ${key} (${file})`;
   }
 
   // No-op fast path: the entry already matches. Do not rewrite the file — this
@@ -1066,21 +1088,21 @@ function addMcpServer(source, entry) {
     (existing.enabled === undefined ? true : existing.enabled) === desired.enabled &&
     (existing.type || null) === (desired.type || null);
   if (same) {
-    return `Registered workled -> ${source.key} (${file}) (unchanged)`;
+    return `Registered workled -> ${key} (${file}) (unchanged)`;
   }
 
   // Preferred path: byte-level surgery that preserves user comments, key
   // order, and formatting. Falls back to a full JSON.stringify rewrite only if
   // the layout defeats the editor (the file was already validated as parseable,
   // so the rewrite loses nothing but comments/formatting).
-  const edited = upsertJsoncEntry(raw, source.key, "workled", desired);
+  const edited = upsertJsoncEntry(raw, key, "workled", desired);
   if (edited != null && isValidJsonc(edited)) {
     writeFileSync(file, edited, "utf8");
-    return `Registered workled -> ${source.key} (${file})`;
+    return `Registered workled -> ${key} (${file})`;
   }
   map.workled = desired;
   writeConfig(file, obj);
-  return `Registered workled -> ${source.key} (${file})`;
+  return `Registered workled -> ${key} (${file})`;
 }
 
 // Add (or replace) a `workled` server under a YAML top-level MCP block
@@ -1147,15 +1169,10 @@ function addMcpServerYaml(file, key, serverName, entry) {
 // sources (deduped by path). Mirrors unregisterWorkledMcp so install and
 // uninstall stay symmetric and every client's logic is identical.
 function registerWorkledMcp(client, entry) {
-  const sources = MCP_SOURCES.filter((s) => s.client === client && !s.patchManaged);
-  const seen = new Set();
-  const msgs = [];
-  for (const s of sources) {
-    if (seen.has(s.path())) continue;
-    seen.add(s.path());
-    msgs.push(addMcpServer(s, entry));
-  }
-  return msgs.filter(Boolean);
+  const t = CLIENT_TARGETS[client];
+  if (!t?.mcpPath) return [];
+  const msg = addMcpServer(client, entry);
+  return msg ? [msg] : [];
 }
 
 // ---- per-client install/uninstall -------------------------------------------
@@ -1175,11 +1192,11 @@ const OPENCLAW_PLUGIN_MANIFEST = {
 };
 
 function openclawConfigPath() {
-  return join(h, ".openclaw", "openclaw.json");
+  return joinP(h, ".openclaw", "openclaw.json");
 }
 
 function openclawPluginDir() {
-  return join(h, ".openclaw", "plugins");
+  return joinP(h, ".openclaw", "plugins");
 }
 
 // Load ~/.openclaw/openclaw.json (or {} if missing/unparseable).
@@ -1197,9 +1214,9 @@ function readOpenclawConfig() {
 // openclaw install, manifest + config portion only. The entry file is written
 // by the shared plugin-file path (see the generic loop in main()), which calls
 // this after writing ~/.openclaw/plugins/workled/index.js. Path is single-
-// sourced from CLIENT_TARGETS.openclaw.dest().
+// sourced from CLIENT_TARGETS.openclaw.pluginPath().
 async function installOpenclawManifest() {
-  const dest = CLIENT_TARGETS.openclaw.dest();
+  const dest = CLIENT_TARGETS.openclaw.pluginPath();
   const destDir = dirname(dest);
   // The entry file is already written by the caller; ensure the dir exists for
   // the manifest (idempotent on re-run).
@@ -1207,7 +1224,7 @@ async function installOpenclawManifest() {
 
   // Write plugin manifest (lives in the same plugin dir as the entry file)
   writeFileSync(
-    join(destDir, "openclaw.plugin.json"),
+    joinP(destDir, "openclaw.plugin.json"),
     JSON.stringify(OPENCLAW_PLUGIN_MANIFEST, null, 2) + "\n",
     "utf8"
   );
@@ -1299,7 +1316,7 @@ function stripWorkledFromOpenclawConfig(cfg) {
 }
 
 async function uninstallOpenclaw() {
-  const destDir = join(openclawPluginDir(), "workled");
+  const destDir = joinP(openclawPluginDir(), "workled");
   let msg = "";
   if (existsSync(destDir)) {
     removePath(destDir, { recursive: true });
@@ -1357,7 +1374,7 @@ function entryFile(lines) {
 // opencode: the plugins dir auto-loads EVERY exported function as a plugin, so
 // the installed file exposes a single plugin function that adapts the entry's
 // register() into opencode's factory shape.
-// Dest (CLIENT_TARGETS.opencode.dest()): ~/.config/opencode/plugins/workled.js
+// Dest (CLIENT_TARGETS.opencode.pluginPath()): ~/.config/opencode/plugins/workled.js
 function opencodeEntryFile() {
   return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
@@ -1366,7 +1383,7 @@ function opencodeEntryFile() {
 }
 
 // openclaw: Gateway loads via plugins.load.paths; wraps the entry with the SDK.
-// Dest (CLIENT_TARGETS.openclaw.dest()): ~/.openclaw/plugins/workled/index.js
+// Dest (CLIENT_TARGETS.openclaw.pluginPath()): ~/.openclaw/plugins/workled/index.js
 function openclawEntryFile() {
   return entryFile([
     `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";`,
@@ -1376,7 +1393,7 @@ function openclawEntryFile() {
 }
 
 // pi: extensions take the default export as (pi: ExtensionAPI) => void.
-// Dest (CLIENT_TARGETS.pi.dest()): ~/.pi/agent/extensions/workled/index.ts
+// Dest (CLIENT_TARGETS.pi.pluginPath()): ~/.pi/agent/extensions/workled/index.ts
 function piEntryFile() {
   return entryFile([
     `import { piEntry } from "${fileUrl(corePath)}";`,
@@ -1387,7 +1404,7 @@ function piEntryFile() {
 // kilo (Anomaly) is an opencode fork: Event/Hooks types are identical to
 // opencode, so it reuses opencodeEntry. The installed file is a module
 // descriptor (default export { id, server }) in the single `plugin/` dir.
-// Dest (CLIENT_TARGETS.kilo.dest()): ~/.config/kilo/plugin/workled.js
+// Dest (CLIENT_TARGETS.kilo.pluginPath()): ~/.config/kilo/plugin/workled.js
 function kiloEntryFile() {
   return entryFile([
     `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
@@ -1718,7 +1735,7 @@ function removeHermesAutoAccept(yamlText) {
 }
 
 function installHermes() {
-  const cfg = join(hermesHome(), "config.yaml");
+  const cfg = joinP(hermesHome(), "config.yaml");
   mkdirSync(dirname(cfg), { recursive: true });
   const existing = existsSync(cfg) ? readFileSync(cfg, "utf8") : "";
   const withHooks = installHermesHooks(existing);
@@ -1727,7 +1744,7 @@ function installHermes() {
 }
 
 function uninstallHermes() {
-  const cfg = join(hermesHome(), "config.yaml");
+  const cfg = joinP(hermesHome(), "config.yaml");
   if (!existsSync(cfg)) return `No hermes config at ${cfg}`;
   const content = readFileSync(cfg, "utf8");
   // Remove workled hooks from the hooks block; every other top-level key
@@ -1744,6 +1761,35 @@ function uninstallHermes() {
   }
   writeFileSync(cfg, cleaned, "utf8");
   return `Removed hermes shell hooks -> ${cfg}`;
+}
+
+// ---- Skill directory management ----------------------------------------------
+// Copy the entire workled skill directory to each client's skills/workled
+// directory so status reports the skill field correctly. Re-install overwrites;
+// uninstall removes only the workled directory (leaf directories with other
+// files are left untouched).
+
+function installSkill(client) {
+  const t = CLIENT_TARGETS[client];
+  if (!t?.skillPath) return null;
+  const destDir = t.skillPath();
+  if (!destDir) return null;
+  const srcDir = scriptDir; // project source directory with all skill files
+  if (!existsSync(srcDir)) return null;
+  // Recursively copy entire skill directory
+  cpDir(srcDir, destDir);
+  return `Copied skill directory -> ${destDir}`;
+}
+
+function uninstallSkill(client) {
+  const t = CLIENT_TARGETS[client];
+  if (!t?.skillPath) return null;
+  const destDir = t.skillPath();
+  if (!destDir) return null;
+  if (!existsSync(destDir)) return null;
+  removePath(destDir);
+  removeEmptyParent(dirname(destDir));
+  return `Removed skill directory -> ${destDir}`;
 }
 
 // ---- dsh (DeepSeek Harness) --------------------------------------------------
@@ -1802,8 +1848,10 @@ function splitYamlTopItems(text) {
 function cpDir(src, dest) {
   mkdirSync(dest, { recursive: true });
   for (const entry of readdirSync(src, { withFileTypes: true })) {
-    const s = join(src, entry.name);
-    const d = join(dest, entry.name);
+    // Skip .git directory to avoid permission issues
+    if (entry.name === ".git") continue;
+    const s = joinP(src, entry.name);
+    const d = joinP(dest, entry.name);
     if (entry.isDirectory()) cpDir(s, d);
     else copyFileSync(s, d);
   }
@@ -1814,13 +1862,13 @@ function installDsh() {
   const url = process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
   mkdirSync(home, { recursive: true });
   // A) Install as a proper dsh bundle under the web profile's node_modules.
-  const srcPlugin = join(scriptDir, "dsh-plugin");
-  const dstPlugin = join(home, "profiles", "web", "node_modules", "workled");
+  const srcPlugin = joinP(scriptDir, "dsh-plugin");
+  const dstPlugin = joinP(home, "profiles", "web", "node_modules", "workled");
   cpDir(srcPlugin, dstPlugin);
   // B) Register the bundle in the web profile's package.json.
-  const profileDir = join(home, "profiles", "web");
+  const profileDir = joinP(home, "profiles", "web");
   mkdirSync(profileDir, { recursive: true });
-  const pkgFile = join(profileDir, "package.json");
+  const pkgFile = joinP(profileDir, "package.json");
   const pkg = readJsonOrEmpty(pkgFile) || {};
   if (!pkg.dsh) pkg.dsh = {};
   if (!pkg.dsh.profile) pkg.dsh.profile = {};
@@ -1830,7 +1878,7 @@ function installDsh() {
   }
   writeConfig(pkgFile, pkg);
   // C) Mount plugin in the `web` profile cordis.patch.yml (config override).
-  const patchFile = join(profileDir, "cordis.patch.yml");
+  const patchFile = joinP(profileDir, "cordis.patch.yml");
   const block = dshPatchBlock(url);
   let content = "";
   if (existsSync(patchFile)) content = readFileSync(patchFile, "utf8");
@@ -1847,21 +1895,21 @@ function uninstallDsh() {
   const home = dshHome();
   const removed = [];
   // A) Remove bundle from the web profile's node_modules.
-  const bundleDir = join(home, "profiles", "web", "node_modules", "workled");
+  const bundleDir = joinP(home, "profiles", "web", "node_modules", "workled");
   if (existsSync(bundleDir)) {
     removePath(bundleDir);
     removed.push(`Removed dsh bundle dir ${bundleDir}`);
     removeEmptyParent(dirname(bundleDir));
   }
   // Backward compat: also remove old vendored plugin tree if present.
-  const pluginDir = join(home, "plugins", "workled");
+  const pluginDir = joinP(home, "plugins", "workled");
   if (existsSync(pluginDir)) {
     removePath(pluginDir);
     removed.push(`Removed old dsh plugin dir ${pluginDir}`);
     removeEmptyParent(dirname(pluginDir));
   }
   // B) Unregister bundle from the web profile's package.json.
-  const pkgFile = join(home, "profiles", "web", "package.json");
+  const pkgFile = joinP(home, "profiles", "web", "package.json");
   if (existsSync(pkgFile)) {
     const pkg = readJsonOrEmpty(pkgFile);
     if (pkg && Array.isArray(pkg.dsh?.profile?.bundles)) {
@@ -1874,7 +1922,7 @@ function uninstallDsh() {
     }
   }
   // C) Strip workled rows from the `web` profile cordis.patch.yml.
-  const patchFile = join(home, "profiles", "web", "cordis.patch.yml");
+  const patchFile = joinP(home, "profiles", "web", "cordis.patch.yml");
   if (existsSync(patchFile)) {
     const items = splitYamlTopItems(readFileSync(patchFile, "utf8"));
     const kept = items.filter((it) => !it.some((l) => l.includes("workled")));
@@ -1890,20 +1938,25 @@ function uninstallDsh() {
 // ---- CLI ----------------------------------------------------------------------
 
 // Render one client's --help line from CLIENT_TARGETS: plugin clients use the
-// structured dest/label, the others carry ready-made help text.
+// structured pluginPath/label, the others carry ready-made help text.
 function targetHelp(name) {
   const t = CLIENT_TARGETS[name] ?? CLIENT_TARGETS.default;
-  return t.help || `${t.label} -> ${t.dest()}`;
+  return t.help || `${t.label} -> ${t.pluginPath()}`;
 }
 
 function printHelp() {
   console.log(`workled skill installer
 
 Usage:
-  node skill-install.mjs install|uninstall --client <name>
+  node skill-install.mjs install|uninstall [--client <name>]
+
+  --client <name>   OPTIONAL. The client to (un)install for. Omitted = auto-detect
+                     the running client (reliable on a single-client machine). When
+                     several clients are installed, pass it explicitly — e.g. from an
+                     opencode chat, "install workled in kilocode" → --client kilocode.
+                     The agent knows its own client name and passes it directly.
 
 ${CLIENTS.map((c) => `  ${c.padEnd(10)} ${targetHelp(c)}`).join("\n")}
-  --client   REQUIRED -- the invoking agent passes its own client name
 `);
 }
 
@@ -1920,21 +1973,32 @@ async function main() {
     process.exit(1);
   }
 
-  // Target client resolution: both actions (install AND uninstall) require an
-  // explicit target. The invoking agent passes its own client name.
+  // Target client resolution. An explicit `--client <name>` always wins (this
+  // is also how an agent installs for a DIFFERENT client, e.g. "install
+  // workled in kilocode" from an opencode chat). Omitted --client triggers
+  // auto-detection of the running client — reliable on a single-client
+  // machine; when several clients are installed (ambiguous) detection returns
+  // null and we ask for an explicit --client (the agent already knows its own
+  // name from its system prompt, so it simply passes `--client <its-name>`).
   const clientIdx = args.indexOf("--client");
-  const clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
+  let clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
   if (clientArg && !CLIENTS.includes(clientArg)) {
     console.error(`Unknown client: ${clientArg}\nSupported clients: ${CLIENTS.join(", ")}`);
     process.exit(1);
   }
   if (!clientArg) {
-    console.error(
-      `No target client for ${action}.\n` +
-      `Pass --client <name> to ${action} only your own client.\n` +
-      `Clients: ${CLIENTS.join(", ")}`
-    );
-    process.exit(1);
+    const detected = detectClient();
+    if (!detected) {
+      console.error(
+        `Could not auto-detect the client for \`${action}\`.\n` +
+        `Pass --client <name> to target a specific client (the agent's own name works, e.g. \`--client workbuddy\`).\n` +
+        `Clients: ${CLIENTS.join(", ")}\n` +
+        `Tip: set WORKLED_CLIENT=<name> to pin detection.`
+      );
+      process.exit(1);
+    }
+    clientArg = detected;
+    console.error(`[workled] auto-detected client: ${clientArg}`);
   }
   const targets = [clientArg];
 
@@ -1966,8 +2030,8 @@ async function main() {
       case "kilo":
       case "pi":
       case "openclaw": {
-        const t = CLIENT_TARGETS[c]; // { label, dest } — plugin-file client
-        const dest = t.dest();
+        const t = CLIENT_TARGETS[c]; // { label, pluginPath } — plugin-file client
+        const dest = t.pluginPath();
         const destDir = dirname(dest);
         if (isInstall) {
           mkdirSync(destDir, { recursive: true });
@@ -1979,6 +2043,9 @@ async function main() {
             lines.push(await installOpenclawManifest());
           }
           lines.push(...(await registerWorkledMcp(c, mcpEntry)));
+          // Copy SKILL.md to client's skills directory
+          const skillMsg = installSkill(c);
+          if (skillMsg) lines.push(skillMsg);
         } else {
           if (existsSync(dest)) {
             removePath(dest);
@@ -1993,14 +2060,24 @@ async function main() {
             lines.push(await uninstallOpenclaw());
           }
           lines.push(...unregisterWorkledMcp(c));
+          // Remove SKILL.md from client's skills directory
+          const skillMsg = uninstallSkill(c);
+          if (skillMsg) lines.push(skillMsg);
         }
         break;
       }
       case "hermes": {
         const hh = hermesHome();
         lines.push(isInstall ? installHermes() : uninstallHermes());
-        if (isInstall) lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
-        else lines.push(...unregisterWorkledMcp("hermes"));
+        if (isInstall) {
+          lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
+          const skillMsg = installSkill("hermes");
+          if (skillMsg) lines.push(skillMsg);
+        } else {
+          lines.push(...unregisterWorkledMcp("hermes"));
+          const skillMsg = uninstallSkill("hermes");
+          if (skillMsg) lines.push(skillMsg);
+        }
         break;
       }
       case "dsh": {
@@ -2008,31 +2085,50 @@ async function main() {
         lines.push(isInstall ? installDsh() : uninstallDsh());
         // dsh's MCP + hooks wiring is fully owned by installDsh/uninstallDsh
         // (cordis.patch.yml + workled-hooks.json), so no separate MCP step.
+        if (isInstall) {
+          const skillMsg = installSkill("dsh");
+          if (skillMsg) lines.push(skillMsg);
+        } else {
+          const skillMsg = uninstallSkill("dsh");
+          if (skillMsg) lines.push(skillMsg);
+        }
         break;
       }
       case "workbuddy": {
         // WorkBuddy is a pure-MCP client whose state protocol is enforced by
         // user-level lifecycle hooks (settings.json) rather than by agent
         // discipline; install wires MCP + hooks, uninstall removes both.
-        lines.push(...(isInstall ? await installWorkbuddy(mcpEntry) : await uninstallWorkbuddy()));
+        if (isInstall) {
+          lines.push(...(await installWorkbuddy(mcpEntry)));
+          const skillMsg = installSkill("workbuddy");
+          if (skillMsg) lines.push(skillMsg);
+        } else {
+          lines.push(...(await uninstallWorkbuddy()));
+          const skillMsg = uninstallSkill("workbuddy");
+          if (skillMsg) lines.push(skillMsg);
+        }
         break;
       }
-      case "traecode": {
-        // TraeCode (VSCode fork) reads a GLOBAL MCP config at
+      case "trae-cn": {
+        // trae-cn (VSCode fork) reads a GLOBAL MCP config at
         // <user-data>/User/mcp.json (shared by every workspace) plus lifecycle
         // hooks at <home>/.trae-cn/hooks.json — both are wired automatically.
         // MCP is picked up after a reload; if the URL is the <device-name>
         // placeholder the user must still replace it in Settings → MCP, and the
         // Hooks config needs manual enabling in Settings > Hooks to fire.
         if (isInstall) {
-          lines.push(...installTraecode(mcpEntry));
+          lines.push(...installTraeCn(mcpEntry));
+          const skillMsg = installSkill("trae-cn");
+          if (skillMsg) lines.push(skillMsg);
           lines.push(
-            "TraeCode: MCP written to <user-data>/User/mcp.json (reload to pick it up). Replace <device-name> in Settings → MCP if a placeholder was written, and enable the workled hooks in Settings → Hooks for agent-state tracking."
+            "trae-cn: MCP written to <user-data>/User/mcp.json (reload to pick it up). Replace <device-name> in Settings → MCP if a placeholder was written, and enable the workled hooks in Settings → Hooks for agent-state tracking."
           );
         } else {
-          lines.push(...uninstallTraecode());
+          lines.push(...uninstallTraeCn());
+          const skillMsg = uninstallSkill("trae-cn");
+          if (skillMsg) lines.push(skillMsg);
           lines.push(
-            "TraeCode: workled MCP entry and hooks removed; the server you added via Settings → MCP (if any) stays as you configured it."
+            "trae-cn: workled MCP entry and hooks removed; the server you added via Settings → MCP (if any) stays as you configured it."
           );
         }
         break;

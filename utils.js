@@ -32,22 +32,22 @@ export function dshHome() {
   return join(homedir(), ".dsh");
 }
 
-// Resolve TraeCode's global Hooks config directory. TraeCode is a VSCode fork;
+// Resolve trae-cn's global Hooks config directory. trae-cn is a VSCode fork;
 // its global Hooks (Settings > Hooks) live in a `.trae-cn` folder under the
 // user's home directory — distinct from the per-edition user-data dir
 // (%APPDATA%\Trae CN etc.). Windows uses %userprofile%/.trae-cn/hooks.json;
 // macOS/Linux use ~/.trae-cn/hooks.json.
-export function traeCodeHooksHome() {
+export function traeCnHooksHome() {
   return join(homedir(), ".trae-cn");
 }
 
-// Resolve TraeCode's per-user data dir, where its GLOBAL MCP config lives at
-// <dir>/User/mcp.json (the VSCode convention TraeCode inherits). Tools in that
+// Resolve trae-cn's per-user data dir, where its GLOBAL MCP config lives at
+// <dir>/User/mcp.json (the VSCode convention trae-cn inherits). Tools in that
 // file are shared by every workspace, mirroring a Settings > MCP "global"
 // entry. Windows uses %APPDATA%\Trae CN; macOS/Linux use the platform config
-// dir. Note: TraeCode HTTP-type MCP servers are declared bare `{ url,
+// dir. Note: trae-cn HTTP-type MCP servers are declared bare `{ url,
 // enabled }` here — no `type` field.
-export function traeCodeUserDir() {
+export function traeCnUserDir() {
   if (process.platform === "win32") {
     return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "Trae CN");
   }

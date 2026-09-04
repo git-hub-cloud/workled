@@ -18,118 +18,196 @@
 //   WORKLED_MCP_URL env -> opencode config (mcp.*.url).
 
 import { homedir } from "os";
-import { join, resolve } from "path";
+import { join, resolve, dirname } from "path";
 import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome, sleep, dshHome, traeCodeUserDir } from "./utils.js";
+import { stripJsonc, hermesHome, sleep, dshHome, traeCnUserDir, traeCnHooksHome } from "./utils.js";
 
 const HOME = homedir();
+
+// Normalize an absolute path to forward slashes so emitted commands and the
+// status report read identically on Windows and POSIX. A Windows backslash
+// path (`C:\Users\...`) would otherwise (a) differ across platforms and
+// (b) break when the byte is parsed by a cross-shell command runner.
+export function toPosix(p) {
+  return String(p).split(/[\\/]+/).join("/");
+}
 const execFileAsync = promisify(execFile);
-
-// Single source of truth for the MCP config files each client keeps its MCP
-// servers in. Used by loadMcpServers() here and by the uninstall cleanup in
-// skill-install.mjs, so the client list and config paths cannot drift.
-//
-//   client  - "<name>" identifier (e.g., "opencode", "kilo")
-//   key     - top-level key that holds the server map (mcp / mcpServers); the
-//             hermes YAML reader resolves "mcp_servers" internally
-//   format  - json (JSONC tolerated via stripJsonc) | yaml
-//   path    - resolved lazily so $HERMES_HOME is always read at call time,
-//             never frozen at load.
-//   type    - default `type` written for a fresh workled MCP entry; only set
-//             for clients that require an explicit transport declaration
-//             (opencode/kilo/workbuddy use "remote"). Clients that infer the
-//             transport from `url` (openclaw, pi, hermes) omit it.
-export const MCP_SOURCES = [
-  // opencode
-  { client: "opencode", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "opencode", "opencode.json") },
-  // kilo
-  { client: "kilo", key: "mcp", format: "json", type: "remote", path: () => join(HOME, ".config", "kilo", "kilo.json") },
-  // openclaw
-  { client: "openclaw", key: "mcp", format: "json", path: () => join(HOME, ".openclaw", "openclaw.json") },
-  // pi
-  { client: "pi", key: "mcp", format: "json", path: () => join(HOME, ".pi", "mcp.json") },
-  // workbuddy (JSON, mcpServers key, ~/.workbuddy/mcp.json; Claude Code
-  // compatible, so remote servers declare type: "remote")
-  { client: "workbuddy", key: "mcpServers", format: "json", type: "remote", path: () => join(HOME, ".workbuddy", "mcp.json") },
-  // hermes (YAML)
-  { client: "hermes", key: "mcp_servers", format: "yaml", path: () => join(hermesHome(), "config.yaml") },
-  // dsh (DeepSeek Harness): workled is installed as a proper bundle under
-  // <dsh-home>/profiles/web/node_modules/workled/, registered in the web
-  // profile's package.json dsh.profile.bundles, with a config-override row
-  // in cordis.patch.yml (id: workled, name: workled, config: {url, timeout,
-  // enabled}). format: "dsh-patch" triggers the dedicated parser in loadMcpServers
-  // that extracts config.url + enabled.
-  { client: "dsh", key: "mcp", format: "dsh-patch", path: () => join(dshHome(), "profiles", "web", "cordis.patch.yml") },
-  // traecode (VSCode fork): global MCP config at <user-data>/User/mcp.json
-  // (the VSCode convention TraeCode inherits). HTTP-type workled server is
-  // declared bare `{ url, enabled }` — no `type` field. The lifecycle hooks
-  // live separately in ~/.trae-cn/hooks.json (see skill-install.mjs).
-  { client: "traecode", key: "mcpServers", format: "json", path: () => join(traeCodeUserDir(), "User", "mcp.json") },
-];
-
-// Every client the skill installs to. `status` accepts an optional
-// `--client <name>` filter that must be one of these. Derived from MCP_SOURCES
-// so it stays in sync: to add a client, extend MCP_SOURCES above and add the
-// matching install/uninstall branch in skill-install.mjs + SKILL.md.
-export const CLIENTS = [...new Set(MCP_SOURCES.map((s) => s.client.split(".")[0]))];
 
 // Per-client install targets — the single source of truth for where each
 // client's workled integration lives. skill-install.mjs derives both the
 // `--help` text and the plugin-file install logic from it, so a client's
-// paths are maintained exactly once. Keys match CLIENTS (itself derived from
-// MCP_SOURCES); `default` is the fallback used by --help.
+// paths are maintained exactly once. `default` is the fallback used by --help.
 //
-//   plugin clients (opencode/kilo/pi/openclaw): carry `dest` + `label`;
-//     install = write generated entry file to dest. openclaw additionally
-//     needs a plugin manifest + openclaw.json registration (owned by
-//     installOpenclawManifest() in skill-install.mjs), but its entry file is
-//     generated by the same shared path as the others.
-//   other clients: carry only free-form `help` text (their install logic is
-//     bespoke and lives in skill-install.mjs).
+// Each real client entry carries:
+//   mcpPath    - MCP config file path (lazy, so env-derived dirs are fresh)
+//   mcpKey     - top-level key holding the server map (mcp / mcpServers / mcp_servers)
+//   mcpFormat  - "json" (JSONC tolerated) | "yaml" | "dsh-patch"
+//   mcpType    - default `type` for a fresh entry; only for clients requiring
+//                explicit transport declaration (opencode/kilo/workbuddy)
+//   existMcp   - probe: config file exists AND mentions "workled"
+//   pluginPath - where the plugin/hooks artifact lives
+//   existPlugin- probe: artifact is actually installed
+//   sigDir     - signature dir for detectClient() fallback
+//   skillPath  - where SKILL.md lives for this client
+//   existSkill - probe: SKILL.md exists in skillPath
+//   label/help - for --help rendering
 export const CLIENT_TARGETS = {
   opencode: {
     label: "plugin",
-    dest: () => join(HOME, ".config", "opencode", "plugins", "workled.js"),
+    mcpPath: () => join(HOME, ".config", "opencode", "opencode.json"),
+    mcpKey: "mcp",
+    mcpFormat: "json",
+    mcpType: "remote",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(HOME, ".config", "opencode", "plugins", "workled.js"),
+    existPlugin: (p) => existsSync(p),
+    sigDir: () => join(HOME, ".config", "opencode"),
+    skillPath: () => join(HOME, ".config", "opencode", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   kilo: {
     label: "plugin",
-    dest: () => join(HOME, ".config", "kilo", "plugin", "workled.js"),
+    mcpPath: () => join(HOME, ".config", "kilo", "kilo.json"),
+    mcpKey: "mcp",
+    mcpFormat: "json",
+    mcpType: "remote",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(HOME, ".config", "kilo", "plugin", "workled.js"),
+    existPlugin: (p) => existsSync(p),
+    sigDir: () => join(HOME, ".config", "kilo"),
+    skillPath: () => join(HOME, ".config", "kilo", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   openclaw: {
     label: "plugin",
-    // The entry file lives in a plugin dir (workled/) next to the plugin
-    // manifest (openclaw.plugin.json) and the openclaw.json registration. The
-    // entry itself is written by the shared plugin-file path (like opencode /
-    // kilo / pi); the manifest + config registration is owned by
-    // installOpenclawManifest() in skill-install.mjs.
-    dest: () => join(HOME, ".openclaw", "plugins", "workled", "index.js"),
+    mcpPath: () => join(HOME, ".openclaw", "openclaw.json"),
+    mcpKey: "mcp",
+    mcpFormat: "json",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(HOME, ".openclaw", "plugins", "workled", "index.js"),
+    existPlugin: (p) => existsSync(p) && existsSync(join(dirname(p), "openclaw.plugin.json")),
+    sigDir: () => join(HOME, ".openclaw"),
+    skillPath: () => join(HOME, ".openclaw", "workspace", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   hermes: {
     help: "hooks  -> <hermes-home>/config.yaml (~/.hermes on unix, %LOCALAPPDATA%\\hermes on Windows)",
+    mcpPath: () => join(hermesHome(), "config.yaml"),
+    mcpKey: "mcp_servers",
+    mcpFormat: "yaml",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(hermesHome(), "config.yaml"),
+    existPlugin: (p) => fileContains(p, "workled"),
+    sigDir: () => hermesHome(),
+    skillPath: () => join(hermesHome(), "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   pi: {
     label: "extension",
-    dest: () => join(HOME, ".pi", "agent", "extensions", "workled", "index.ts"),
+    mcpPath: () => join(HOME, ".pi", "mcp.json"),
+    mcpKey: "mcp",
+    mcpFormat: "json",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(HOME, ".pi", "agent", "extensions", "workled", "index.ts"),
+    existPlugin: (p) => existsSync(p),
+    sigDir: () => join(HOME, ".pi"),
+    skillPath: () => join(HOME, ".pi", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   workbuddy: {
     help: "mcp    -> ~/.workbuddy/mcp.json (mcpServers.workled)   + SKILL.md (protocol already loaded)",
+    mcpPath: () => join(HOME, ".workbuddy", "mcp.json"),
+    mcpKey: "mcpServers",
+    mcpFormat: "json",
+    mcpType: "remote",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(HOME, ".workbuddy", "settings.json"),
+    existPlugin: (p) => fileContains(p, "workled"),
+    sigDir: () => join(HOME, ".workbuddy"),
+    skillPath: () => join(HOME, ".workbuddy", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   dsh: {
     help: "plugin -> <dsh-home>/profiles/web/node_modules/workled (bundle) + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP)",
+    mcpPath: () => join(dshHome(), "profiles", "web", "cordis.patch.yml"),
+    mcpKey: "mcp",
+    mcpFormat: "dsh-patch",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(dshHome(), "profiles", "web", "node_modules", "workled"),
+    existPlugin: (p) => existsSync(p) && fileContains(join(dshHome(), "profiles", "web", "cordis.patch.yml"), "workled"),
+    sigDir: () => dshHome(),
+    skillPath: () => join(dshHome(), "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
-  traecode: {
+  "trae-cn": {
     help: "mcp    -> <user-data>/User/mcp.json (global mcpServers.workled) + hooks -> ~/.trae-cn/hooks.json",
+    mcpPath: () => join(traeCnUserDir(), "User", "mcp.json"),
+    mcpKey: "mcpServers",
+    mcpFormat: "json",
+    existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
+    pluginPath: () => join(traeCnHooksHome(), "hooks.json"),
+    existPlugin: (p) => fileContains(p, "workled"),
+    sigDir: () => join(HOME, ".trae-cn"),
+    skillPath: () => join(HOME, ".trae-cn", "skills", "workled"),
+    existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   default: {
     help: "installed (targets: see SKILL.md)",
   },
 };
 
-const DEFAULT_RPC_TIMEOUT_MS = 5000;
-const DEFAULT_MAX_ATTEMPTS = 3;
+// Every client the skill installs to, derived from CLIENT_TARGETS keys.
+// `status` accepts an optional `--client <name>` filter that must be one of
+// these. To add a client, add a new key to CLIENT_TARGETS above and the matching
+// install/uninstall branch in skill-install.mjs + SKILL.md.
+export const CLIENTS = Object.keys(CLIENT_TARGETS).filter((k) => k !== "default");
+
+// Best-effort detection of the client running this agent, used when no
+// explicit `--client` is passed to the installer or `status`. Layered so a
+// single-client dev box resolves cleanly, while a box with many stale client
+// configs falls back to an explicit `--client` (the reliable cross-client
+// path). Returns a CLIENTS member, or null when ambiguous.
+//
+// NOTE: on a machine where several clients have all been installed, every
+// client's signature dir / workled MCP entry is present, so detection is
+// necessarily ambiguous — callers must then require `--client` (the agent
+// already knows its own client name from its system prompt, so it simply
+// passes `--client <its-name>`).
+export function detectClient() {
+  // 1) Manual override (also lets an agent pass its own name via env).
+  if (process.env.WORKLED_CLIENT && CLIENTS.includes(process.env.WORKLED_CLIENT.trim())) {
+    return process.env.WORKLED_CLIENT.trim();
+  }
+  // 2) The client(s) already configured with a workled MCP entry are the
+  //    strongest "this is my client" signal.
+  const configured = [
+    ...new Set(loadMcpServers().filter((s) => s.name === "workled").map((s) => s.client)),
+  ];
+  if (configured.length === 1) return configured[0];
+  // 3) Fall back to signature dirs; if exactly one exists, that's the client.
+  const byDir = CLIENTS.filter((c) => {
+    const d = CLIENT_TARGETS[c]?.sigDir?.();
+    return d && existsSync(d);
+  });
+  if (byDir.length === 1) return byDir[0];
+  // 4) Ambiguous — caller must pass --client.
+  return null;
+}
+
+// Cheap substring probe used by CLIENT_TARGETS.*.pluginPath(); never throws.
+function fileContains(path, needle) {
+  try {
+    return readFileSync(path, "utf8").includes(needle);
+  } catch {
+    return false;
+  }
+}
+
+const DEFAULT_RPC_TIMEOUT_MS = 10000;
+const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_RETRY_DELAY_MS = 500;
 const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -181,22 +259,22 @@ export function resolveMcpType(existingType, defaultType) {
   return null;
 }
 
-// Pure decision for the status hint. The traecode install writes the workled
+// Pure decision for the status hint. The trae-cn install writes the workled
 // server into the GLOBAL MCP config (<user-data>/User/mcp.json), so MCP needs
 // only a reload — unless the URL is the <device-name> placeholder, which the
 // user must still replace. The lifecycle hooks are written to
 // <home>/.trae-cn/hooks.json but must also be enabled manually in
-// Settings → Hooks to fire. Returns the reminder text when the traecode client
-// is in scope (the user filtered to it, or a traecode entry is present),
+// Settings → Hooks to fire. Returns the reminder text when the trae-cn client
+// is in scope (the user filtered to it, or a trae-cn entry is present),
 // otherwise "". Accepts an optional list of scanned client entries so a
-// traecode entry can also trigger the reminder.
-export function traecodeReminderText({ clientPrefix = null, clients = [] } = {}) {
-  const traecodeFilter = !clientPrefix || String(clientPrefix).startsWith("traecode");
-  const hasTraecodeEntry =
+// trae-cn entry can also trigger the reminder.
+export function traeCnReminderText({ clientPrefix = null, clients = [] } = {}) {
+  const traeCnFilter = !clientPrefix || String(clientPrefix).startsWith("trae-cn");
+  const hasTraeCnEntry =
     Array.isArray(clients) &&
-    clients.some((c) => c && c.client && String(c.client).startsWith("traecode"));
-  if (!(traecodeFilter || hasTraecodeEntry)) return "";
-  return "traecode: verify the device-name in Settings → MCP (reload to pick up the config) and enable the workled hooks in Settings → Hooks for agent-state tracking.";
+    clients.some((c) => c && c.client && String(c.client).startsWith("trae-cn"));
+  if (!(traeCnFilter || hasTraeCnEntry)) return "";
+  return "trae-cn: verify the device-name in Settings → MCP (reload to pick up the config) and enable the workled hooks in Settings → Hooks for agent-state tracking.";
 }
 
 function sleepWithJitter(baseMs, attempt) {
@@ -294,28 +372,23 @@ function stripValue(v) {
   return v;
 }
 
-// Scan every MCP_SOURCES entry and return the MCP servers it declares, each
-// tagged with its source (client.scope + path).
+// Scan every client's MCP config (via CLIENT_TARGETS) and return the MCP
+// servers it declares, each tagged with its source (client + path).
 function loadMcpServers() {
   const servers = [];
-  for (const s of MCP_SOURCES) {
-    if (s.patchManaged) continue; // legacy mark; superseded by bespoke parsers
-    const srcPath = s.path();
-    if (s.format === "dsh-patch") {
-      // dsh bespoke parser: cordis.patch.yml top-level YAML array. Look for a
-      // `- insert:` block whose descendent rows contain `- id: workled`, then
-      // extract `config: {url, enabled}` scalar fields. Also probe the
-      // vendored plugin dir to report install status.
+  for (const client of CLIENTS) {
+    const t = CLIENT_TARGETS[client];
+    if (!t?.mcpPath) continue;
+    const srcPath = t.mcpPath();
+    const format = t.mcpFormat;
+    const key = t.mcpKey;
+    if (format === "dsh-patch") {
       const pluginDir = join(dshHome(), "plugins", "workled");
       const pluginInstalled = existsSync(pluginDir) && existsSync(join(pluginDir, "src", "index.js"));
       if (!existsSync(srcPath)) {
-        // Even when no patch file exists, surface a "ghost" workled entry so
-        // diagnoseStatus can distinguish "patch missing (not installed)" from
-        // "no workled entry in patch". pluginInstalled=false below doubles as
-        // the install signal.
         servers.push({
           name: "workled",
-          client: s.client,
+          client,
           path: srcPath,
           server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: false },
         });
@@ -327,7 +400,7 @@ function loadMcpServers() {
         if (parsed) {
           servers.push({
             name: "workled",
-            client: s.client,
+            client,
             path: srcPath,
             server: {
               url: parsed.url,
@@ -340,7 +413,7 @@ function loadMcpServers() {
         } else {
           servers.push({
             name: "workled",
-            client: s.client,
+            client,
             path: srcPath,
             server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: true, _dshWorkledRow: false },
           });
@@ -353,12 +426,12 @@ function loadMcpServers() {
     if (!existsSync(srcPath)) continue;
     try {
       const text = readFileSync(srcPath, "utf8");
-      const parsed = s.format === "yaml" ? mcpServersFromYaml(text) : JSON.parse(stripJsonc(text));
-      const m = s.format === "yaml" || !parsed || typeof parsed !== "object" ? parsed : parsed[s.key];
+      const parsed = format === "yaml" ? mcpServersFromYaml(text) : JSON.parse(stripJsonc(text));
+      const m = format === "yaml" || !parsed || typeof parsed !== "object" ? parsed : parsed[key];
       if (m && typeof m === "object") {
         for (const [name, server] of Object.entries(m)) {
           if (server && typeof server === "object") {
-            servers.push({ name, client: s.client, path: srcPath, server });
+            servers.push({ name, client, path: srcPath, server });
           }
         }
       }
@@ -962,11 +1035,11 @@ function setAgentState(state) {
   }
 }
 
-// CLI hook mode: wait until the queue drains so the short-lived process does
+// CLI send mode: wait until the queue drains so the background process does
 // not exit before the MCP call completes. Timeout after 15s to avoid hanging
 // the process if the sender loop is stuck.
 // Returns a promise that resolves with { state, sent, error } for the last state.
-const FLUSH_TIMEOUT_MS = 15000; // must exceed WORKLED_HOOK_TIMEOUT_MS so the host's hook budget never truncates an in-flight send
+const FLUSH_TIMEOUT_MS = 15000;
 async function flushState() {
   // If nothing pending and not running, return immediately
   if (pendingState === null && !senderRunning) {
@@ -1266,9 +1339,9 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 // otherwise it is a no-op. PostToolUse maps to "thinking" — after any tool
 // returns the agent resumes working, so the LED returns to the working state.
 //
-// NOTE (TraeCode & WorkBuddy, both verified effective): PreToolUse AND
+// NOTE (trae-cn & WorkBuddy, both verified effective): PreToolUse AND
 // PostToolUse for AskUserQuestion fire as expected in BOTH engines. The
-// earlier "only-on-answer" behavior seen in TraeCode no longer reproduces.
+// earlier "only-on-answer" behavior seen in trae-cn no longer reproduces.
 // The agent still lights "waiting" itself BEFORE rendering a question for
 // robustness (see SKILL.md). The only render-time hook signal hosts offer is
 // Notification, which fires when a permission/approval dialog is SHOWN
@@ -1363,11 +1436,6 @@ function resolveHookState(event, payload) {
   return target;
 }
 
-// Single shared hook timeout budget (milliseconds), used directly by the internal
-// flush cap below. skill-install.mjs converts it to seconds for the host's hook
-// `timeout` in settings.json. This is the one tunable for the whole hook budget.
-export const WORKLED_HOOK_TIMEOUT_MS = 10000;
-
 async function runHookMode() {
   try {
     const argv = process.argv.slice(2);
@@ -1403,51 +1471,27 @@ async function runHookMode() {
     }
     const state = resolveHookState(event, payload);
     if (state) {
-      setAgentState(state);
-      // The timeout timer must be clearable so the hook process exits as soon
-      // as the state send settles. Without the clearTimeout below the ref'd
-      // timer keeps the event loop alive for the full WORKLED_HOOK_TIMEOUT_MS,
-      // which makes the host (WorkBuddy) treat every hook as timed out and
-      // block the user prompt (HookBlockedError).
-      let timeoutTimer = null;
-      try {
-        const result = await Promise.race([
-          flushState().then((r) => {
-            if (timeoutTimer) clearTimeout(timeoutTimer);
-            return r;
-          }),
-          new Promise((resolve) => {
-            timeoutTimer = setTimeout(
-              () => resolve({ state, sent: false, superseded: false, timeout: true }),
-              WORKLED_HOOK_TIMEOUT_MS
-            );
-          }),
-        ]);
-        if (!result.sent && !result.superseded && !result.timeout) {
-          console.warn(`[workled] hook: state ${result.state} not sent: ${result.error && result.error.message}`);
-        }
-      } catch (err) {
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        console.warn(`[workled] hook flush error: ${err && err.message}`);
-      }
+      // Non-blocking: delegate the actual device send to a detached background
+      // process (the `send` subcommand). The current hook process returns
+      // immediately, so the host never waits on the device link — an
+      // unreachable/congested device can no longer stall or time out the host's
+      // tool call or prompt. The background send reuses the exact same
+      // plugin-style send loop, bounded by DEFAULT_RPC_TIMEOUT_MS and
+      // DEFAULT_MAX_ATTEMPTS, so hooks and plugin clients now share one logic
+      // path and one timeout budget.
+      spawn(process.execPath, [process.argv[1], "send", state], {
+        detached: true,
+        stdio: "ignore",
+      }).unref();
     }
   } catch (err) {
     // Never propagate: the hook process must always exit cleanly (stdout {}
     // + status 0) so the host's tool call is never denied or delayed.
     console.warn(`[workled] hook error: ${err && err.message}`);
   } finally {
-    // Always print an empty JSON object so the hook never blocks or denies.
-    // Do NOT hard-exit while a state send may still be in flight: process.exit
-    // would abort the in-flight HTTP request before the device receives it
-    // (the first call after a fresh process is a single stateless
-    // tools/call, which still exceeds the flush cap because of node startup
-    // latency). Let the event loop drain — the
-    // pending socket keeps the process alive until the send settles — then exit.
+    // Always print an empty JSON object so the hook never blocks or denies,
+    // then let the process exit naturally.
     process.stdout.write("{}\n");
-    // Bounded safety net: if the host keeps stdin open (or some socket never
-    // settles) the process would otherwise hang forever. This cap is far beyond
-    // the flush budget so it never truncates a legitimate in-flight send.
-    setTimeout(() => process.exit(0), FLUSH_TIMEOUT_MS + 5000).unref();
   }
 }
 
@@ -1526,15 +1570,18 @@ async function runStatusMode() {
   const entries = [];
   const envUrl = process.env.WORKLED_MCP_URL;
   if (envUrl) {
-    // WORKLED_MCP_URL override wins and is reported first.
-    entries.push({ client: "env", path: "WORKLED_MCP_URL", enabled: true, url: envUrl });
+    // WORKLED_MCP_URL override wins and is reported first. It is a synthetic
+    // override entry (not an installable client), so it carries only the
+    // fields that matter for diagnostics: url + reachable. Skip enabled /
+    // mcp / plugin / skill — those only make sense for real clients.
+    entries.push({ client: "env", path: "WORKLED_MCP_URL", url: envUrl });
   }
   for (const s of loadMcpServers()) {
     if (s.name !== "workled") continue;
     if (clientPrefix && !s.client.startsWith(clientPrefix)) continue;
     const entry = {
       client: s.client,
-      path: s.path,
+      path: toPosix(s.path),
       enabled: s.server.enabled !== false,
       url: s.server.url || null,
     };
@@ -1583,7 +1630,7 @@ async function runStatusMode() {
   // concurrently; per-URL retries (up to 3 with backoff) stay inside
   // probeReachable. Keeps `status` fast when many clients share configs.
   const urls = [
-    ...new Set(entries.filter((e) => e.url && e.enabled).map((e) => e.url)),
+    ...new Set(entries.filter((e) => e.url && e.enabled !== false).map((e) => e.url)),
   ];
   log(`probing ${urls.length} unique URL(s)...`);
   const results = new Map(
@@ -1592,17 +1639,24 @@ async function runStatusMode() {
   log("URL probes finished");
 
   out.clients = entries.map((e) => {
-    const probe = e.url && e.enabled ? results.get(e.url) : null;
+    // env override entries carry no `enabled`; treat absent as enabled (true).
+    const enabled = e.enabled !== false;
+    const probe = e.url && enabled ? results.get(e.url) : null;
     const entry = {
       client: e.client,
-      path: e.path,
-      enabled: e.enabled,
-      url: e.url,
-      reachable: !!(probe && probe.reachable),
+      mcpUrlReachable: !!(probe && probe.reachable),
     };
+    if (e.client === "env") {
+      // Synthetic WORKLED_MCP_URL override: report the URL under the variable
+      // name itself, since there is no config file (and thus no mcpPath /
+      // mcpEnable) behind it — only the URL and its reachability matter.
+      entry.WORKLED_MCP_URL = e.url;
+    } else {
+      entry.mcpPath = toPosix(e.path);
+      entry.mcpUrl = e.url;
+      if (e.enabled !== undefined) entry.mcpEnable = e.enabled;
+    }
     if (probe && probe.error) entry.error = probe.error;
-    // Which attempt (1-based) succeeded, or how many were tried when failing.
-    if (probe && probe.attempt) entry.attempt = probe.attempt;
     // dsh-only install metadata: plugin vendored / patch file exists / workled
     // row is present. Plain entries (JSON/YAML) omit these.
     for (const k of ["_dshPluginInstalled", "_dshPatchExists", "_dshWorkledRow"]) {
@@ -1611,7 +1665,31 @@ async function runStatusMode() {
     return entry;
   });
 
-  if (out.clients.some((c) => c.reachable)) {
+  // ---- per-client install status: merge skill / plugin into clients -------
+  // A functional client must have a workled MCP server configured — that is
+  // how the agent calls the device (the generated plugin/hooks only add
+  // lifecycle lighting). `out.clients` therefore already holds only MCP-
+  // configured clients (from loadMcpServers). Here we enrich each with the
+  // actual installed artifact paths: its plugin/hooks (plugin) and the workled
+  // skill dir (skill). Pure filesystem probe — does not touch the device.
+  const detectedClient = detectClient();
+
+  for (const entry of out.clients) {
+    // The synthetic "env" entry (WORKLED_MCP_URL) is not an installable
+    // client — it carries no config-file-backed mcpEnable, and plugin/skill
+    // are meaningless for it, so leave it to just the MCP url fields above.
+    if (entry.client === "env") continue;
+    entry.mcpEnable = entry.mcpEnable !== false;
+    entry.mcpConfig = !!(entry.mcpEnable !== false && entry.mcpUrl);
+    // plugin / skill: pure path + separate existence probe. Symmetric.
+    const t = CLIENT_TARGETS[entry.client];
+    const pPath = t?.pluginPath?.();
+    entry.plugin = pPath && t.existPlugin(pPath) ? toPosix(pPath) : null;
+    const sPath = t?.skillPath?.();
+    entry.skill = sPath && t.existSkill(sPath) ? toPosix(sPath) : null;
+  }
+
+  if (out.clients.some((c) => c.mcpUrlReachable)) {
     out.ok = true;
     out.exitCode = 0;
     if (bluetooth && bluetooth.available === true && !bluetooth.devicePaired) {
@@ -1632,9 +1710,9 @@ async function runStatusMode() {
         "hooks — some agents need to manually enable hooks (e.g. Settings -> Hooks); " +
         "DNS — on Windows mDNS is unstable, so in the MCP config prefer a static IP over the .local hostname to avoid intermittent -32001 timeouts.";
     }
-  } else if (out.clients.some((c) => c.enabled === false)) {
+  } else if (out.clients.some((c) => c.mcpConfig && c.mcpEnable === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
-  } else if (out.clients.some((c) => !c.url)) {
+  } else if (out.clients.some((c) => c.mcpConfig && !c.mcpUrl)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
   } else {
     if (bluetooth && bluetooth.available === false) {
@@ -1646,6 +1724,25 @@ async function runStatusMode() {
       }
       out.hint = hint;
     }
+  }
+
+  // Clients that should be wired but aren't: configured clients missing their
+  // plugin, plus the running client if it has no MCP config at all (it can't
+  // call the device until a full install runs).
+  // Only real, installable clients count — the synthetic "env" pseudo-entry
+  // (from WORKLED_MCP_URL) is not something `install --client` can target.
+  const unwired = out.clients.filter((e) => !e.plugin && CLIENTS.includes(e.client));
+  if (detectedClient && !out.clients.some((c) => c.client === detectedClient)) {
+    unwired.push({ client: detectedClient, plugin: null });
+  }
+  if (unwired.length > 0) {
+    const target = detectedClient && unwired.some((e) => e.client === detectedClient)
+      ? detectedClient
+      : unwired[0].client;
+    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    const cmd = `node ${JSON.stringify(toPosix(join(scriptDir, "skill-install.mjs")))} install --client ${target}`;
+    const list = unwired.map((e) => e.client).join(", ");
+    out.hint += ` wiring — not installed for: ${list}; run: ${cmd}`;
   }
 
   out.duration_ms = Date.now() - startedAt;
@@ -1678,6 +1775,20 @@ if (process.argv[1]) {
         console.warn(`[workled] status error: ${err && err.message}`);
         process.exitCode = 1;
       });
+    } else if (sub === "send") {
+      // Background send mode (invoked as a detached child of runHookMode):
+      // enqueue the state via the plugin-style sender loop and let the event
+      // loop drain naturally. No hard exit — process.exit would abort the
+      // in-flight HTTP request before the device receives it. The rpc() timeout
+      // (DEFAULT_RPC_TIMEOUT_MS) plus DEFAULT_MAX_ATTEMPTS guarantee this
+      // process eventually terminates even against an unreachable device.
+      const state = process.argv[3];
+      if (!state) {
+        console.error(`[workled] send requires a state argument.`);
+        process.exitCode = 2;
+      } else {
+        setAgentState(state);
+      }
     } else {
       console.error(`[workled] unknown subcommand: "${sub}".`);
       process.exitCode = 2;
