@@ -93,8 +93,9 @@ for (let cycle = 1; cycle <= 3; cycle++) {
     ok("install command exits cleanly", false, e.message);
   }
 
-  // Check install output mentions plugin + patch
-  ok("install output mentions plugin dir", installOut.includes("plugin"), installOut.trim());
+  // Check install output reports the installed bundle path (dsh uses the
+  // "bundle" wording, unlike the plugin-file clients).
+  ok("install output reports bundle path", /Installed dsh bundle/.test(installOut), installOut.trim());
 
   // Check plugin tree
   ok("plugin dir exists", existsSync(PLUGIN_DIR));

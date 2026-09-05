@@ -61,6 +61,7 @@ export const CLIENT_TARGETS = {
     mcpKey: "mcp",
     mcpFormat: "json",
     mcpType: "remote",
+    mcpTimeoutMs: 10000,
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".config", "opencode", "plugins", "workled.js"),
     existPlugin: (p) => existsSync(p),
@@ -74,6 +75,7 @@ export const CLIENT_TARGETS = {
     mcpKey: "mcp",
     mcpFormat: "json",
     mcpType: "remote",
+    mcpTimeoutMs: 10000,
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".config", "kilo", "plugin", "workled.js"),
     existPlugin: (p) => existsSync(p),
@@ -84,7 +86,17 @@ export const CLIENT_TARGETS = {
   openclaw: {
     label: "plugin",
     mcpPath: () => join(HOME, ".openclaw", "openclaw.json"),
-    mcpKey: "mcp",
+    // OpenClaw nests its OpenClaw-managed MCP servers under mcp.servers (not
+    // directly under `mcp`), and a remote server declares `transport` rather
+    // than `type`. mcpNestedPath marks the container the workled server map
+    // lives in so write/read/remove all target mcp.servers.<name>.
+    mcpNestedPath: ["mcp", "servers"],
+    mcpTransport: "streamable-http",
+    // openclaw bundle-mcp defaults tool-listing timeout to 1500ms when
+    // requestTimeoutMs is absent; a network MCP server (mDNS + HTTP) can
+    // take >1s just for DNS. Set 10s so the initial tools/list doesn't
+    // race the deadline.
+    mcpRequestTimeoutMs: 10000,
     mcpFormat: "json",
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".openclaw", "plugins", "workled", "index.js"),
@@ -98,6 +110,8 @@ export const CLIENT_TARGETS = {
     mcpPath: () => join(hermesHome(), "config.yaml"),
     mcpKey: "mcp_servers",
     mcpFormat: "yaml",
+    mcpConnectTimeoutSeconds: 10,
+    mcpTimeoutSeconds: 10,
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(hermesHome(), "config.yaml"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -123,6 +137,11 @@ export const CLIENT_TARGETS = {
     mcpKey: "mcpServers",
     mcpFormat: "json",
     mcpType: "remote",
+    // No mcpTimeoutMs here: WorkBuddy's remote MCP client resolves a configured
+    // timeout as Math.max(60000, configured) and caps the connect handshake at
+    // 60s, so any value <= 60000 is a no-op and shorter values are unreachable.
+    // Emitting `timeout` would only advertise a knob that does not exist.
+    // (Read out of the client bundle 2026-09-05.)
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".workbuddy", "settings.json"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -147,6 +166,7 @@ export const CLIENT_TARGETS = {
     mcpPath: () => join(traeCnUserDir(), "User", "mcp.json"),
     mcpKey: "mcpServers",
     mcpFormat: "json",
+    mcpHeaderTimeoutMs: 10000,
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(traeCnHooksHome(), "hooks.json"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -158,6 +178,22 @@ export const CLIENT_TARGETS = {
     help: "installed (targets: see SKILL.md)",
   },
 };
+
+// Normalise every path a CLIENT_TARGETS accessor returns to POSIX ("/") so
+// install/status echoes stay uniform on Windows, matching the installer's
+// joinP. Only string responses containing a backslash are rewritten; booleans,
+// labels, and relative config strings pass through untouched.
+for (const clientName of Object.keys(CLIENT_TARGETS)) {
+  const target = CLIENT_TARGETS[clientName];
+  for (const k of Object.keys(target)) {
+    if (typeof target[k] !== "function") continue;
+    const fn = target[k];
+    target[k] = (...args) => {
+      const v = fn(...args);
+      return typeof v === "string" && v.includes("\\") ? toPosix(v) : v;
+    };
+  }
+}
 
 // Every client the skill installs to, derived from CLIENT_TARGETS keys.
 // `status` accepts an optional `--client <name>` filter that must be one of
@@ -410,14 +446,11 @@ function loadMcpServers() {
               _dshPatchExists: true,
             },
           });
-        } else {
-          servers.push({
-            name: "workled",
-            client,
-            path: srcPath,
-            server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: true, _dshWorkledRow: false },
-          });
         }
+        // No `workled` row in the patch (e.g. after uninstall leaves the file
+        // behind): push nothing, mirroring the JSON/YAML clients whose config
+        // carries no `workled` key. Reporting such a placeholder as a configured
+        // server made `status` show a phantom "dsh not installed" hint.
       } catch {
         /* unreadable patch file: skip */
       }
@@ -427,7 +460,17 @@ function loadMcpServers() {
     try {
       const text = readFileSync(srcPath, "utf8");
       const parsed = format === "yaml" ? mcpServersFromYaml(text) : JSON.parse(stripJsonc(text));
-      const m = format === "yaml" || !parsed || typeof parsed !== "object" ? parsed : parsed[key];
+      // JSON server map location: default is the client's top-level mcpKey;
+      // a client with mcpNestedPath (e.g. openclaw: mcp.servers) walks down
+      // that container path first, then treats the last segment as the map.
+      let m;
+      if (format !== "yaml" && parsed && typeof parsed === "object" && t.mcpNestedPath) {
+        let node = parsed;
+        for (const seg of t.mcpNestedPath) node = node && typeof node === "object" ? node[seg] : undefined;
+        m = node;
+      } else {
+        m = format === "yaml" || !parsed || typeof parsed !== "object" ? parsed : parsed[key];
+      }
       if (m && typeof m === "object") {
         for (const [name, server] of Object.entries(m)) {
           if (server && typeof server === "object") {
@@ -1197,6 +1240,10 @@ export const openclawEntry = {
   description:
     "Maps OpenClaw agent lifecycle events (thinking/idle/waiting/error) to the workled MCP set_agent_state tool driving the LED strip.",
   register(api) {
+    // True while an input tool (AskUserQuestion / confirm / ...) is awaiting
+    // the user's answer, so we can recover to "thinking" once it replies.
+    let lastWasInput = false;
+
     // Inbound user message starts a turn -> thinking.
     api.on("before_agent_run", async (event, ctx) => {
       try {
@@ -1216,9 +1263,29 @@ export const openclawEntry = {
           (event && (event.toolName || event.tool || event.name)) || "";
         if (isInputTool(name)) {
           setAgentState("waiting");
+          lastWasInput = true;
+        } else if (lastWasInput) {
+          // A previous input tool (waiting) has been answered and a regular
+          // tool now runs -> thinking (defensive recovery for ordered flows).
+          setAgentState("thinking");
+          lastWasInput = false;
         }
       } catch (err) {
         console.warn(`[workled] before_tool_call hook error: ${err && err.message}`);
+      }
+    });
+
+    // An input tool (AskUserQuestion) returned -> the user answered, resume
+    // thinking. OpenClaw fires this after the tool resolves (before the next
+    // agent step), which is the reliable recovery point out of "waiting".
+    api.on("after_tool_call", async (event) => {
+      try {
+        if (lastWasInput) {
+          setAgentState("thinking");
+          lastWasInput = false;
+        }
+      } catch (err) {
+        console.warn(`[workled] after_tool_call hook error: ${err && err.message}`);
       }
     });
 
@@ -1342,10 +1409,12 @@ export default { register: openclawEntry.register, activate: openclawEntry.regis
 // NOTE (trae-cn & WorkBuddy, both verified effective): PreToolUse AND
 // PostToolUse for AskUserQuestion fire as expected in BOTH engines. The
 // earlier "only-on-answer" behavior seen in trae-cn no longer reproduces.
-// The agent still lights "waiting" itself BEFORE rendering a question for
-// robustness (see SKILL.md). The only render-time hook signal hosts offer is
-// Notification, which fires when a permission/approval dialog is SHOWN
-// (resolved via payload.notification_type, see "notification" below).
+// The installer therefore wires PreToolUse(matcher: AskUserQuestion) so a plain
+// question lights "waiting" automatically as it is shown, and the matching
+// PostToolUse returns the LED to "thinking" once the user answers — no
+// agent-side set_agent_state call is needed. Notification remains the signal
+// for approval dialogs (resolved via payload.notification_type, see
+// "notification" below).
 const HOOK_MAP = {
   // WorkBuddy (Claude Code-compatible hooks in ~/.workbuddy/settings.json)
   UserPromptSubmit: "thinking",

@@ -1,26 +1,14 @@
 ---
 name: workled
-description: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, waiting, error). Use when connected to a workled device, controlling the agent state indicator, or configuring touch macros."
-description_zh: "通过 MCP 控制 workled 指示灯与触控宏，在每次智能体状态切换（思考/等待/空闲/错误）时同步灯效"
-description_en: "MUST call set_agent_state via MCP on each agent state transition (thinking, idle, waiting, error). Use when connected to a workled device, controlling the agent state indicator, or configuring touch macros."
-version: "0.1.16"
+description: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
+description_zh: "Agent 状态：`thinking`（思考中）、`waiting`（等待响应）、`idle`（空闲）、`error`（异常报错），可经由 MCP 协议自动同步至 workled 设备；同时支持通过 MCP 协议对设备的灯效、触控宏进行配置。"
+description_en: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
+version: "0.1.17"
 display_name: "workled"
 display_name_en: "workled"
 ---
 
 # workled MCP Controller
-
-## Mandatory State Protocol
-
-Call `set_agent_state` via MCP on every state transition. The MCP server name
-varies by host — look for the server whose tools include *set_agent_state* in the block of the system prompt.
-
-| State | When |
-|-------|------|
-| `thinking` | First tool call of every reply; user submits a message |
-| `waiting` | **Call BEFORE asking the user for input** — before invoking an input tool (`AskUserQuestion`/`question`/`ask`/`confirm`), before opening a client-side modal, and before rendering a plain-text choice list / multi-option question. |
-| `idle` | Turn finished; session torn down |
-| `error` | Runtime error / failed tool call occurred |
 
 ## MCP Tool Reference
 
@@ -58,8 +46,11 @@ Rule of thumb: hue 0-359 picks the hue, saturation 0-255 (0 = white/pastel, 255 
 
 ## Troubleshooting
 
-If the device is not responding, run `node <skill-dir>/index.js status`
-and follow the JSON `hint` it prints.
+If the device is not responding, or automatic state lighting stays dark, run
+`node <skill-dir>/index.js status` and follow the JSON `hint` it prints. A
+configured client whose `plugin`/hooks are missing shows up there — re-run the
+installer (`skill-install.mjs install --client <name>`) to wire the automatic
+lighting.
 
 ## Reference
 

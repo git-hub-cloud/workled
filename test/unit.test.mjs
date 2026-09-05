@@ -224,7 +224,7 @@ test("drainFlushPromisesForState settles a state=null (drain) waiter on any stat
 // only the trae-cn-scoped workled groups. Both are pure and disk-free.
 
 // Every event in WORKLED_HOOK_SPECS should be present after a fresh merge.
-const SPEC_EVENTS = ["UserPromptSubmit", "Stop", "Notification", "PostToolUse"];
+const SPEC_EVENTS = ["UserPromptSubmit", "Stop", "Notification", "PreToolUse", "PostToolUse"];
 const cmdFor = (e) => `node workled hook --event ${e} --client trae-cn`;
 const mergeTraeCn = (cfg) => mergeClientHooks(cfg, { client: "trae-cn", commandForEvent: cmdFor, version: 1 });
 const stripTraeCn = (cfg) => stripClientHooks(cfg, "trae-cn");
@@ -305,6 +305,10 @@ test("mergeClientHooks('trae-cn') embeds matchers for the Notification events", 
   const matchers = merged.hooks.Notification.map((g) => g.matcher);
   assert.ok(matchers.includes("permission_prompt"));
   assert.ok(matchers.includes("idle_prompt"));
+  // PreToolUse is restricted to AskUserQuestion so a question lights "waiting"
+  // automatically without spawning a process on every other tool call.
+  const pre = merged.hooks.PreToolUse.map((g) => g.matcher);
+  assert.ok(pre.includes("AskUserQuestion"));
   // PostToolUse is restricted to AskUserQuestion so the hook does not spawn a
   // process on every tool call.
   const post = merged.hooks.PostToolUse.map((g) => g.matcher);

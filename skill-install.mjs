@@ -749,6 +749,11 @@ function removeMcpServer(client) {
     const candidates = [key, ...MCP_KEY_CANDIDATES.filter((k) => k !== key)];
     return removeMcpServerYaml(file, candidates);
   }
+  // Nested-container client (openclaw): remove workled from the nested map via
+  // a clean object round-trip, then prune any emptied container segments.
+  if (t.mcpNestedPath) {
+    return removeMcpServerNested(client, t);
+  }
   if (!existsSync(file)) return null;
   const raw = readFileSync(file, "utf8");
   if (!isValidJsonc(raw)) return null;
@@ -771,6 +776,46 @@ function removeMcpServer(client) {
     }
   }
   return `Removed workled from ${key} -> ${file}`;
+}
+
+// Remove the `workled` server from a nested-container client (openclaw) and
+// prune empty container segments (e.g. mcp.servers, then mcp) so uninstall
+// leaves no `{}` shells behind. Object round-trip on clean JSON. Returns null
+// when no workled entry existed.
+function removeMcpServerNested(client, t) {
+  const file = t.mcpPath();
+  if (!existsSync(file)) return null;
+  let obj;
+  try {
+    obj = JSON.parse(stripJsonc(readFileSync(file, "utf8")));
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  // Walk to the server map; any missing segment means no workled entry.
+  let map = obj;
+  for (const seg of t.mcpNestedPath) {
+    if (!map[seg] || typeof map[seg] !== "object") return null;
+    map = map[seg];
+  }
+  if (!map.workled) return null;
+  delete map.workled;
+  // Prune emptied container segments bottom-up: once a level's map is empty,
+  // drop that key from its parent and move up. Stop at the first level that
+  // still holds entries — nothing above it can have been emptied by us.
+  const segs = [...t.mcpNestedPath];
+  for (let i = segs.length - 1; i >= 0; i--) {
+    let holder = obj; // object that directly owns segs[i]
+    for (let k = 0; k < i; k++) holder = holder[segs[k]];
+    const child = holder[segs[i]];
+    if (child && typeof child === "object" && Object.keys(child).length === 0) {
+      delete holder[segs[i]];
+    } else {
+      break;
+    }
+  }
+  writeConfig(file, obj);
+  return `Removed workled from ${t.mcpNestedPath.join(".")} -> ${file}`;
 }
 
 // Remove a top-level <key> entry (the whole `"key": {...}`) from raw JSONC
@@ -853,20 +898,25 @@ export function workledHookCommand(eventName, client, url) {
 // every tool call — a bare PreToolUse hook would spawn a ~3.6s process per
 // Bash/Read/Write and stall the agent.
 //
-// AskUserQuestion timing (WorkBuddy/CodeBuddy): PreToolUse AND PostToolUse for
-// AskUserQuestion both fire at the moment the USER ANSWERS, not when the dialog
-// is rendered. A PreToolUse hook would therefore light "waiting" AFTER the user
-// already confirmed — exactly backwards — so it is intentionally NOT installed.
-// The AskUserQuestion wait window is lit by the agent calling
-// set_agent_state("waiting") itself BEFORE rendering the question (SKILL.md).
-// Notification is the only render-time hook: permission_prompt fires when a
-// tool approval dialog is SHOWN -> waiting; idle_prompt fires after ~60s of
-// session idle -> idle (fallback if Stop did not fire).
+// AskUserQuestion timing (WorkBuddy/CodeBuddy, verified in index.js): the host
+// fires PreToolUse AND PostToolUse for AskUserQuestion at the correct moments
+// — the earlier "only-on-answer" behavior no longer reproduces. So the
+// PreToolUse matcher below lights "waiting" as the question is shown and the
+// PostToolUse matcher returns the LED to "thinking" once the user answers; no
+// agent-side set_agent_state call is required for a plain question.
+// Notification is the render-time signal for approval dialogs:
+// permission_prompt fires when a tool approval dialog is SHOWN -> waiting;
+// idle_prompt fires after ~60s of session idle -> idle (fallback if Stop did
+// not fire).
 const WORKLED_HOOK_SPECS = [
   { event: "UserPromptSubmit", matcher: null },
   { event: "Stop", matcher: null },
   { event: "Notification", matcher: "permission_prompt" },
   { event: "Notification", matcher: "idle_prompt" },
+  // PreToolUse maps to "tool" (HOOK_MAP): restricted to AskUserQuestion it
+  // lights "waiting" as the question is rendered, without spawning a process
+  // on every other tool call.
+  { event: "PreToolUse", matcher: "AskUserQuestion" },
   // PostToolUse maps to "thinking" (HOOK_MAP) so answering an AskUserQuestion
   // returns the LED to the working state; it fires when the user answers.
   { event: "PostToolUse", matcher: "AskUserQuestion" },
@@ -1051,6 +1101,13 @@ function addMcpServer(client, entry) {
   if (format === "yaml") {
     return addMcpServerYaml(file, key, "workled", entry);
   }
+  // Nested-container client (e.g. openclaw: server map lives at mcp.servers and
+  // a remote server declares `transport` rather than `type`). Such files are
+  // clean JSON, so a plain object round-trip is safe and far simpler than the
+  // top-level JSONC surgery used below.
+  if (t.mcpNestedPath) {
+    return addMcpServerNested(client, t, entry);
+  }
   // A corrupt existing config must never be flattened to {} and written back,
   // or the user's other servers would be lost. Skip the source with a warning
   // instead; a missing file still falls through to creating a fresh entry.
@@ -1070,6 +1127,18 @@ function addMcpServer(client, entry) {
   // unavailable (placeholder path) yet a valid config already exists.
   const url = resolveMergedUrl(existing.url, entry.url);
   const desired = { url, enabled: entry.enabled !== false };
+  // Per-client request timeout on the server entry: opencode/kilo take a
+  // `timeout` (ms); trae-cn reads HTTP headers set by its client. workbuddy
+  // intentionally declares none: its client clamps config timeouts to a 60s
+  // floor, so the field would be a no-op.
+  if (t.mcpTimeoutMs) desired.timeout = t.mcpTimeoutMs;
+  if (t.mcpHeaderTimeoutMs) {
+    desired.headers = {
+      ...(existing.headers || {}),
+      START_MCP_TIMEOUT_MS: String(t.mcpHeaderTimeoutMs),
+      RUN_MCP_TIMEOUT_MS: String(t.mcpHeaderTimeoutMs),
+    };
+  }
   // Existing type wins; otherwise fall back to the client's default so fresh
   // installs carry the transport declaration their client requires.
   const type = resolveMcpType(existing.type, defaultType);
@@ -1077,7 +1146,8 @@ function addMcpServer(client, entry) {
 
   if (raw == null) {
     // No file yet: create a minimal one with just the workled server.
-    writeConfig(file, { [key]: { workled: desired } });
+    map.workled = desired;
+    writeConfig(file, { [key]: map });
     return `Registered workled -> ${key} (${file})`;
   }
 
@@ -1086,7 +1156,9 @@ function addMcpServer(client, entry) {
   const same =
     existing.url === desired.url &&
     (existing.enabled === undefined ? true : existing.enabled) === desired.enabled &&
-    (existing.type || null) === (desired.type || null);
+    (existing.type || null) === (desired.type || null) &&
+    (existing.timeout ?? null) === (desired.timeout ?? null) &&
+    (existing.headers?.START_MCP_TIMEOUT_MS ?? null) === (desired.headers?.START_MCP_TIMEOUT_MS ?? null);
   if (same) {
     return `Registered workled -> ${key} (${file}) (unchanged)`;
   }
@@ -1105,10 +1177,56 @@ function addMcpServer(client, entry) {
   return `Registered workled -> ${key} (${file})`;
 }
 
+// Write/update the `workled` server inside a client whose server map lives at
+// a nested path (CLIENT_TARGETS.mcpNestedPath), e.g. openclaw -> mcp.servers.
+// A remote server there uses `transport` (default streamable-http), not `type`.
+// The container file is clean JSON, so we round-trip the whole object.
+function addMcpServerNested(client, t, entry) {
+  const file = t.mcpPath();
+  const label = t.mcpNestedPath.join(".");
+  let obj = {};
+  if (existsSync(file)) {
+    try {
+      obj = JSON.parse(stripJsonc(readFileSync(file, "utf8")));
+    } catch {
+      return `SKIPPED workled -> ${label} (${file}): config file unreadable, not modified`;
+    }
+    if (!obj || typeof obj !== "object") obj = {};
+  }
+  // Walk down / create the container path; the last segment is the server map.
+  let map = obj;
+  for (const seg of t.mcpNestedPath) {
+    if (!map[seg] || typeof map[seg] !== "object") map[seg] = {};
+    map = map[seg];
+  }
+  const existing = map.workled && typeof map.workled === "object" ? map.workled : {};
+  const url = resolveMergedUrl(existing.url, entry.url);
+  const transport = t.mcpTransport || "streamable-http";
+  const desired = {
+    url,
+    enabled: entry.enabled !== false,
+    transport: existing.transport || transport,
+  };
+  if (t.mcpRequestTimeoutMs) {
+    desired.requestTimeoutMs = t.mcpRequestTimeoutMs;
+  }
+  const same =
+    existing.url === desired.url &&
+    (existing.enabled === undefined ? true : existing.enabled) === desired.enabled &&
+    (existing.transport || null) === desired.transport &&
+    (existing.requestTimeoutMs || null) === (desired.requestTimeoutMs || null);
+  if (same) {
+    return `Registered workled -> ${label}.workled (${file}) (unchanged)`;
+  }
+  map.workled = desired;
+  writeConfig(file, obj);
+  return `Registered workled -> ${label}.workled (${file})`;
+}
+
 // Add (or replace) a `workled` server under a YAML top-level MCP block
 // (`mcp_servers:` or an aliased key). Preserves every other server and the
 // block's indentation.
-function addMcpServerYaml(file, key, serverName, entry) {
+function addMcpServerYaml(file, key, serverName, entry, t) {
   if (!existsSync(file)) return null;
   let content = readFileSync(file, "utf8");
   const split = splitTopLevelBlock(content, key);
@@ -1117,6 +1235,9 @@ function addMcpServerYaml(file, key, serverName, entry) {
     `    url: ${JSON.stringify(entry.url)}`,
     `    enabled: true`,
   ];
+  // hermes: tool-call and connect/tool-list trends are separate seconds fields.
+  if (t?.mcpTimeoutSeconds) serverLines.push(`    timeout: ${t.mcpTimeoutSeconds}`);
+  if (t?.mcpConnectTimeoutSeconds) serverLines.push(`    connect_timeout: ${t.mcpConnectTimeoutSeconds}`);
   if (!split) {
     const trimmed = content.trimEnd();
     content = (trimmed ? trimmed + "\n" : "") + `${key}:\n` + serverLines.join("\n") + "\n";
@@ -1158,6 +1279,8 @@ function addMcpServerYaml(file, key, serverName, entry) {
   out.push(`${sIndent}${serverName}:`);
   out.push(`${sIndent}  url: ${JSON.stringify(entry.url)}`);
   out.push(`${sIndent}  enabled: true`);
+  if (t?.mcpTimeoutSeconds) out.push(`${sIndent}  timeout: ${t.mcpTimeoutSeconds}`);
+  if (t?.mcpConnectTimeoutSeconds) out.push(`${sIndent}  connect_timeout: ${t.mcpConnectTimeoutSeconds}`);
   const before = lines.slice(0, split.start);
   const after = lines.slice(split.end);
   content = [...before, ...out, ...after].join("\n").replace(/\n{3,}/g, "\n\n");
@@ -1803,20 +1926,14 @@ function uninstallSkill(client) {
 //   2. drives the workled LED BY DIRECT HTTP to the workled MCP endpoint
 //      (tools/call set_agent_state JSON-RPC POST), no shell hop, no hook CLI.
 
-// cordis.patch.yml config-override block: the plugin is installed as a proper
-// bundle under <dsh-home>/profiles/web/node_modules/workled/, so the profile
-// patch only overrides the bundle's config (url / timeout / enabled). The
-// bundle's own patch.yml inserts the entry with name 'workled'; this overlay
-// finds it by id and patches config.
-function dshPatchBlock(url) {
-  return [
-    "- id: workled",
-    "  name: workled",
-    "  config:",
-    `    url: '${url}'`,
-    "    timeout: 1500",
-    "    enabled: true",
-  ].join("\n");
+// Write the real device url into the copied bundle patch.yml in place (plan B:
+// no separate cordis.patch.yml override layer — the bundle carries the real
+// config). When WORKLED_MCP_URL is unset the bundle's placeholder url is kept.
+function patchBundleUrl(patchYmlPath, url) {
+  if (!existsSync(patchYmlPath)) return;
+  let text = readFileSync(patchYmlPath, "utf8");
+  const out = text.replace(/url:\s*'[^']*'/, `url: '${url}'`);
+  if (out !== text) writeFileSync(patchYmlPath, out, "utf8");
 }
 
 // Split a YAML top-level array (rows starting with `- ` at column 0) into
@@ -1865,6 +1982,8 @@ function installDsh() {
   const srcPlugin = joinP(scriptDir, "dsh-plugin");
   const dstPlugin = joinP(home, "profiles", "web", "node_modules", "workled");
   cpDir(srcPlugin, dstPlugin);
+  // A2) Write the real device url into the copied bundle patch.yml in place.
+  patchBundleUrl(joinP(dstPlugin, "patch.yml"), url);
   // B) Register the bundle in the web profile's package.json.
   const profileDir = joinP(home, "profiles", "web");
   mkdirSync(profileDir, { recursive: true });
@@ -1877,18 +1996,7 @@ function installDsh() {
     pkg.dsh.profile.bundles.push("workled");
   }
   writeConfig(pkgFile, pkg);
-  // C) Mount plugin in the `web` profile cordis.patch.yml (config override).
-  const patchFile = joinP(profileDir, "cordis.patch.yml");
-  const block = dshPatchBlock(url);
-  let content = "";
-  if (existsSync(patchFile)) content = readFileSync(patchFile, "utf8");
-  const items = splitYamlTopItems(content);
-  const kept = items.filter((it) => !it.some((l) => l.includes("workled")));
-  const rows = (items.prelude || []).filter((l) => l.trim() !== "[]").concat(kept);
-  rows.push(block.split("\n"));
-  const written = rows.flat().join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
-  writeFileSync(patchFile, written, "utf8");
-  return `Installed dsh bundle -> ${dstPlugin}\nInstalled dsh profile patch -> ${patchFile}`;
+  return `Installed dsh bundle -> ${dstPlugin}`;
 }
 
 function uninstallDsh() {
@@ -1921,7 +2029,9 @@ function uninstallDsh() {
       removed.push(`Removed workled from ${pkgFile}`);
     }
   }
-  // C) Strip workled rows from the `web` profile cordis.patch.yml.
+  // C) Backward compat: strip any legacy workled rows a pre-"plan B" install
+  // left in the `web` profile cordis.patch.yml (the override layer no longer
+  // exists — the bundle carries the real url in its own patch.yml now).
   const patchFile = joinP(home, "profiles", "web", "cordis.patch.yml");
   if (existsSync(patchFile)) {
     const items = splitYamlTopItems(readFileSync(patchFile, "utf8"));
@@ -1937,26 +2047,19 @@ function uninstallDsh() {
 
 // ---- CLI ----------------------------------------------------------------------
 
-// Render one client's --help line from CLIENT_TARGETS: plugin clients use the
-// structured pluginPath/label, the others carry ready-made help text.
-function targetHelp(name) {
-  const t = CLIENT_TARGETS[name] ?? CLIENT_TARGETS.default;
-  return t.help || `${t.label} -> ${t.pluginPath()}`;
-}
-
 function printHelp() {
   console.log(`workled skill installer
 
 Usage:
   node skill-install.mjs install|uninstall [--client <name>]
 
-  --client <name>   OPTIONAL. The client to (un)install for. Omitted = auto-detect
-                     the running client (reliable on a single-client machine). When
-                     several clients are installed, pass it explicitly — e.g. from an
-                     opencode chat, "install workled in kilocode" → --client kilocode.
-                     The agent knows its own client name and passes it directly.
+Options:
+  --client <name>   Target client. Omitted = auto-detect. Pass it explicitly
+                    when several clients are installed (e.g. "install workled
+                    in kilocode" → --client kilocode).
 
-${CLIENTS.map((c) => `  ${c.padEnd(10)} ${targetHelp(c)}`).join("\n")}
+Clients:
+  ${CLIENTS.join(", ")}
 `);
 }
 

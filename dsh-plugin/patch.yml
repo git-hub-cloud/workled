@@ -3,11 +3,12 @@
 - insert:
     - id: workled
       name: 'workled'
-      # Config is overridden by the profile's cordis.patch.yml / env vars.
-      # WORKLED_MCP_URL wins on every call; the url field is a fallback.
+      # Plan B: the bundle carries the real config directly; no cordis.patch.yml
+      # override layer. WORKLED_MCP_URL env still wins on every call; url is the
+      # fallback host.
       config:
         url: 'http://<device-name>.local:18791/mcp'
         # How long to wait for a workled HTTP call before giving up (ms).
-        timeout: 1500
+        timeout: 10000
         # Set to false to disable the plugin at boot without uninstalling.
         enabled: true
