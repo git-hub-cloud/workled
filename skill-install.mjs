@@ -1937,6 +1937,13 @@ function installSkill(client) {
   if (!existsSync(srcDir)) return null;
   // Recursively copy entire skill directory
   cpDir(srcDir, destDir);
+  // A copy that silently wrote nothing still used to report success, which
+  // left a dangling entry point: the user then ran `node <dest>/index.js`
+  // against a file that was never created. Verify the one file every entry
+  // point needs before claiming the copy worked.
+  if (!existsSync(joinP(destDir, "index.js"))) {
+    throw new Error(`skill copy produced no index.js at ${joinP(destDir, "index.js")}`);
+  }
   return `Copied skill directory -> ${destDir}`;
 }
 
@@ -2182,6 +2189,105 @@ Clients:
 `);
 }
 
+// ============================================================
+// Post-install self-check
+// ============================================================
+
+// Run the status diagnostic for the clients this run touched and print a short
+// human-readable summary, so a finished install answers "did the wiring land?"
+// (MCP entry + skill dir + plugin/hooks + device reach) without a manual
+// `node index.js status`.
+//
+// Best-effort by design: a slow, blocked or failing diagnostic must never
+// change the install's exit code. Every failure path ends in a one-line note.
+async function runPostInstallStatus(client, corePath) {
+  // Long enough for the Bluetooth + URL probes (which retry) but short enough
+  // that a hung child never stalls the install. Overridable for slow networks.
+  const timeoutMs = Number(process.env.WORKLED_STATUS_TIMEOUT_MS) || 10000;
+  // `--client` keeps the scan to this client, so unrelated configs never add
+  // probe time or noise.
+  const args = [corePath, "status", "--client", client];
+
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+
+  try {
+    const { spawn } = await import("child_process");
+    // process.execPath (not a bare "node"): the check then works even when the
+    // user's PATH has no Node entry (e.g. an IDE-managed runtime).
+    const proc = spawn(process.execPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    proc.stdout.on("data", (c) => { stdout += c; });
+    proc.stderr.on("data", (c) => { stderr += c; });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill();
+    }, timeoutMs);
+    await new Promise((done) => {
+      proc.on("close", done);
+      proc.on("error", done);
+    });
+    clearTimeout(timer);
+  } catch (err) {
+    console.log(`   (status diagnostic could not start: ${err && err.message})`);
+    return;
+  }
+
+  if (timedOut) {
+    console.log(
+      `   (status diagnostic timed out after ${timeoutMs}ms - re-run \`node index.js status --client ${client}\`)`
+    );
+    return;
+  }
+
+  let status;
+  try {
+    status = JSON.parse(stdout);
+  } catch {
+    // No parseable report: surface the child's own progress log rather than
+    // failing silently — that is the only clue left about what went wrong.
+    const tail = stderr.trim().split(/\r?\n/).slice(-3).join("\n     ");
+    console.log(
+      "   (status diagnostic returned no report)" + (tail ? `\n     ${tail}` : "")
+    );
+    return;
+  }
+
+  // `--client` still leaves the synthetic WORKLED_MCP_URL entry in the report;
+  // it is not an installable client, so it has no install state to show.
+  const entries = (status.clients || []).filter(
+    (e) => e.client !== "env" && e.client.startsWith(client)
+  );
+
+  console.log("");
+  console.log("Status check:");
+  if (entries.length === 0) {
+    console.log(`   no workled server reported for: ${client}`);
+  } else {
+    // Aligned columns so the three install surfaces read at a glance.
+    // "-" = not applicable for this client (it has no such artifact).
+    const head = ["client", "mcp", "skill", "plugin", "reachable"];
+    const rows = entries.map((e) => [
+      e.client,
+      e.mcpConfig ? "yes" : "no",
+      e.skill ? "yes" : "-",
+      e.plugin ? "yes" : "-",
+      e.mcpUrlReachable ? "yes" : "no",
+    ]);
+    const width = head.map((c, i) =>
+      Math.max(c.length, ...rows.map((r) => String(r[i]).length))
+    );
+    const line = (r) =>
+      "   " + r.map((v, i) => String(v).padEnd(width[i])).join("  ");
+    console.log(line(head));
+    for (const r of rows) console.log(line(r));
+  }
+  if (status.hint) console.log(`   ${status.hint}`);
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
@@ -2196,9 +2302,12 @@ async function main() {
   }
 
   // Target client resolution. An explicit `--client <name>` always wins.
-  // Omitted --client triggers auto-detection via process environment signatures,
-  // existing MCP config, or signature directories. If ambiguous or no signal,
-  // we require an explicit --client.
+  // Omitted --client triggers auto-detection: layer 1 reads process-injected
+  // env vars that are NOT present in the OS persistent env (system-level
+  // leftovers like a registry HERMES_HOME are ignored, so they never cause a
+  // false hermes match), layer 2 looks for a unique client whose MCP config
+  // already mentions workled, layer 3 looks for a unique signature dir. If
+  // ambiguous or no signal, we require an explicit --client.
   const clientIdx = args.indexOf("--client");
   let clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
   if (clientArg && !CLIENTS.includes(clientArg)) {
@@ -2327,6 +2436,18 @@ async function main() {
                 "  Approve the OS permission prompt to continue; declining aborts the install.\n"
               );
               if (runElevated()) {
+                // Do not trust the elevated run's exit code on its own: a UAC
+                // prompt that is blocked, auto-denied or silently dismissed can
+                // still surface as 0 while nothing was written (observed: a
+                // non-existent DSH_HOME reported "installed" and exited 0).
+                // Re-probe the same paths and only claim success when they are
+                // genuinely writable now.
+                const after = checkWriteAccess(standardPaths);
+                if (!after.ok) {
+                  throw new Error(
+                    `dsh standard path still not writable after the elevated run: ${after.path} (${after.code})`
+                  );
+                }
                 lines.push("dsh: installed by the elevated run above.");
                 break;
               }
@@ -2413,64 +2534,32 @@ async function main() {
   // deliberately left untouched — the tool never deletes user-visible
   // backup files.
 
-  // After install, run status check ONLY for the client that was just installed.
-  // This avoids noise from unrelated clients (e.g. dsh diagnostic when installing pi).
-  // NOTE: In sandboxed environments (e.g. DSH workspace-write mode), the status
-  // check may hang if it tries to access network resources or blocked paths.
-  // We skip it when DSH_HOME is not set (indicating we're in a sandbox).
-  if (action === "install" && !process.env.DSH_HOME) {
-    // Run status check to see if MCP is configured (best-effort, may fail in sandbox)
-    try {
-      const { spawn } = await import("child_process");
-      // Use process.execPath (the same Node this installer runs under) instead
-      // of a bare "node": the status check then works even when the user's PATH
-      // has no Node entry (e.g. invoked through an IDE-managed runtime).
-      // Pass --client so status only reports on the target client.
-      const statusArgs = [corePath, "status", "--client", targets[0]];
-      const statusProc = spawn(process.execPath, statusArgs, {
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      });
-
-      let statusOutput = "";
-      statusProc.stdout.on("data", (chunk) => { statusOutput += chunk; });
-      statusProc.stderr.on("data", () => { /* swallow stderr to avoid noise */ });
-
-      // Wait for completion with a short timeout (3s)
-      const statusTimeout = setTimeout(() => {
-        statusProc.kill();
-      }, 3000);
-
-      await new Promise((resolve) => {
-        statusProc.on("close", resolve);
-        statusProc.on("error", resolve);
-      });
-
-      clearTimeout(statusTimeout);
-
-      if (statusOutput) {
-        try {
-          const status = JSON.parse(statusOutput);
-          // status.ok = false means device unreachable, NOT "not configured".
-          // "Not configured" = no workled entries at all (clients.length === 0).
-          if (status.clients && status.clients.length === 0) {
-            console.log("");
-            console.log("⚠ WORKLED MCP SERVER NOT CONFIGURED");
-            console.log("   Please add the MCP server to your client config:");
-            console.log("   See device_setup.md for instructions.");
-          } else if (status.hint) {
-            console.log("   " + status.hint);
-          }
-        } catch {
-          // Ignore parse errors
-        }
-      }
-    } catch (err) {
-      // Status check failed — ignore and continue
-    }
-  } else if (action === "install" && process.env.DSH_HOME) {
-    // In DSH sandbox, skip status check to avoid network timeout
-    console.error("[workled] Skipping status check (DSH sandbox detected)");
+  // Self-check: report the state of every client this run touched. Runs for
+  // install only (uninstall has nothing left to verify) and never affects the
+  // exit code — see runPostInstallStatus.
+  //
+  // The old version skipped this whenever DSH_HOME was set, on the theory that
+  // it indicated a sandbox. It does not: DSH_HOME is a user-settable variable
+  // with no bearing on whether the check can run, and the real dsh sandbox
+  // (a WRITE_RESTRICTED token) typically leaves it unset — so the guard
+  // skipped the check exactly when it was most useful. The timeout below is
+  // what actually protects against a hung probe.
+  if (action === "install") {
+    await runPostInstallStatus(targets[0], corePath);
+    // Spell out the entry point: `corePath` resolves to the user-level copy
+    // when there is one and to this script's own directory otherwise, so the
+    // runnable `index.js` is not always where the install output points.
+    console.log(
+      `\nFull report: node "${corePath}" status --client ${targets[0]}`
+    );
+  } else {
+    // Uninstall deletes the per-client skill copy, so the path the user may
+    // have been running `index.js` from is gone by now. Point at the stable
+    // user-level entry instead — otherwise `status` dies with "Cannot find
+    // module" before workled even loads.
+    console.log(
+      `\nVerify: node "${corePath}" status --client ${targets[0]}`
+    );
   }
 }
 

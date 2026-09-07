@@ -3,7 +3,7 @@ name: workled
 description: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
 description_zh: "Agent 状态：`thinking`（思考中）、`waiting`（等待响应）、`idle`（空闲）、`error`（异常报错），可经由 MCP 协议自动同步至 workled 设备；同时支持通过 MCP 协议对设备的灯效、触控宏进行配置。"
 description_en: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
-version: "0.1.18"
+version: "0.1.23"
 display_name: "workled"
 display_name_en: "workled"
 ---
@@ -51,6 +51,31 @@ If the device is not responding, or automatic state lighting stays dark, run
 configured client whose `plugin`/hooks are missing shows up there — re-run the
 installer (`skill-install.mjs install --client <name>`) to wire the automatic
 lighting.
+
+## Waiting-state coverage by client
+
+`waiting` means "the agent asked you something and is blocked on your
+answer". workled can only light it when the client itself emits an event for
+the question — it cannot invent one. Coverage therefore differs per client.
+
+| Client | Waiting state | Notes |
+|---|---|---|
+| opencode | ok | — |
+| kilo | ok | — |
+| dsh | ok | — |
+| pi | no | No event is fired for the option prompt |
+| openclaw | no | No event is fired for the option prompt |
+| hermes | partial | Normal option prompts emit nothing; permission prompts do |
+| workbuddy | ok | - |
+| trae-cn | ok | - |
+
+On the clients marked no (and on hermes for normal option prompts), the LED
+stays on `thinking` while a question is pending. If you want "waiting for you"
+to be visible there, call `set_agent_state("waiting")` yourself before asking
+the question.
+
+Measured 2026-09-07; re-check after a client update, since this depends on each
+client's own hook/plugin surface.
 
 ## Reference
 

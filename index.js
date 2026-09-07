@@ -33,6 +33,7 @@ import {
   traeCnUserDir,
   traeCnHooksHome,
   toPosix,
+  persistentEnvVarNames,
 } from "./utils.js";
 
 const HOME = homedir();
@@ -65,6 +66,7 @@ export const CLIENT_TARGETS = {
     mcpFormat: "json",
     mcpType: "remote",
     mcpTimeoutMs: 10000,
+    procVars: ["OPENCODE_CONFIG", "OPENCODE_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".config", "opencode", "plugins", "workled.js"),
     existPlugin: (p) => existsSync(p),
@@ -79,6 +81,7 @@ export const CLIENT_TARGETS = {
     mcpFormat: "json",
     mcpType: "remote",
     mcpTimeoutMs: 10000,
+    procVars: ["KILO_CONFIG", "KILO_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".config", "kilo", "plugin", "workled.js"),
     existPlugin: (p) => existsSync(p),
@@ -101,6 +104,7 @@ export const CLIENT_TARGETS = {
     // race the deadline.
     mcpRequestTimeoutMs: 10000,
     mcpFormat: "json",
+    procVars: ["OPENCLAW_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".openclaw", "plugins", "workled", "index.js"),
     existPlugin: (p) => existsSync(p) && existsSync(join(dirname(p), "openclaw.plugin.json")),
@@ -115,6 +119,10 @@ export const CLIENT_TARGETS = {
     mcpFormat: "yaml",
     mcpConnectTimeoutSeconds: 10,
     mcpTimeoutSeconds: 10,
+    // HERMES_HOME is filtered out by the persistent-env guard when hermes is
+    // installed into the OS env, so it only fires when hermes actually injects
+    // it into this process's environment at spawn.
+    procVars: ["HERMES_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(hermesHome(), "config.yaml"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -127,6 +135,7 @@ export const CLIENT_TARGETS = {
     mcpPath: () => join(HOME, ".pi", "mcp.json"),
     mcpKey: "mcp",
     mcpFormat: "json",
+    procVars: ["PI_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".pi", "agent", "extensions", "workled", "index.ts"),
     existPlugin: (p) => existsSync(p),
@@ -145,6 +154,7 @@ export const CLIENT_TARGETS = {
     // 60s, so any value <= 60000 is a no-op and shorter values are unreachable.
     // Emitting `timeout` would only advertise a knob that does not exist.
     // (Read out of the client bundle 2026-09-05.)
+    procVars: ["WORKBUDDY_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(HOME, ".workbuddy", "settings.json"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -163,6 +173,7 @@ export const CLIENT_TARGETS = {
     mcpPath: () => join(dshHome(), "profiles", "web", "node_modules", "workled", "patch.yml"),
     mcpKey: "mcp",
     mcpFormat: "dsh-patch",
+    procVars: ["DSH_HOME"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(dshHome(), "profiles", "web", "node_modules", "workled"),
     existPlugin: (p) => existsSync(p) && existsSync(join(p, "patch.yml")),
@@ -176,6 +187,12 @@ export const CLIENT_TARGETS = {
     mcpKey: "mcpServers",
     mcpFormat: "json",
     mcpHeaderTimeoutMs: 10000,
+    // trae-cn is a VSCode fork; its IDE process injects TRAE_* brand vars and a
+    // VSCODE_IPC_HOOK handle. TRAE_BRAND_NAME / TRAE_JWT_TOKEN_PATH are Trae CN
+    // specific (vs. VSCODE_IPC_HOOK which every VSCode fork sets). None of these
+    // are ever written to the OS persistent env, so the process-env guard keeps
+    // them usable.
+    procVars: ["TRAE_BRAND_NAME", "TRAE_JWT_TOKEN_PATH"],
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(traeCnHooksHome(), "hooks.json"),
     existPlugin: (p) => fileContains(p, "workled"),
@@ -210,11 +227,30 @@ for (const clientName of Object.keys(CLIENT_TARGETS)) {
 // install/uninstall branch in skill-install.mjs + SKILL.md.
 export const CLIENTS = Object.keys(CLIENT_TARGETS).filter((k) => k !== "default");
 
+// Helper: does any of this client's `procVars` exist as a live process env
+// var AND is absent from the OS persistent env? The persistent-env filter is
+// what separates a genuine process injection (spawned by that client) from a
+// stale system-level var that lingers in every unrelated terminal.
+function hasProcessInjectedSignal(client, persistent) {
+  const vars = CLIENT_TARGETS[client]?.procVars;
+  if (!vars || !vars.length) return false;
+  return vars.some((v) => process.env[v] && !persistent.has(v));
+}
+
 // Best-effort detection of the client running this agent, used when no
 // explicit `--client` is passed to the installer or `status`. Layered so a
 // single-client dev box resolves cleanly, while a box with many stale client
 // configs falls back to an explicit `--client` (the reliable cross-client
 // path). Returns a CLIENTS member, or null when ambiguous.
+//
+// Layer 1 reasons from PROCESS environment vars only — and only those that
+// are NOT persisted in the OS user/machine env. A var sitting in the registry
+// (e.g. a hermes installer writing HERMES_HOME) is inherited by every process
+// and carries no signal, so it is ignored. A var present in this process but
+// absent from the persistent env can only have come from the agent runtime
+// that spawned us, and identifies the client. This keeps detection valid for
+// EVERY client (each listed via its `procVars`) without ever trusting a
+// system-level leftover.
 //
 // NOTE: on a machine where several clients have all been installed, every
 // client's signature dir / workled MCP entry is present, so detection is
@@ -222,18 +258,11 @@ export const CLIENTS = Object.keys(CLIENT_TARGETS).filter((k) => k !== "default"
 // already knows its own client name from its system prompt, so it simply
 // passes `--client <its-name>`).
 export function detectClient() {
-  const env = process.env;
-
-  // 1. Process environment signatures (agent runtime injects these).
-  // These are strong signals because they're set by the agent process itself.
-  if (env.DSH_HOME) return "dsh";
-  if (env.OPENCODE_CONFIG || env.OPENCODE_HOME) return "opencode";
-  if (env.KILO_HOME || env.KILO_CONFIG) return "kilo";
-  if (env.WORKBUDDY_HOME) return "workbuddy";
-  if (env.HERMES_HOME) return "hermes";
-  if (env.OPENCLAW_HOME) return "openclaw";
-  if (env.PI_HOME) return "pi";
-  if (env.TRAE_CN_HOME || env.VSCODE_IPC_HOOK_CLI) return "trae-cn";
+  // 1. Process-injected env vars, filtered against the OS persistent env.
+  const persistent = persistentEnvVarNames();
+  const hits = CLIENTS.filter((c) => hasProcessInjectedSignal(c, persistent));
+  if (hits.length === 1) return hits[0];
+  if (hits.length > 1) return null; // ambiguous → require --client
 
   // 2. Existing MCP config (only if exactly ONE client has workled configured).
   const configured = [...new Set(loadMcpServers()

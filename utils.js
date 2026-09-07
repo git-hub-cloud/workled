@@ -2,6 +2,7 @@
 
 import { homedir } from "os";
 import { join, dirname, sep } from "path";
+import { spawnSync } from "child_process";
 import {
   accessSync,
   constants,
@@ -63,6 +64,40 @@ export function traeCnUserDir() {
     return join(homedir(), "Library", "Application Support", "Trae");
   }
   return join(homedir(), ".config", "trae");
+}
+
+// Collect the names of variables persisted in the OS user/machine env.
+// On Windows these live in the registry (HKCU\Environment +
+// HKLM\...\Session Manager\Environment) and are inherited by EVERY process,
+// so they can never be a signal that "this process was spawned by client X".
+// On non-Windows (macOS/Linux the persistent env comes from shell profiles
+// and is indistinguishable via process.env) we return an empty set, i.e. no
+// variable is filtered out — detection then relies on process-injected vars
+// and the existing MCP-config/sigDir fallbacks. Result is cached.
+const _persistentEnvCache = new WeakMap();
+export function persistentEnvVarNames() {
+  if (_persistentEnvCache.has(process)) return _persistentEnvCache.get(process);
+  const names = new Set();
+  if (process.platform === "win32") {
+    for (const hive of [
+      "HKCU\\Environment",
+      "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+    ]) {
+      try {
+        const r = spawnSync("reg", ["query", hive], { encoding: "utf8" });
+        if (r.status === 0) {
+          for (const line of r.stdout.split(/\r?\n/)) {
+            const m = line.match(/^\s*([A-Za-z0-9_]+)\s+REG_/);
+            if (m) names.add(m[1]);
+          }
+        }
+      } catch {
+        // registry query unavailable — ignore and move on
+      }
+    }
+  }
+  _persistentEnvCache.set(process, names);
+  return names;
 }
 
 /**
