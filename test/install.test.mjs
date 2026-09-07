@@ -14,7 +14,9 @@ import {
   splitTopLevelBlock,
   installHermesHooks,
   uninstallHermesHooks,
-  ensureHermesAutoAccept,
+  approveHermesAllowlist,
+  revokeHermesAllowlist,
+  hermesHookEvents,
 } from "../skill-install.mjs";
 
 const ENTRY = { url: "http://HomeAnt-A919.local:18791/mcp", enabled: true, type: "remote" };
@@ -398,7 +400,7 @@ hooks:
   assert.ok(cleaned.includes("post_llm_call:"));
 });
 
-// --- hermes hooks_auto_accept + post_tool_call coverage ---------------
+// --- hermes per-hook allowlist (v0.1.25) + post_tool_call coverage -------
 
 test("installHermesHooks now includes post_tool_call alongside pre_tool_call", () => {
   const out = installHermesHooks("");
@@ -408,39 +410,69 @@ test("installHermesHooks now includes post_tool_call alongside pre_tool_call", (
   assert.ok(out.includes("hook --event post_tool_call"));
 });
 
-test("ensureHermesAutoAccept inserts hooks_auto_accept before the hooks block", () => {
-  const withHooks = `model: "gpt"
-hooks:
-  pre_tool_call:
-    - command: "x"
-`;
-  const out = ensureHermesAutoAccept(withHooks);
-  const lines = out.split("\n");
-  const autoIdx = lines.findIndex((l) => l.startsWith("hooks_auto_accept:"));
-  const hooksIdx = lines.findIndex((l) => l.startsWith("hooks:"));
-  assert.ok(autoIdx >= 0, "hooks_auto_accept added");
-  assert.equal(lines[autoIdx], "hooks_auto_accept: true");
-  assert.ok(autoIdx < hooksIdx, "hooks_auto_accept placed before hooks");
+const EVENTS_COUNT = hermesHookEvents().length;
+
+test("approveHermesAllowlist adds one entry per event on an empty skeleton", () => {
+  const { text, added } = approveHermesAllowlist("", hermesHookEvents());
+  assert.equal(added, EVENTS_COUNT, "one entry per hermes event");
+  const data = JSON.parse(text);
+  assert.equal(data.approvals.length, EVENTS_COUNT);
+  for (const e of data.approvals) {
+    assert.ok(e.event && typeof e.command === "string", "entry shape");
+    assert.ok(e.command.includes(`hook --event ${e.event}`), "command matches event");
+    assert.ok(e.approved_at, "approved_at recorded");
+  }
 });
 
-test("ensureHermesAutoAccept replaces an existing false value in place", () => {
-  const out = ensureHermesAutoAccept("hooks_auto_accept: false\nhooks:\n  a:\n    - command: x\n");
-  assert.ok(out.includes("hooks_auto_accept: true"));
-  assert.equal(out.includes("false"), false, "false value overwritten to true");
-});
-
-test("ensureHermesAutoAccept appends when there is no hooks block", () => {
-  const bare = "model: gpt\n";
-  const out = ensureHermesAutoAccept(bare);
-  assert.ok(out.endsWith("hooks_auto_accept: true"));
-});
-
-test("ensureHermesAutoAccept is idempotent", () => {
-  const once = ensureHermesAutoAccept("hooks:\n  a:\n    - command: x\n");
-  const twice = ensureHermesAutoAccept(once);
-  assert.equal(
-    twice.split("\n").filter((l) => l.startsWith("hooks_auto_accept:")).length,
-    1,
-    "no duplicate hooks_auto_accept"
+test("approveHermesAllowlist is idempotent and preserves foreign approvals", () => {
+  const foreign = { event: "pre_tool_call", command: "user-own-tool --run" };
+  const first = approveHermesAllowlist(
+    JSON.stringify({ approvals: [foreign] }),
+    hermesHookEvents()
   );
+  assert.equal(first.added, EVENTS_COUNT);
+  const second = approveHermesAllowlist(first.text, hermesHookEvents());
+  assert.equal(second.added, 0, "no duplicates on re-approval");
+  const data = JSON.parse(second.text);
+  assert.equal(data.approvals.length, EVENTS_COUNT + 1, "foreign entry kept");
+  assert.deepEqual(
+    data.approvals.find((e) => e.command === foreign.command),
+    foreign,
+    "foreign entry untouched"
+  );
+});
+
+test("approveHermesAllowlist tolerates corrupt or non-object JSON", () => {
+  for (const bad of ["not json", "[1, 2]", '"str"']) {
+    const { text, added } = approveHermesAllowlist(bad, hermesHookEvents());
+    assert.equal(added, EVENTS_COUNT, `recovers from ${bad.slice(0, 8)}`);
+    assert.ok(JSON.parse(text).approvals.length === EVENTS_COUNT);
+  }
+});
+
+test("revokeHermesAllowlist removes only workled's own entries", () => {
+  const foreign = { event: "on_session_start", command: "user-own-tool --run" };
+  const approved = approveHermesAllowlist(
+    JSON.stringify({ approvals: [foreign] }),
+    hermesHookEvents()
+  );
+  const { text, removed } = revokeHermesAllowlist(approved.text, hermesHookEvents());
+  assert.equal(removed, EVENTS_COUNT, "all workled entries removed");
+  const data = JSON.parse(text);
+  assert.deepEqual(data.approvals, [foreign], "foreign approval survives");
+});
+
+test("revokeHermesAllowlist roundtrips to zero and is a no-op on empty", () => {
+  const approved = approveHermesAllowlist("", hermesHookEvents());
+  const empty = revokeHermesAllowlist(approved.text, hermesHookEvents());
+  assert.equal(JSON.parse(empty.text).approvals.length, 0);
+  const again = revokeHermesAllowlist(empty.text, hermesHookEvents());
+  assert.equal(again.removed, 0, "nothing to remove");
+  assert.equal(again.text, empty.text, "text untouched");
+});
+
+test("revokeHermesAllowlist tolerates corrupt JSON without writing", () => {
+  const { text, removed } = revokeHermesAllowlist("not json", hermesHookEvents());
+  assert.equal(removed, 0);
+  assert.equal(text, "not json", "input returned unchanged");
 });

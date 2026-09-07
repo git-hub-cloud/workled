@@ -1,13 +1,15 @@
 // Shared utilities for workled skill
 
 import { homedir } from "os";
-import { join, dirname, sep } from "path";
+import { join, dirname, sep, resolve } from "path";
 import { spawnSync } from "child_process";
 import {
   accessSync,
   constants,
   existsSync,
+  readdirSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
@@ -236,4 +238,45 @@ export function checkWriteAccess(paths) {
 // (b) break when the byte is parsed by a cross-shell command runner.
 export function toPosix(p) {
   return String(p).split(/[\\/]+/).join("/");
+}
+
+// ---------------------------------------------------------------------------
+// Scoped-install repair: surface a `@namespace/workled` install at the canonical
+// flat `skills/workled` entry point.
+//
+// Some market installers (e.g. skillhub) land a skill under a scoped directory
+// `skills/@handle/workled`. Tooling and the workled entry-point convention,
+// however, expect a flat `skills/workled`. When the real skill sits under a
+// scope, create a cross-platform link at the parent level:
+//   - Windows  -> junction (no admin required)
+//   - POSIX    -> directory symlink
+// Idempotent and non-destructive: if `skills/workled` already exists (real dir
+// or link) it is left untouched, so a legitimate flat install is never
+// clobbered. Failures (e.g. a sandbox that denies the write) are swallowed so
+// the caller — the installer or `status` — is never blocked by a link it could
+// not make. Returns human-readable lines for the report (only when a link is
+// actually created).
+// ---------------------------------------------------------------------------
+export function createSkillJunctions(skillsDir) {
+  if (!skillsDir || !existsSync(skillsDir)) return [];
+  const msgs = [];
+  for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith("@")) continue;
+    const nsDir = join(skillsDir, entry.name);
+    // Only process workled: confirm `@namespace/workled/SKILL.md` exists.
+    if (!existsSync(join(nsDir, "workled", "SKILL.md"))) continue;
+    const linkPath = join(skillsDir, "workled");
+    // Already exists (real dir or junction/symlink) — leave it alone.
+    if (existsSync(linkPath)) continue;
+    const targetPath = join(nsDir, "workled");
+    try {
+      const absTarget = resolve(targetPath);
+      const type = process.platform === "win32" ? "junction" : "dir";
+      symlinkSync(absTarget, linkPath, type);
+      msgs.push(`Linked ${linkPath} -> ${absTarget}`);
+    } catch {
+      // junction/symlink creation failed (e.g. sandbox permission) — skip
+    }
+  }
+  return msgs;
 }

@@ -15,6 +15,7 @@ import {
   rmSync,
   rmdirSync,
   statSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
@@ -26,6 +27,7 @@ import {
   sleep,
   dshHome,
   traeCnHooksHome,
+  createSkillJunctions,
 } from "./utils.js";
 import { CLIENTS, CLIENT_TARGETS, detectClient, resolveMergedUrl, resolveMcpType } from "./index.js";
 
@@ -1587,7 +1589,7 @@ const PLUGIN_CLIENTS = {
 //   $HERMES_HOME env var wins; otherwise Windows uses %LOCALAPPDATA%\hermes,
 //   everything else uses ~/.hermes. Implemented once in utils.js.
 
-function hermesHookEvents() {
+export function hermesHookEvents() {
   return [
     "pre_llm_call",
     "post_llm_call",
@@ -1853,44 +1855,109 @@ export function uninstallHermesHooks(yamlText) {
   return [...before, ...rebuilt, ...after].join("\n").replace(/\n{3,}/g, "\n\n");
 }
 
-// Ensure a top-level `hooks_auto_accept: true` exists. Hermes gates each shell
-// hook on a byte-exact (event, command) consent for non-interactive runs
-// (gateway/cron/CI) unless hooks_auto_accept is set; without it freshly
-// installed hooks are silently skipped. Pure text edit; preserves comments and
-// every other top-level key. Cross-platform by construction (plain YAML text).
-// Exported for unit tests.
+// ---- hermes hook allowlist (per-hook consent, v0.1.25) -----------------------
 //
-// NOTE (deliberate, not a bug): an existing `hooks_auto_accept` value is
-// overwritten with `true` rather than left alone — a value of `false` would
-// make hermes skip every workled hook, which is the exact failure this line
-// exists to prevent. The trade-off is that a pre-existing `false` cannot be
-// restored on uninstall: by then the line is a bare `true`, which
-// removeHermesAutoAccept() legitimately removes. Do not "fix" this by
-// preserving the old value; fix it by restoring from a backup if the loss
-// ever turns out to matter.
-export function ensureHermesAutoAccept(yamlText) {
-  const lines = yamlText.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (/^hooks_auto_accept\s*:/.test(lines[i])) {
-      lines[i] = lines[i].replace(/^hooks_auto_accept\s*:.*/, "hooks_auto_accept: true");
-      return lines.join("\n");
-    }
-  }
-  // Not present: insert before the `hooks:` block (or append at the end).
-  const idx = lines.findIndex((l) => /^hooks\s*:/.test(l));
-  if (idx >= 0) lines.splice(idx, 0, "hooks_auto_accept: true");
-  else lines.push("hooks_auto_accept: true");
-  return lines.join("\n");
+// Hermes gates every shell hook on a byte-exact (event, command) consent for
+// non-interactive runs (gateway/cron/CI). The coarse escape hatch is
+// `hooks_auto_accept: true` in config.yaml — but that disables the consent
+// mechanism for EVERY hook on the machine, which a security review (2026-09-07)
+// rightly flagged as out of scope for an LED skill. The fine-grained mechanism
+// is the per-user allowlist <hermes-home>/shell-hooks-allowlist.json:
+//   { "approvals": [ { "event", "command", "approved_at", ... } ] }
+// Runtime matching (agent/shell_hooks.py::_is_allowlisted) compares only the
+// (event, command) pair byte-exactly; the other fields are metadata. So workled
+// registers exactly its own hook commands there and never touches
+// hooks_auto_accept — the host's consent posture stays intact.
+
+function hermesAllowlistPath() {
+  return joinP(hermesHome(), "shell-hooks-allowlist.json");
 }
 
-// Reverse of ensureHermesAutoAccept: drop the exact top-level
-// `hooks_auto_accept: true` line introduced for workled. A user's own value
-// (anything other than bare `true`) is left untouched.
-function removeHermesAutoAccept(yamlText) {
-  return yamlText
-    .split("\n")
-    .filter((l) => !/^hooks_auto_accept\s*:\s*true\s*$/.test(l))
-    .join("\n");
+// Pure JSON edit, exported for unit tests. Adds one approval per event using
+// the same command string the config.yaml hook rows carry (hookCommand(ev) is
+// the single source; hermesCommandYaml merely JSON-quotes it, and YAML parsing
+// yields the identical scalar). Idempotent: existing (event, command) pairs are
+// kept untouched, as are all non-workled approvals. script_mtime_at_approval is
+// intentionally omitted — hermes only uses it for `hooks doctor` drift hints.
+export function approveHermesAllowlist(jsonText, events) {
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    data = {};
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+  if (!Array.isArray(data.approvals)) data.approvals = [];
+  const approvedAt = new Date().toISOString();
+  let added = 0;
+  for (const ev of events) {
+    const command = hookCommand(ev);
+    const exists = data.approvals.some(
+      (e) => e && e.event === ev && e.command === command
+    );
+    if (exists) continue;
+    data.approvals.push({ event: ev, command, approved_at: approvedAt });
+    added++;
+  }
+  return { text: JSON.stringify(data, null, 2) + "\n", added };
+}
+
+// Pure JSON edit, exported for unit tests. Drops exactly workled's own
+// (event, command) approvals; every other entry survives. Returns the new text
+// plus how many entries were removed so the caller can decide whether to
+// persist (and whether the file is now empty enough to delete).
+export function revokeHermesAllowlist(jsonText, events) {
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    return { text: jsonText, removed: 0 };
+  }
+  const commands = new Set(events.map((ev) => hookCommand(ev)));
+  const before = Array.isArray(data?.approvals) ? data.approvals.length : 0;
+  const kept = (data.approvals || []).filter(
+    (e) => !(e && commands.has(e.command))
+  );
+  if (kept.length === before) return { text: jsonText, removed: 0 };
+  data.approvals = kept;
+  return { text: JSON.stringify(data, null, 2) + "\n", removed: before - kept.length };
+}
+
+// File-level wrapper for install: persist the approvals, reporting only what
+// changed. Never writes when there is nothing to add (preserves file mtime and
+// any concurrent edits hermes may have made).
+function applyHermesAllowlist() {
+  const p = hermesAllowlistPath();
+  const current = existsSync(p) ? readFileSync(p, "utf8") : "";
+  const { text, added } = approveHermesAllowlist(current, hermesHookEvents());
+  if (added > 0) {
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, text, "utf8");
+  }
+  return { path: p, added };
+}
+
+// File-level wrapper for uninstall: remove workled's approvals. When nothing
+// of ours remains the file is left as-is; when it becomes empty because of our
+// removal we delete it so an uninstall leaves zero residue.
+function stripHermesAllowlist() {
+  const p = hermesAllowlistPath();
+  if (!existsSync(p)) return { path: p, removed: 0 };
+  const { text, removed } = revokeHermesAllowlist(readFileSync(p, "utf8"), hermesHookEvents());
+  if (removed > 0) {
+    let remaining = 0;
+    try {
+      remaining = (JSON.parse(text).approvals || []).length;
+    } catch {
+      remaining = 1; // unparsable after our edit: keep the file, be safe
+    }
+    if (remaining === 0) {
+      unlinkSync(p);
+    } else {
+      writeFileSync(p, text, "utf8");
+    }
+  }
+  return { path: p, removed };
 }
 
 function installHermes() {
@@ -1898,21 +1965,33 @@ function installHermes() {
   mkdirSync(dirname(cfg), { recursive: true });
   const existing = existsSync(cfg) ? readFileSync(cfg, "utf8") : "";
   const withHooks = installHermesHooks(existing);
-  writeFileSync(cfg, ensureHermesAutoAccept(withHooks), "utf8");
-  return `Installed hermes shell hooks + hooks_auto_accept -> ${cfg}`;
+  writeFileSync(cfg, withHooks, "utf8");
+  const allow = applyHermesAllowlist();
+  return (
+    `Installed hermes shell hooks -> ${cfg}\n` +
+    `Allowlisted ${allow.added} workled hook command(s) -> ${allow.path}`
+  );
 }
 
 function uninstallHermes() {
   const cfg = joinP(hermesHome(), "config.yaml");
-  if (!existsSync(cfg)) return `No hermes config at ${cfg}`;
+  const allow = stripHermesAllowlist();
+  if (!existsSync(cfg)) {
+    return allow.removed > 0
+      ? `No hermes config at ${cfg}; revoked ${allow.removed} allowlist entr(y/ies) -> ${allow.path}`
+      : `No hermes config at ${cfg}`;
+  }
   const content = readFileSync(cfg, "utf8");
   // Remove workled hooks from the hooks block; every other top-level key
   // (user hooks, MCP servers, model/terminal settings, ...) is preserved.
   // The workled MCP server entry is removed separately by
   // unregisterWorkledMcp("hermes") via removeMcpServerYaml().
   let cleaned = uninstallHermesHooks(content);
-  cleaned = removeHermesAutoAccept(cleaned);
-  if (cleaned === content) return `No hermes workled hooks at ${cfg}`;
+  if (cleaned === content) {
+    return allow.removed > 0
+      ? `No hermes workled hooks at ${cfg}; revoked ${allow.removed} allowlist entr(y/ies) -> ${allow.path}`
+      : `No hermes workled hooks at ${cfg}`;
+  }
   if (cleaned.trim() === "") {
     removePath(cfg);
     removeEmptyParent(dirname(cfg));
@@ -1956,6 +2035,27 @@ function uninstallSkill(client) {
   removePath(destDir);
   removeEmptyParent(dirname(destDir));
   return `Removed skill directory -> ${destDir}`;
+}
+
+// Create a junction for workled if installed under a @namespace subdirectory.
+// Only targets @namespace/workled/SKILL.md (confirmed workled skill).
+// Create the canonical `skills/workled` link for a scoped `@namespace/workled`
+// install. Logic lives in utils.js (shared with `status` so we don't import
+// back from here into index.js). See createSkillJunctions in utils.js.
+
+// Remove workled junction AND real directory from the skills directory.
+function removeSkillJunctions(skillsDir) {
+  if (!existsSync(skillsDir)) return [];
+  const msgs = [];
+  const workledDir = joinP(skillsDir, "workled");
+  if (!existsSync(workledDir)) return msgs;
+  try {
+    removePath(workledDir);
+    msgs.push(`Removed workled skill directory ${workledDir}`);
+  } catch {
+    // removal failed, skip silently
+  }
+  return msgs;
 }
 
 // ---- dsh (DeepSeek Harness) --------------------------------------------------
@@ -2381,6 +2481,9 @@ async function main() {
           // Copy SKILL.md to client's skills directory
           const skillMsg = installSkill(c);
           if (skillMsg) lines.push(skillMsg);
+          // Create junction for @namespace/workled if present
+          const junctionMsgs = createSkillJunctions(dirname(t.skillPath()));
+          lines.push(...junctionMsgs);
         } else {
           if (existsSync(dest)) {
             removePath(dest);
@@ -2398,6 +2501,9 @@ async function main() {
           // Remove SKILL.md from client's skills directory
           const skillMsg = uninstallSkill(c);
           if (skillMsg) lines.push(skillMsg);
+          // Remove workled junction and real directory
+          const junctionMsgs = removeSkillJunctions(dirname(t.skillPath()));
+          lines.push(...junctionMsgs);
         }
         break;
       }
@@ -2408,10 +2514,20 @@ async function main() {
           lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
           const skillMsg = installSkill("hermes");
           if (skillMsg) lines.push(skillMsg);
+          const hermesT = CLIENT_TARGETS.hermes;
+          if (hermesT?.skillPath) {
+            const junctionMsgs = createSkillJunctions(dirname(hermesT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         } else {
           lines.push(...unregisterWorkledMcp("hermes"));
           const skillMsg = uninstallSkill("hermes");
           if (skillMsg) lines.push(skillMsg);
+          const hermesT = CLIENT_TARGETS.hermes;
+          if (hermesT?.skillPath) {
+            const junctionMsgs = removeSkillJunctions(dirname(hermesT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         }
         break;
       }
@@ -2457,10 +2573,20 @@ async function main() {
           lines.push(installDsh(mcpEntry));
           const skillMsg = installSkill("dsh");
           if (skillMsg) lines.push(skillMsg);
+          const dshT = CLIENT_TARGETS.dsh;
+          if (dshT?.skillPath) {
+            const junctionMsgs = createSkillJunctions(dirname(dshT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         } else {
           lines.push(uninstallDsh());
           const skillMsg = uninstallSkill("dsh");
           if (skillMsg) lines.push(skillMsg);
+          const dshT = CLIENT_TARGETS.dsh;
+          if (dshT?.skillPath) {
+            const junctionMsgs = removeSkillJunctions(dirname(dshT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         }
         break;
       }
@@ -2472,10 +2598,20 @@ async function main() {
           lines.push(...(await installWorkbuddy(mcpEntry)));
           const skillMsg = installSkill("workbuddy");
           if (skillMsg) lines.push(skillMsg);
+          const wbT = CLIENT_TARGETS.workbuddy;
+          if (wbT?.skillPath) {
+            const junctionMsgs = createSkillJunctions(dirname(wbT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         } else {
           lines.push(...(await uninstallWorkbuddy()));
           const skillMsg = uninstallSkill("workbuddy");
           if (skillMsg) lines.push(skillMsg);
+          const wbT = CLIENT_TARGETS.workbuddy;
+          if (wbT?.skillPath) {
+            const junctionMsgs = removeSkillJunctions(dirname(wbT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
         }
         break;
       }
@@ -2490,6 +2626,11 @@ async function main() {
           lines.push(...installTraeCn(mcpEntry));
           const skillMsg = installSkill("trae-cn");
           if (skillMsg) lines.push(skillMsg);
+          const traeT = CLIENT_TARGETS["trae-cn"];
+          if (traeT?.skillPath) {
+            const junctionMsgs = createSkillJunctions(dirname(traeT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
           lines.push(
             "trae-cn: MCP written to <user-data>/User/mcp.json (reload to pick it up). Replace <device-name> in Settings → MCP if a placeholder was written, and enable the workled hooks in Settings → Hooks for agent-state tracking."
           );
@@ -2497,6 +2638,11 @@ async function main() {
           lines.push(...uninstallTraeCn());
           const skillMsg = uninstallSkill("trae-cn");
           if (skillMsg) lines.push(skillMsg);
+          const traeT = CLIENT_TARGETS["trae-cn"];
+          if (traeT?.skillPath) {
+            const junctionMsgs = removeSkillJunctions(dirname(traeT.skillPath()));
+            lines.push(...junctionMsgs);
+          }
           lines.push(
             "trae-cn: workled MCP entry and hooks removed; the server you added via Settings → MCP (if any) stays as you configured it."
           );
