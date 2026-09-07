@@ -170,8 +170,11 @@ shown in the output). Fields:
   - `WORKLED_MCP_URL` — present only on the `env` override entry; holds the
     override URL. The `env` entry has no config file, so unlike real clients it
     emits no `mcpPath` / `mcpUrl` / `mcpEnable`
-  - `mcpConfig` — `mcpEnable && mcpUrl` both present (a working server entry);
-    omitted for the `env` override entry
+  - `mcpConfig` — `true` whenever this client has a workled row in its MCP
+    config; the entry is here precisely because it does, so this is equivalent
+    to "is this client MCP-configured". Used to gate the `configured but
+    disabled` / `no url` diagnostics below; omitted for the `env` override
+    entry
   - `plugin` — the actual installed plugin/hooks artifact path for that client
     (generated entry file, or the config/hooks file carrying the workled
     marker), or `null` when not installed; omitted for the `env` override entry

@@ -75,6 +75,38 @@ test("upsertJsoncEntry replaces an existing workled entry in place", () => {
   assert.equal(parsed.mcp.workled.url, ENTRY.url);
 });
 
+// Regression test for #key-indent-drift — when workled already exists and we
+// re-upsert, the previous implementation accumulated 2 spaces per replace on
+// the key line while fields only used keyIndent + "  ", causing a visible
+// `    "workled"` → `        "workled"` drift after each reinstall and JSON
+// files doubling in nested-indent on every cycle. The repair moves the
+// replace-from slice past the leading whitespace of the key line so
+// jsoncEntryBlock can re-emit a uniform indent.
+test("upsertJsoncEntry existing-replace keeps key-line indent stable across N cycles", () => {
+  const start = `{
+  "mcp": {
+    "requestTimeoutMs": 1500,
+    "workled": {
+      "url": "http://old.local/mcp",
+      "enabled": true
+    }
+  }
+}
+`;
+  let out = start;
+  for (let i = 0; i < 4; i++) {
+    out = upsertJsoncEntry(out, "mcp", "workled", ENTRY);
+  }
+  // Key line: 4 spaces (the indent of fields inside mcp)
+  assert.match(out, /\n {4}"workled":/);
+  // Field line: 6 spaces (one level deeper)
+  assert.match(out, /\n {6}"url":/);
+  // The drift regression would produce `\n {8}"workled"` — assert it's not there
+  assert.doesNotMatch(out, /\n {8}"workled":/);
+  assert.equal(isValidJsonc(out), true);
+  assert.equal(JSON.parse(stripJsonc(out)).mcp.workled.url, ENTRY.url);
+});
+
 test("upsertJsoncEntry appends a new top-level key when absent", () => {
   const bare = '{ "note": "x" }\n';
   const out = upsertJsoncEntry(bare, "mcp", "workled", ENTRY);

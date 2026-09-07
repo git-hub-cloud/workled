@@ -2,6 +2,7 @@
 // workled skill installer/uninstaller for all supported clients.
 // Usage client targets: run `node skill-install.mjs --help`.
 
+import { spawnSync } from "child_process";
 import { homedir } from "os";
 import { dirname, join, resolve, sep } from "path";
 import { fileURLToPath, pathToFileURL } from "url";
@@ -17,7 +18,15 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { stripJsonc, hermesHome, sleep, dshHome, traeCnHooksHome } from "./utils.js";
+import {
+  WRITE_ERROR_REASONS,
+  checkWriteAccess,
+  stripJsonc,
+  hermesHome,
+  sleep,
+  dshHome,
+  traeCnHooksHome,
+} from "./utils.js";
 import { CLIENTS, CLIENT_TARGETS, detectClient, resolveMergedUrl, resolveMcpType } from "./index.js";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -568,12 +577,23 @@ export function upsertJsoncEntry(text, key, serverName, entry) {
     // replacement range must cover the entire key:value (not just the value
     // object). Indentation is inherited from the original key line so
     // `"workled":\n  { ... }` layouts remain consistent after re-insertion.
+    //
+    // findKeyLineStartForValue returns the index of the opening quote of the
+    // key (i.e. the position right AFTER the line's leading whitespace).
+    // text.slice(0, keyIdx) therefore ends with those leading spaces. Back
+    // off the slice by the key-line indent length so the slice ends at the
+    // line start (just past the preceding '\n'); jsoncEntryBlock will then
+    // re-emit the full key line including its own keyIndent. Without this
+    // offset, the prefix indent and the indent emitted inside
+    // jsoncEntryBlock add up, producing key lines with 2x indent and field
+    // lines with 1x indent (an asymmetric drift that doubles on every
+    // reinstall).
     const objAbsoluteStart = span.start + found.start; // index of `{`
     const objAbsoluteEnd   = span.start + found.end;   // index of matching `}`
     const keyIdx = findKeyLineStartForValue(text, objAbsoluteStart);
-    const replaceFrom = keyIdx >= 0 ? keyIdx : objAbsoluteStart;
+    const keyIndent = lineIndentAt(text, keyIdx >= 0 ? keyIdx : objAbsoluteStart);
+    const replaceFrom = keyIdx >= 0 ? Math.max(0, keyIdx - keyIndent.length) : objAbsoluteStart;
     const replaceTo   = objAbsoluteEnd + 1; // include closing `}`
-    const keyIndent = lineIndentAt(text, replaceFrom);
     return text.slice(0, replaceFrom) + jsoncEntryBlock(serverName, entry, keyIndent) + text.slice(replaceTo);
   }
   // Insert at the end of the map (just before its closing brace).
@@ -1099,7 +1119,10 @@ function addMcpServer(client, entry) {
   const format = t.mcpFormat;
   const defaultType = t.mcpType;
   if (format === "yaml") {
-    return addMcpServerYaml(file, key, "workled", entry);
+    // Pass `t` through: addMcpServerYaml reads t.mcpTimeoutSeconds /
+    // t.mcpConnectTimeoutSeconds to emit hermes' `timeout` / `connect_timeout`.
+    // Omitting it silently produced a workled entry with no timeout fields.
+    return addMcpServerYaml(file, key, "workled", entry, t);
   }
   // Nested-container client (e.g. openclaw: server map lives at mcp.servers and
   // a remote server declares `transport` rather than `type`). Such files are
@@ -1203,6 +1226,10 @@ function addMcpServerNested(client, t, entry) {
   const url = resolveMergedUrl(existing.url, entry.url);
   const transport = t.mcpTransport || "streamable-http";
   const desired = {
+    // Start from the existing entry so any field the user added by hand
+    // (headers, auth, ...) survives a re-install; building the object from
+    // scratch used to drop everything outside url/enabled/transport.
+    ...existing,
     url,
     enabled: entry.enabled !== false,
     transport: existing.transport || transport,
@@ -1832,6 +1859,15 @@ export function uninstallHermesHooks(yamlText) {
 // installed hooks are silently skipped. Pure text edit; preserves comments and
 // every other top-level key. Cross-platform by construction (plain YAML text).
 // Exported for unit tests.
+//
+// NOTE (deliberate, not a bug): an existing `hooks_auto_accept` value is
+// overwritten with `true` rather than left alone — a value of `false` would
+// make hermes skip every workled hook, which is the exact failure this line
+// exists to prevent. The trade-off is that a pre-existing `false` cannot be
+// restored on uninstall: by then the line is a bare `true`, which
+// removeHermesAutoAccept() legitimately removes. Do not "fix" this by
+// preserving the old value; fix it by restoring from a backup if the loss
+// ever turns out to matter.
 export function ensureHermesAutoAccept(yamlText) {
   const lines = yamlText.split("\n");
   for (let i = 0; i < lines.length; i++) {
@@ -1965,8 +2001,8 @@ function splitYamlTopItems(text) {
 function cpDir(src, dest) {
   mkdirSync(dest, { recursive: true });
   for (const entry of readdirSync(src, { withFileTypes: true })) {
-    // Skip .git directory to avoid permission issues
-    if (entry.name === ".git") continue;
+    // Skip .git and .dsh-local directories to avoid permission issues and infinite recursion
+    if (entry.name === ".git" || entry.name === ".dsh-local") continue;
     const s = joinP(src, entry.name);
     const d = joinP(dest, entry.name);
     if (entry.isDirectory()) cpDir(s, d);
@@ -1974,9 +2010,92 @@ function cpDir(src, dest) {
   }
 }
 
-function installDsh() {
-  const home = dshHome();
-  const url = process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
+// ============================================================
+// dsh: blocked-path report + permission request (probe lives in utils.js)
+// ============================================================
+
+// dsh installs to the L1 standard paths only — no workspace-local fallback and
+// no env-only mode. When dsh's agent runs this installer it does so under a
+// WRITE_RESTRICTED token (dsh-sandbox-windows-acl / CreateRestrictedToken) that
+// only allows writes inside the workspace, so ~/.dsh is genuinely unwritable
+// even though the user owns it. A blocked path is therefore reported and the
+// installer re-runs itself elevated (UAC / sudo) so the user can grant access
+// explicitly — never silent, never degraded.
+
+// Loud, explicit failure notice. Never silent, never degraded.
+function reportWriteFailure(check, paths) {
+  const reason = WRITE_ERROR_REASONS[check.code] || `write failed (${check.code})`;
+  const block = [
+    "",
+    "✖ workled: the dsh standard paths are not writable — install aborted.",
+    "",
+    `  Blocked path : ${check.path}`,
+    `  Reason       : ${reason}`,
+    `  dsh home     : ${dshHome()}`,
+    "",
+    "  workled must be able to write:",
+    ...paths.map((p) => `    - ${p}`),
+    "",
+  ];
+  console.error(block.join("\n"));
+}
+
+// Re-run this installer with elevated privileges so the user sees a real OS
+// permission prompt (Windows UAC / POSIX sudo) instead of a silent degrade.
+// The elevated process runs with a full (admin) token, escaping dsh's
+// restricted-token sandbox. Returns true when the elevated run exited 0.
+function runElevated() {
+  const self = fileURLToPath(import.meta.url);
+  const args = [self, ...process.argv.slice(2)];
+  // WORKLED_ELEVATED marks the child so a second failure cannot loop forever.
+  const childEnv = { ...process.env, WORKLED_ELEVATED: "1" };
+
+  if (process.platform === "win32") {
+    const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+    const argList = args.map(psQuote).join(",");
+    // ASCII only: `powershell.exe -Command` decodes its argument with the
+    // console code page, so non-ASCII characters would be mangled.
+    const cmd =
+      `try { ` +
+      `$p = Start-Process -FilePath ${psQuote(process.execPath)} ` +
+      `-ArgumentList @(${argList}) -WorkingDirectory ${psQuote(process.cwd())} ` +
+      `-Verb RunAs -Wait -PassThru -ErrorAction Stop; ` +
+      `if ($null -eq $p) { exit 1 }; ` +
+      `exit $p.ExitCode ` +
+      `} catch { ` +
+      `Write-Output "workled: elevation not granted - $($_.Exception.Message)"; ` +
+      `exit 1 }`;
+    const r = spawnSync("powershell.exe", ["-NoProfile", "-Command", cmd], {
+      stdio: "inherit",
+      env: childEnv,
+    });
+    if (r.error) {
+      console.error(`workled: could not raise the permission prompt: ${r.error.message}`);
+      return false;
+    }
+    return r.status === 0;
+  }
+
+  const r = spawnSync("sudo", [process.execPath, ...args], { stdio: "inherit", env: childEnv });
+  if (r.error) {
+    console.error(
+      `workled: could not re-run through sudo (${r.error.message}).\n` +
+        `  Re-run manually with enough privileges:\n` +
+        `    sudo ${[process.execPath, ...args].map((a) => JSON.stringify(a)).join(" ")}`
+    );
+    return false;
+  }
+  return r.status === 0;
+}
+
+function installDsh(mcpEntry, customHome = null) {
+  const home = customHome || dshHome();
+  // Use the caller-resolved url: main() runs device discovery once and hands the
+  // same entry to every client. Reading the env alone here (the old behaviour)
+  // meant dsh was the only client that never saw discovery and always fell back
+  // to the <device-name> placeholder, silently installing a broken endpoint.
+  const url =
+    mcpEntry?.url || process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
   mkdirSync(home, { recursive: true });
   // A) Install as a proper dsh bundle under the web profile's node_modules.
   const srcPlugin = joinP(scriptDir, "dsh-plugin");
@@ -2076,13 +2195,10 @@ async function main() {
     process.exit(1);
   }
 
-  // Target client resolution. An explicit `--client <name>` always wins (this
-  // is also how an agent installs for a DIFFERENT client, e.g. "install
-  // workled in kilocode" from an opencode chat). Omitted --client triggers
-  // auto-detection of the running client — reliable on a single-client
-  // machine; when several clients are installed (ambiguous) detection returns
-  // null and we ask for an explicit --client (the agent already knows its own
-  // name from its system prompt, so it simply passes `--client <its-name>`).
+  // Target client resolution. An explicit `--client <name>` always wins.
+  // Omitted --client triggers auto-detection via process environment signatures,
+  // existing MCP config, or signature directories. If ambiguous or no signal,
+  // we require an explicit --client.
   const clientIdx = args.indexOf("--client");
   let clientArg = clientIdx >= 0 ? args[clientIdx + 1] : null;
   if (clientArg && !CLIENTS.includes(clientArg)) {
@@ -2093,10 +2209,17 @@ async function main() {
     const detected = detectClient();
     if (!detected) {
       console.error(
-        `Could not auto-detect the client for \`${action}\`.\n` +
-        `Pass --client <name> to target a specific client (the agent's own name works, e.g. \`--client workbuddy\`).\n` +
-        `Clients: ${CLIENTS.join(", ")}\n` +
-        `Tip: set WORKLED_CLIENT=<name> to pin detection.`
+        `Could not auto-detect the client environment.\n` +
+        `Please specify the target client explicitly:\n\n` +
+        `  node skill-install.mjs ${action} --client <name>\n\n` +
+        `Supported clients:\n` +
+        `  ${CLIENTS.join(", ")}\n\n` +
+        `Detection checks performed:\n` +
+        `  • Process environment variables (DSH_HOME, OPENCODE_HOME, etc.)\n` +
+        `  • Existing workled MCP configuration (unique entry only)\n` +
+        `  • Client signature directories (unique only)\n\n` +
+        `Tip: Run this command from within your agent's terminal/session ` +
+        `so its environment variables are available for detection.`
       );
       process.exit(1);
     }
@@ -2184,14 +2307,37 @@ async function main() {
         break;
       }
       case "dsh": {
-        const dh = dshHome();
-        lines.push(isInstall ? installDsh() : uninstallDsh());
-        // dsh's MCP + hooks wiring is fully owned by installDsh/uninstallDsh
-        // (cordis.patch.yml + workled-hooks.json), so no separate MCP step.
         if (isInstall) {
+          // L1 only: probe the standard dsh paths before touching anything.
+          const t = CLIENT_TARGETS.dsh;
+          const standardPaths = [t.mcpPath?.(), t.pluginPath?.(), t.skillPath?.()].filter(Boolean);
+          const check = checkWriteAccess(standardPaths);
+          if (!check.ok) {
+            reportWriteFailure(check, standardPaths);
+            // WORKLED_ELEVATED: set on the child, so a blocked elevated run
+            // reports instead of prompting again. WORKLED_NO_ELEVATE: opt out
+            // for CI / non-interactive runs.
+            const canElevate =
+              process.env.WORKLED_ELEVATED !== "1" && process.env.WORKLED_NO_ELEVATE !== "1";
+            if (canElevate) {
+              console.error(
+                "  Requesting permission: re-running the installer with elevated privileges."
+              );
+              console.error(
+                "  Approve the OS permission prompt to continue; declining aborts the install.\n"
+              );
+              if (runElevated()) {
+                lines.push("dsh: installed by the elevated run above.");
+                break;
+              }
+            }
+            throw new Error(`dsh standard path not writable: ${check.path} (${check.code})`);
+          }
+          lines.push(installDsh(mcpEntry));
           const skillMsg = installSkill("dsh");
           if (skillMsg) lines.push(skillMsg);
         } else {
+          lines.push(uninstallDsh());
           const skillMsg = uninstallSkill("dsh");
           if (skillMsg) lines.push(skillMsg);
         }
@@ -2269,37 +2415,62 @@ async function main() {
 
   // After install, run status check ONLY for the client that was just installed.
   // This avoids noise from unrelated clients (e.g. dsh diagnostic when installing pi).
-  if (action === "install") {
-    // Run status check to see if MCP is configured
-    const { spawnSync } = await import("child_process");
-    // Use process.execPath (the same Node this installer runs under) instead
-    // of a bare "node": the status check then works even when the user's PATH
-    // has no Node entry (e.g. invoked through an IDE-managed runtime).
-    // Pass --client so status only reports on the target client.
-    const statusArgs = [corePath, "status", "--client", targets[0]];
-    const statusResult = spawnSync(process.execPath, statusArgs, {
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    if (statusResult.stdout) {
-      try {
-        const status = JSON.parse(statusResult.stdout);
-        // status.ok = false means device unreachable, NOT "not configured".
-        // "Not configured" = no workled entries at all (clients.length === 0).
-        if (status.clients && status.clients.length === 0) {
-          console.log("");
-          console.log("⚠ WORKLED MCP SERVER NOT CONFIGURED");
-          console.log("   Please add the MCP server to your client config:");
-          console.log("   See device_setup.md for instructions.");
-          console.log("   Or run: node " + corePath + " status to check current state.");
-        } else {
-          // Configured but maybe unreachable — show the actual hint.
-          console.log("   " + status.hint);
+  // NOTE: In sandboxed environments (e.g. DSH workspace-write mode), the status
+  // check may hang if it tries to access network resources or blocked paths.
+  // We skip it when DSH_HOME is not set (indicating we're in a sandbox).
+  if (action === "install" && !process.env.DSH_HOME) {
+    // Run status check to see if MCP is configured (best-effort, may fail in sandbox)
+    try {
+      const { spawn } = await import("child_process");
+      // Use process.execPath (the same Node this installer runs under) instead
+      // of a bare "node": the status check then works even when the user's PATH
+      // has no Node entry (e.g. invoked through an IDE-managed runtime).
+      // Pass --client so status only reports on the target client.
+      const statusArgs = [corePath, "status", "--client", targets[0]];
+      const statusProc = spawn(process.execPath, statusArgs, {
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+
+      let statusOutput = "";
+      statusProc.stdout.on("data", (chunk) => { statusOutput += chunk; });
+      statusProc.stderr.on("data", () => { /* swallow stderr to avoid noise */ });
+
+      // Wait for completion with a short timeout (3s)
+      const statusTimeout = setTimeout(() => {
+        statusProc.kill();
+      }, 3000);
+
+      await new Promise((resolve) => {
+        statusProc.on("close", resolve);
+        statusProc.on("error", resolve);
+      });
+
+      clearTimeout(statusTimeout);
+
+      if (statusOutput) {
+        try {
+          const status = JSON.parse(statusOutput);
+          // status.ok = false means device unreachable, NOT "not configured".
+          // "Not configured" = no workled entries at all (clients.length === 0).
+          if (status.clients && status.clients.length === 0) {
+            console.log("");
+            console.log("⚠ WORKLED MCP SERVER NOT CONFIGURED");
+            console.log("   Please add the MCP server to your client config:");
+            console.log("   See device_setup.md for instructions.");
+          } else if (status.hint) {
+            console.log("   " + status.hint);
+          }
+        } catch {
+          // Ignore parse errors
         }
-      } catch {
-        // Ignore parse errors
       }
+    } catch (err) {
+      // Status check failed — ignore and continue
     }
+  } else if (action === "install" && process.env.DSH_HOME) {
+    // In DSH sandbox, skip status check to avoid network timeout
+    console.error("[workled] Skipping status check (DSH sandbox detected)");
   }
 }
 

@@ -2,6 +2,14 @@
 
 import { homedir } from "os";
 import { join, dirname, sep } from "path";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 
 // Shared async delay, used by index.js (retry/discovery backoff) and
 // skill-install.mjs (openclaw config-stabilisation polling).
@@ -110,8 +118,87 @@ export function stripJsonc(src) {
       i += 2;
       continue;
     }
-    out += c;
-    i++;
+  out += c;
+  i++;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// L1 standard-path writability probe (shared by installer and status).
+//
+// dsh installs to the L1 standard paths only — no workspace-local fallback and
+// no env-only mode. Both the installer (before writing) and `status` (when
+// diagnosing a missing dsh install) need the same answer, so it lives here.
+// ---------------------------------------------------------------------------
+
+// errno -> human reason, so a message says what is actually wrong instead of
+// dumping a bare EACCES at the user.
+export const WRITE_ERROR_REASONS = {
+  EACCES: "permission denied - the current user may not write here",
+  EPERM: "operation not permitted - sandbox, ACL, or a locked-down directory",
+  EROFS: "read-only filesystem",
+  ENOENT: "path does not exist and cannot be created",
+  EBUSY: "path is locked by another process",
+  EISDIR: "path is a directory, not a file",
+};
+
+// Closest ancestor of `p` that already exists. A not-yet-existing path is
+// creatable iff that ancestor is writable, so probe the ancestor rather than
+// creating directories just to test them.
+export function nearestExistingAncestor(p) {
+  let cur = p;
+  while (cur && cur !== dirname(cur)) {
+    if (existsSync(cur)) return cur;
+    cur = dirname(cur);
+  }
+  return p;
+}
+
+// Non-destructive writability probe. An earlier version cleaned up with
+// `rmdirSync(p, {recursive:true})`; for dsh one of the probed paths IS the
+// installed bundle dir, so every re-install deleted the bundle before copying
+// it back. This version only ever creates — and removes — its own uniquely
+// named probe file.
+export function checkWriteAccess(paths) {
+  for (const p of paths) {
+    const target = existsSync(p) ? p : nearestExistingAncestor(p);
+    try {
+      accessSync(target, constants.W_OK);
+    } catch (e) {
+      return { ok: false, path: toPosix(target), code: e.code || "UNKNOWN" };
+    }
+    // accessSync reports the ACL, not the effective outcome (sandboxes and
+    // Windows directory ACLs disagree with it often enough to matter), so
+    // confirm directories with a real write.
+    let isDir = false;
+    try {
+      isDir = statSync(target).isDirectory();
+    } catch {
+      /* stat raced with a delete - treat as not a directory */
+    }
+    if (isDir) {
+      const probe = join(target, `.workled-write-test-${process.pid}-${Date.now()}`);
+      try {
+        writeFileSync(probe, "test");
+      } catch (e) {
+        return { ok: false, path: toPosix(target), code: e.code || "UNKNOWN" };
+      } finally {
+        try {
+          unlinkSync(probe);
+        } catch {
+          /* nothing to clean up */
+        }
+      }
+    }
+  }
+  return { ok: true };
+}
+
+// Normalize an absolute path to forward slashes so emitted commands and the
+// status report read identically on Windows and POSIX. A Windows backslash
+// path (`C:\Users\...`) would otherwise (a) differ across platforms and
+// (b) break when the byte is parsed by a cross-shell command runner.
+export function toPosix(p) {
+  return String(p).split(/[\\/]+/).join("/");
 }

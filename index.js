@@ -23,17 +23,20 @@ import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { execFile, spawn } from "child_process";
 import { promisify } from "util";
-import { stripJsonc, hermesHome, sleep, dshHome, traeCnUserDir, traeCnHooksHome } from "./utils.js";
+import {
+  WRITE_ERROR_REASONS,
+  checkWriteAccess,
+  stripJsonc,
+  hermesHome,
+  sleep,
+  dshHome,
+  traeCnUserDir,
+  traeCnHooksHome,
+  toPosix,
+} from "./utils.js";
 
 const HOME = homedir();
 
-// Normalize an absolute path to forward slashes so emitted commands and the
-// status report read identically on Windows and POSIX. A Windows backslash
-// path (`C:\Users\...`) would otherwise (a) differ across platforms and
-// (b) break when the byte is parsed by a cross-shell command runner.
-export function toPosix(p) {
-  return String(p).split(/[\\/]+/).join("/");
-}
 const execFileAsync = promisify(execFile);
 
 // Per-client install targets — the single source of truth for where each
@@ -150,13 +153,19 @@ export const CLIENT_TARGETS = {
     existSkill: (p) => existsSync(join(p, "SKILL.md")),
   },
   dsh: {
-    help: "plugin -> <dsh-home>/profiles/web/node_modules/workled (bundle) + profile patch -> <dsh-home>/profiles/web/cordis.patch.yml (native Cordis plugin, calls workled directly over HTTP)",
-    mcpPath: () => join(dshHome(), "profiles", "web", "cordis.patch.yml"),
+    // Plan B (2026-09-05): the bundle is self-configuring — installDsh copies
+    // dsh-plugin/ to <dsh-home>/profiles/web/node_modules/workled and writes the
+    // real device url into that copy's patch.yml. Nothing is written to the
+    // profile's cordis.patch.yml any more, so both the MCP/config probe and the
+    // plugin probe must look at the bundle (the old Plan A path,
+    // <dsh-home>/plugins/workled, is dead and no longer installed anywhere).
+    help: "bundle -> <dsh-home>/profiles/web/node_modules/workled (patch.yml carries url/config) + registered in <dsh-home>/profiles/web/package.json",
+    mcpPath: () => join(dshHome(), "profiles", "web", "node_modules", "workled", "patch.yml"),
     mcpKey: "mcp",
     mcpFormat: "dsh-patch",
     existMcp: (p) => existsSync(p) && fileContains(p, "workled"),
     pluginPath: () => join(dshHome(), "profiles", "web", "node_modules", "workled"),
-    existPlugin: (p) => existsSync(p) && fileContains(join(dshHome(), "profiles", "web", "cordis.patch.yml"), "workled"),
+    existPlugin: (p) => existsSync(p) && existsSync(join(p, "patch.yml")),
     sigDir: () => dshHome(),
     skillPath: () => join(dshHome(), "skills", "workled"),
     existSkill: (p) => existsSync(join(p, "SKILL.md")),
@@ -213,23 +222,33 @@ export const CLIENTS = Object.keys(CLIENT_TARGETS).filter((k) => k !== "default"
 // already knows its own client name from its system prompt, so it simply
 // passes `--client <its-name>`).
 export function detectClient() {
-  // 1) Manual override (also lets an agent pass its own name via env).
-  if (process.env.WORKLED_CLIENT && CLIENTS.includes(process.env.WORKLED_CLIENT.trim())) {
-    return process.env.WORKLED_CLIENT.trim();
-  }
-  // 2) The client(s) already configured with a workled MCP entry are the
-  //    strongest "this is my client" signal.
-  const configured = [
-    ...new Set(loadMcpServers().filter((s) => s.name === "workled").map((s) => s.client)),
-  ];
+  const env = process.env;
+
+  // 1. Process environment signatures (agent runtime injects these).
+  // These are strong signals because they're set by the agent process itself.
+  if (env.DSH_HOME) return "dsh";
+  if (env.OPENCODE_CONFIG || env.OPENCODE_HOME) return "opencode";
+  if (env.KILO_HOME || env.KILO_CONFIG) return "kilo";
+  if (env.WORKBUDDY_HOME) return "workbuddy";
+  if (env.HERMES_HOME) return "hermes";
+  if (env.OPENCLAW_HOME) return "openclaw";
+  if (env.PI_HOME) return "pi";
+  if (env.TRAE_CN_HOME || env.VSCODE_IPC_HOOK_CLI) return "trae-cn";
+
+  // 2. Existing MCP config (only if exactly ONE client has workled configured).
+  const configured = [...new Set(loadMcpServers()
+    .filter(s => s.name === "workled")
+    .map(s => s.client))];
   if (configured.length === 1) return configured[0];
-  // 3) Fall back to signature dirs; if exactly one exists, that's the client.
-  const byDir = CLIENTS.filter((c) => {
+
+  // 3. Signature directories (only if exactly ONE client's sigDir exists).
+  const byDir = CLIENTS.filter(c => {
     const d = CLIENT_TARGETS[c]?.sigDir?.();
     return d && existsSync(d);
   });
   if (byDir.length === 1) return byDir[0];
-  // 4) Ambiguous — caller must pass --client.
+
+  // 4. Detection failed — return null (NO default fallback).
   return null;
 }
 
@@ -419,41 +438,39 @@ function loadMcpServers() {
     const format = t.mcpFormat;
     const key = t.mcpKey;
     if (format === "dsh-patch") {
-      const pluginDir = join(dshHome(), "plugins", "workled");
-      const pluginInstalled = existsSync(pluginDir) && existsSync(join(pluginDir, "src", "index.js"));
-      if (!existsSync(srcPath)) {
-        servers.push({
-          name: "workled",
-          client,
-          path: srcPath,
-          server: { url: null, enabled: false, _dshPluginInstalled: pluginInstalled, _dshPatchExists: false },
-        });
+      // Same Plan B bundle dir as CLIENT_TARGETS.dsh.pluginPath(); the old
+      // <dsh-home>/plugins/workled location belongs to the retired Plan A
+      // layout and is never written by installDsh.
+      const pluginDir = join(dshHome(), "profiles", "web", "node_modules", "workled");
+      const pluginInstalled = existsSync(join(pluginDir, "patch.yml")) && existsSync(join(pluginDir, "src", "index.js"));
+      // dsh's MCP file lives inside the bundle (Plan B) and is preserved across
+      // uninstall — installDsh rewrites its workled row to nothing rather than
+      // deleting it. Mirror pi/opencode semantics: skip the entry entirely
+      // when the bundle is missing OR the bundle has no `workled` row. The
+      // earlier "push a phantom {url:null, enabled:false}" behavior made status
+      // show "dsh is configured but disabled" on a clean machine, which was a
+      // false positive that misled diagnosis.
+      if (!existsSync(srcPath)) continue;
+      let parsed = null;
+      try {
+        parsed = dshWorkledPluginFromPatch(readFileSync(srcPath, "utf8"));
+      } catch {
+        // unreadable patch file: skip
         continue;
       }
-      try {
-        const text = readFileSync(srcPath, "utf8");
-        const parsed = dshWorkledPluginFromPatch(text);
-        if (parsed) {
-          servers.push({
-            name: "workled",
-            client,
-            path: srcPath,
-            server: {
-              url: parsed.url,
-              enabled: parsed.enabled !== false,
-              type: "remote",
-              _dshPluginInstalled: pluginInstalled,
-              _dshPatchExists: true,
-            },
-          });
-        }
-        // No `workled` row in the patch (e.g. after uninstall leaves the file
-        // behind): push nothing, mirroring the JSON/YAML clients whose config
-        // carries no `workled` key. Reporting such a placeholder as a configured
-        // server made `status` show a phantom "dsh not installed" hint.
-      } catch {
-        /* unreadable patch file: skip */
-      }
+      if (!parsed) continue;
+      servers.push({
+        name: "workled",
+        client,
+        path: srcPath,
+        server: {
+          url: parsed.url,
+          enabled: parsed.enabled !== false,
+          type: "remote",
+          _dshPluginInstalled: pluginInstalled,
+          _dshPatchExists: true,
+        },
+      });
       continue;
     }
     if (!existsSync(srcPath)) continue;
@@ -522,6 +539,37 @@ function dshWorkledPluginFromPatch(yamlText) {
     i = end;
   }
   return null;
+}
+
+// dsh has no user-editable `mcp` map: the workled server is declared inside the
+// L1 bundle (<dsh-home>/profiles/web/node_modules/workled/patch.yml) and
+// registered in <dsh-home>/profiles/web/package.json. When dsh is targeted but
+// no workled entry is found, diagnose that L1 path instead of telling the user
+// to edit an `mcp` section this client does not have.
+function dshL1Hint() {
+  const home = dshHome();
+  const bundle = join(home, "profiles", "web", "node_modules", "workled");
+  const patch = join(bundle, "patch.yml");
+  const skill = join(home, "skills", "workled");
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+  const cmd = `node ${JSON.stringify(toPosix(join(scriptDir, "skill-install.mjs")))} install --client dsh`;
+
+  let state;
+  if (!existsSync(bundle)) {
+    state = `no workled bundle on the dsh L1 standard path (${toPosix(bundle)})`;
+  } else if (!existsSync(patch)) {
+    state = `bundle dir ${toPosix(bundle)} exists but has no patch.yml`;
+  } else {
+    state = `bundle at ${toPosix(bundle)} carries no workled row (or is missing src/index.js)`;
+  }
+
+  const check = checkWriteAccess([patch, bundle, skill]);
+  const perm = check.ok
+    ? ""
+    : `; L1 path not writable: ${check.path} (${WRITE_ERROR_REASONS[check.code] || check.code})` +
+      " - the install will request elevated permission";
+
+  return `dsh: ${state}${perm}. dsh is configured on the L1 standard path only - run: ${cmd}`;
 }
 
 function getWorkledCandidates(clientPrefix) {
@@ -1078,46 +1126,6 @@ function setAgentState(state) {
   }
 }
 
-// CLI send mode: wait until the queue drains so the background process does
-// not exit before the MCP call completes. Timeout after 15s to avoid hanging
-// the process if the sender loop is stuck.
-// Returns a promise that resolves with { state, sent, error } for the last state.
-const FLUSH_TIMEOUT_MS = 15000;
-async function flushState() {
-  // If nothing pending and not running, return immediately
-  if (pendingState === null && !senderRunning) {
-    return { state: null, sent: true, error: null, superseded: false };
-  }
-
-  // Capture the state that is currently queued (or being sent) so the flush
-  // promise only settles when THAT specific state is actually processed.
-  // null means "wait for full queue drain" — used when sender is mid-flight
-  // with no new pending item but we still want to wait for the running loop
-  // to come all the way back to idle.
-  const targetState = pendingState !== null ? pendingState : null;
-
-  // Resolves when the target state (or queue drain) settles; the timeout timer
-  // is cleared as soon as flush settles so short-lived hook processes do not
-  // linger.
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`flushState timeout after ${FLUSH_TIMEOUT_MS}ms`)),
-      FLUSH_TIMEOUT_MS
-    );
-    flushPromises.push({
-      state: targetState,
-      resolve: (result) => {
-        clearTimeout(timer);
-        resolve(result);
-      },
-      reject: (err) => {
-        clearTimeout(timer);
-        reject(err);
-      },
-    });
-  });
-}
-
 function getUserMessage(event) {
   if (event.type !== "message.updated") return null;
   const props = event.properties || {};
@@ -1636,6 +1644,15 @@ async function runStatusMode() {
     return;
   }
 
+  // Hoisted: needed both by the "nothing configured" early return below and by
+  // the unwired-client hint. Pure (env + filesystem only), so hoisting is safe.
+  const detectedClient = detectClient();
+  // True when dsh is the client under diagnosis: named explicitly via --client,
+  // or the only client this process can identify itself as.
+  const dshTargeted = clientPrefix
+    ? "dsh".startsWith(clientPrefix)
+    : detectedClient === "dsh";
+
   const entries = [];
   const envUrl = process.env.WORKLED_MCP_URL;
   if (envUrl) {
@@ -1657,7 +1674,7 @@ async function runStatusMode() {
     // dsh-only install flags: allow the final status report to distinguish
     // "patch present but URL placeholder" from "plugin vendored" from "both
     // missing" without a second filesystem probe.
-    for (const k of ["_dshPluginInstalled", "_dshPatchExists", "_dshWorkledRow"]) {
+    for (const k of ["_dshPluginInstalled", "_dshPatchExists"]) {
       if (k in s.server) entry[k] = s.server[k];
     }
     entries.push(entry);
@@ -1666,9 +1683,13 @@ async function runStatusMode() {
 
 
   if (entries.length === 0) {
-    out.hint = clientPrefix
-      ? `No \`workled\` server configured for client "${clientPrefix}". Add it under \`mcp\` in that client's config or set WORKLED_MCP_URL.`
-      : "No `workled` server configured. Add it under `mcp` in your agent config or set WORKLED_MCP_URL.";
+    if (dshTargeted) {
+      out.hint = dshL1Hint();
+    } else {
+      out.hint = clientPrefix
+        ? `No \`workled\` server configured for client "${clientPrefix}". Add it under \`mcp\` in that client's config or set WORKLED_MCP_URL.`
+        : "No `workled` server configured. Add it under `mcp` in your agent config or set WORKLED_MCP_URL.";
+    }
     out.duration_ms = Date.now() - startedAt;
     log(`done in ${out.duration_ms}ms (no workled server configured)`);
     console.log(JSON.stringify(out, null, 2));
@@ -1728,7 +1749,7 @@ async function runStatusMode() {
     if (probe && probe.error) entry.error = probe.error;
     // dsh-only install metadata: plugin vendored / patch file exists / workled
     // row is present. Plain entries (JSON/YAML) omit these.
-    for (const k of ["_dshPluginInstalled", "_dshPatchExists", "_dshWorkledRow"]) {
+    for (const k of ["_dshPluginInstalled", "_dshPatchExists"]) {
       if (k in e) entry[k] = e[k];
     }
     return entry;
@@ -1741,15 +1762,20 @@ async function runStatusMode() {
   // configured clients (from loadMcpServers). Here we enrich each with the
   // actual installed artifact paths: its plugin/hooks (plugin) and the workled
   // skill dir (skill). Pure filesystem probe — does not touch the device.
-  const detectedClient = detectClient();
-
   for (const entry of out.clients) {
     // The synthetic "env" entry (WORKLED_MCP_URL) is not an installable
     // client — it carries no config-file-backed mcpEnable, and plugin/skill
     // are meaningless for it, so leave it to just the MCP url fields above.
     if (entry.client === "env") continue;
     entry.mcpEnable = entry.mcpEnable !== false;
-    entry.mcpConfig = !!(entry.mcpEnable !== false && entry.mcpUrl);
+    // An entry reaches out.clients only because loadMcpServers found a workled
+    // server declared in that client's config, so "configured" is simply
+    // "present here". Deriving it from mcpEnable/mcpUrl made the two
+    // diagnostics below (configured-but-disabled / missing-url) unreachable:
+    // both describe exactly the states that the old expression required to be
+    // absent, so those hints could never fire and the user got the generic
+    // "Device unreachable" text instead of the actionable one.
+    entry.mcpConfig = true;
     // plugin / skill: pure path + separate existence probe. Symmetric.
     const t = CLIENT_TARGETS[entry.client];
     const pPath = t?.pluginPath?.();
@@ -1779,9 +1805,9 @@ async function runStatusMode() {
         "hooks — some agents need to manually enable hooks (e.g. Settings -> Hooks); " +
         "DNS — on Windows mDNS is unstable, so in the MCP config prefer a static IP over the .local hostname to avoid intermittent -32001 timeouts.";
     }
-  } else if (out.clients.some((c) => c.mcpConfig && c.mcpEnable === false)) {
+  } else if (out.clients.some((c) => c.client !== "env" && c.mcpConfig && c.mcpEnable === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
-  } else if (out.clients.some((c) => c.mcpConfig && !c.mcpUrl)) {
+  } else if (out.clients.some((c) => c.client !== "env" && c.mcpConfig && !c.mcpUrl)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
   } else {
     if (bluetooth && bluetooth.available === false) {
@@ -1795,13 +1821,23 @@ async function runStatusMode() {
     }
   }
 
+  // dsh has no editable `mcp` map, so the generic advice above does not apply
+  // to it. When dsh is the diagnosis target but nothing is installed on its L1
+  // path, replace the hint with a diagnosis of that path (which carries the
+  // install command itself).
+  const dshMissing = dshTargeted && !out.clients.some((c) => c.client === "dsh");
+  if (dshMissing) out.hint = dshL1Hint();
+
   // Clients that should be wired but aren't: configured clients missing their
   // plugin, plus the running client if it has no MCP config at all (it can't
   // call the device until a full install runs).
   // Only real, installable clients count — the synthetic "env" pseudo-entry
   // (from WORKLED_MCP_URL) is not something `install --client` can target.
   const unwired = out.clients.filter((e) => !e.plugin && CLIENTS.includes(e.client));
-  if (detectedClient && !out.clients.some((c) => c.client === detectedClient)) {
+  // Skip dsh here when its L1 hint already replaced the hint above — that
+  // message names the missing path and the install command, so a second
+  // "wiring not installed for: dsh" line would just repeat it.
+  if (!dshMissing && detectedClient && !out.clients.some((c) => c.client === detectedClient)) {
     unwired.push({ client: detectedClient, plugin: null });
   }
   if (unwired.length > 0) {
@@ -1811,7 +1847,9 @@ async function runStatusMode() {
     const scriptDir = dirname(fileURLToPath(import.meta.url));
     const cmd = `node ${JSON.stringify(toPosix(join(scriptDir, "skill-install.mjs")))} install --client ${target}`;
     const list = unwired.map((e) => e.client).join(", ");
-    out.hint += ` wiring — not installed for: ${list}; run: ${cmd}`;
+    // Appended to a hint that already ends in ".", so start capitalised and
+    // space-separated — a lowercase " wiring —" read as one run-on sentence.
+    out.hint += ` Wiring not installed for: ${list}; run: ${cmd}`;
   }
 
   out.duration_ms = Date.now() - startedAt;
