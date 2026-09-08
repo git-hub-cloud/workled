@@ -3,7 +3,7 @@ name: workled
 description: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
 description_zh: "Agent 状态：`thinking`（思考中）、`waiting`（等待响应）、`idle`（空闲）、`error`（异常报错），可经由 MCP 协议自动同步至 workled 设备；同时支持通过 MCP 协议对设备的灯效、触控宏进行配置。"
 description_en: "The Agent states: `thinking`, `waiting`, `idle`, and `error` are automatically synced to workled via the MCP protocol. Light‑effect parameters and touch macros can also be configured for the device over MCP."
-version: "0.1.28"
+version: "0.1.30"
 display_name: "workled"
 display_name_en: "workled"
 ---
@@ -44,13 +44,12 @@ Use `type:"solid"` unless the user asks for an animation. Map a color name to HS
 
 Rule of thumb: hue 0-359 picks the hue, saturation 0-255 (0 = white/pastel, 255 = vivid), value 0-255 brightness. Pastel/white tones use low saturation; vivid tones use 255.
 
-## Troubleshooting
+## Verify & Troubleshooting
 
-If the device is not responding, or automatic state lighting stays dark, run
-`node <skill-dir>/index.js status` and follow the JSON `hint` it prints. A
-configured client whose `plugin`/hooks are missing shows up there — re-run the
-installer (`skill-install.mjs install --client <name>`) to wire the automatic
-lighting.
+Whenever workled is newly installed, used for the first time in a session, or the LED is not responding:
+
+- In the "Agent" dialog box, enter `Is the workled diagnosis in effect?` or `诊断workled生效了吗？`
+- Or manually run the diagnostic program: `node <skill-dir>/index.js status [--client <name>]`
 
 ## Waiting-state coverage by client
 

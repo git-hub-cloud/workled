@@ -253,9 +253,10 @@ export function toPosix(p) {
 // Idempotent and non-destructive: if `skills/workled` already exists (real dir
 // or link) it is left untouched, so a legitimate flat install is never
 // clobbered. Failures (e.g. a sandbox that denies the write) are swallowed so
-// the caller — the installer or `status` — is never blocked by a link it could
-// not make. Returns human-readable lines for the report (only when a link is
-// actually created).
+// the caller — the installer — is never blocked by a link it could not make.
+// Link creation is the installer's responsibility alone; `status` only reports
+// and never writes. Returns human-readable lines for the report (only when a
+// link is actually created).
 // ---------------------------------------------------------------------------
 export function createSkillJunctions(skillsDir) {
   if (!skillsDir || !existsSync(skillsDir)) return [];

@@ -34,7 +34,6 @@ import {
   traeCnHooksHome,
   toPosix,
   persistentEnvVarNames,
-  createSkillJunctions,
 } from "./utils.js";
 
 const HOME = homedir();
@@ -1812,13 +1811,6 @@ async function runStatusMode() {
     entry.plugin = pPath && t.existPlugin(pPath) ? toPosix(pPath) : null;
     const sPath = t?.skillPath?.();
     entry.skill = sPath && t.existSkill(sPath) ? toPosix(sPath) : null;
-    // Scoped-install repair: if the skill was installed under
-    // `@namespace/workled`, surface it at the canonical `skills/workled` via a
-    // cross-platform link — the same logic the installer runs. Idempotent and
-    // non-destructive; a real flat install or an existing link is left alone,
-    // and failures (e.g. a sandbox that denies the write) are swallowed.
-    const sDir = sPath ? dirname(sPath) : null;
-    for (const m of createSkillJunctions(sDir)) log(m);
   }
 
   if (out.clients.some((c) => c.mcpUrlReachable)) {
