@@ -9,13 +9,14 @@ import { fileURLToPath, pathToFileURL } from "url";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   rmdirSync,
   statSync,
-  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "fs";
@@ -50,6 +51,29 @@ function resolveCorePath() {
   return chosen.split(sep).join("/");
 }
 const corePath = resolveCorePath();
+
+// Entry point a GENERATED artifact (client plugin file / hook command) must
+// import: the self-contained copy installSkill() writes into that client's own
+// skills dir — never the source checkout.
+//
+// Why: installSkill copies the whole tree next to the client precisely so an
+// installed plugin does not depend on the checkout surviving. Emitting
+// corePath there silently re-introduced that dependency, so deleting or moving
+// the checkout broke every plugin and hook even though a working copy sat in
+// the client's own skills dir. Each client references its own copy, which the
+// same install run (re)writes, so the two can never drift.
+//
+// Falls back to corePath only when no copy is on disk yet: an installer running
+// from inside the installed copy (installSkill is then a no-op), or a client
+// without a skillPath. Passing null keeps the old corePath behaviour.
+function entryPathFor(client) {
+  const dir = client ? CLIENT_TARGETS[client]?.skillPath?.() : null;
+  if (dir) {
+    const p = joinP(dir, "index.js");
+    if (existsSync(p)) return p;
+  }
+  return corePath;
+}
 // SKILL_VERSION: single-sourced from SKILL.md frontmatter (the `version` field),
 // with a fallback so a missing or corrupt frontmatter never crashes the installer.
 // (_meta.json was deprecated and removed; the version now lives only in SKILL.md.)
@@ -105,6 +129,25 @@ function removePath(p, opts = {}) {
   if (existsSync(p)) {
     throw new Error(`Failed to remove ${p} (safe-delete shim refused and manual removal was blocked)`);
   }
+}
+
+// Remove a skill install path that may be a link/junction rather than a real
+// directory. A link MUST be removed with a NON-recursive call: removePath's
+// behaviour-2 fallback (removeTreeRobust) walks the tree with readdirSync and
+// unlinks entries one by one — through a junction that deletes the files of the
+// LINK TARGET, i.e. the user's source checkout. rmdirSync on a junction removes
+// only the reparse point (verified: target tree untouched). Anything that is
+// not a link falls through to the normal recursive removal.
+function removeSkillEntry(p) {
+  try {
+    if (lstatSync(p).isSymbolicLink()) {
+      rmdirSync(p);
+      return;
+    }
+  } catch {
+    // lstat threw (already gone, or not inspectable) — fall through to removePath
+  }
+  removePath(p);
 }
 
 // Recursive per-entry removal. Each file is unlinked individually and each
@@ -552,19 +595,20 @@ export function upsertJsoncEntry(text, key, serverName, entry) {
     // No top-level <key> yet: append it inside the root object.
     const rootEnd = findRootObjectEnd(text);
     if (rootEnd < 0) return null;
-    const keyIndent = lineIndentAt(text, rootEnd);
+    // The closing brace's own indent is the ROOT object's indent, so the new
+    // key and its members sit one level deeper. Using it as the key indent
+    // (the previous behaviour) emitted the key flush at column 0.
+    const rootIndent = lineIndentAt(text, rootEnd);
+    const keyIndent = rootIndent + "  ";
     const block = `${JSON.stringify(key)}: {\n${jsoncEntryBlock(serverName, entry, keyIndent + "  ")}\n${keyIndent}}`;
-    let before = text.slice(0, rootEnd);
-    // Clean up interior whitespace when the root object is otherwise empty.
-    // Prevents blank-line accumulation from repeated install/uninstall cycles.
-    const interior = before.slice(1);
-    if (/^\s*$/.test(interior)) {
-      before = "{";
-    }
+    // Trim the whitespace the root's last member was followed by, so the comma
+    // we add lands at the end of that member's line instead of on a line of its
+    // own. A root object that held nothing but whitespace collapses to "{".
+    const before = text.slice(0, rootEnd).replace(/[ \t\r\n]+$/, "") || "{";
     const after = text.slice(rootEnd);
     const prev = prevSignificant(before, before.length);
-    const sep = prev.char === "{" ? "\n" : ",\n";
-    return before + sep + block + "\n" + after;
+    const sep = prev.char === "{" ? "\n" + keyIndent : ",\n" + keyIndent;
+    return before + sep + block + "\n" + rootIndent + after;
   }
   const mapSlice = text.slice(span.start, span.end);
   // Use the brace-balancing scanner (not the naive `[^{}]*` regex) so a
@@ -641,29 +685,45 @@ export function removeJsoncEntry(text, key, serverName) {
   const removeTo   = objAbsoluteEnd + 1; // include the closing `}`
 
   const after = nextSignificant(text, removeTo);
+  // A removal must be whitespace-neutral: an earlier version dropped the entry
+  // and its comma but left the line break it sat on, stranding one blank line
+  // per install/uninstall cycle (measured: 5 blank lines in opencode.json after
+  // 5 cycles). Exactly one source of indentation is kept per branch below —
+  // consuming both, or neither, doubles or loses the indent.
+  const prefix = text.slice(0, removeFrom);
   if (after.char === ",") {
-    // Not the last member: drop the entry and the comma that followed it.
-    return text.slice(0, removeFrom) + text.slice(after.index + 1);
+    // Not the last member: drop the entry, the comma that followed it, and the
+    // next member's line break + indent. The prefix still carries the removed
+    // member's own indent, so the layout under the map is unchanged.
+    const tail = text.slice(after.index + 1);
+    const m = tail.match(/^\r?\n[ \t]*/);
+    return prefix + tail.slice(m ? m[0].length : 0);
   }
   const prev = prevSignificant(text, removeFrom);
   if (prev.char === ",") {
     // Last member: also drop the comma that preceded it.
     return text.slice(0, prev.index) + text.slice(removeTo);
   }
-  // Only member: drop just the entry (the map becomes {}).
-  return text.slice(0, removeFrom) + text.slice(removeTo);
+  // Only member: the prefix's trailing indent belonged to the removed line, so
+  // it goes with it and the map's closing brace keeps its own indent. The map
+  // stays on one line when it was written that way.
+  const tail = text.slice(removeTo);
+  const m = tail.match(/^\r?\n/);
+  return prefix.replace(/[ \t]+$/, "") + tail.slice(m ? m[0].length : 0);
 }
 
 // ---- hook command construction (hermes) -------------------------------
 
-function hookCommand(eventName) {
+function hookCommand(eventName, client = null) {
   // Cross-platform: invoke `node` from PATH as a bare command name so the line
   // parses under any shell (bash for Claude Code/workbuddy, PowerShell for
-  // trae-cn). Quote corePath only when it contains spaces — otherwise leave it
-  // bare. Note for hermes/YAML: JSON.stringify escapes the quotes correctly for
-  // the YAML scalar, and keeping the path bare (no manual wrapping) avoids the
-  // window path/backslash corruption documented below.
-  const core = /\s/.test(corePath) ? `"${corePath}"` : corePath;
+  // trae-cn). Quote the entry path only when it contains spaces — otherwise
+  // leave it bare. Note for hermes/YAML: JSON.stringify escapes the quotes
+  // correctly for the YAML scalar, and keeping the path bare (no manual
+  // wrapping) avoids the window path/backslash corruption documented below.
+  // `client` selects that client's installed copy (see entryPathFor).
+  const entry = entryPathFor(client);
+  const core = /\s/.test(entry) ? `"${entry}"` : entry;
   const base = `node ${core} hook`;
   return eventName ? `${base} --event ${eventName}` : base;
 }
@@ -903,9 +963,11 @@ export function workledHookCommand(eventName, client, url) {
   // and Windows PowerShell (trae-cn): a spaced "quoted path first" token is a
   // parse error in PowerShell (needs the `&` call operator) yet the same string
   // would run `&` as a background operator in bash — so absolute-node forms
-  // can never satisfy both. Only corePath is quoted, and only when it has
-  // spaces, so the command stays valid on every shell.
-  const core = /\s/.test(corePath) ? `"${corePath}"` : corePath;
+  // can never satisfy both. Only the entry path is quoted, and only when it has
+  // spaces, so the command stays valid on every shell. The path is this
+  // client's own installed copy (entryPathFor), not the source checkout.
+  const entry = entryPathFor(client);
+  const core = /\s/.test(entry) ? `"${entry}"` : entry;
   let cmd = `node ${core} hook --event ${eventName} --client ${client}`;
   // The hook discovers the MCP URL at runtime from its own configuration
   // (mcp.json / WORKLED_MCP_URL), so no --url is inlined here. This keeps the
@@ -1031,12 +1093,18 @@ export function mergeClientHooks(cfg, { client, commandForEvent, version }) {
           {
             type: "command",
             command: commandForEvent(ev),
-            // Host-side watchdog cap. The hook now returns immediately (the
-            // actual device send is delegated to a detached `send` child, so the
-            // host never waits on the device link). This cap only needs to cover
-            // node startup + stdin-read overhead + spawning that child; a small
-            // fixed budget is enough and never blocks the prompt.
-            timeout: 5,
+            // Host-side watchdog cap, in seconds. It governs exactly one event:
+            // Stop, which declares no `async` so the host waits for the process
+            // to exit (that is what keeps it alive across the turn-end worker
+            // recycle — a detached child is inside the same job object and dies
+            // with it). The other four events declare `{async:true,
+            // asyncTimeout:12000}` and are released ~250ms in, so this cap only
+            // covers the pre-declaration stretch for them.
+            // Budget for the sync path: node startup + one .local mDNS resolve +
+            // one stateless POST, typically 1.2-1.5s, with a measured 5050ms
+            // spike on a slow resolve. 10s covers the spike without letting a
+            // genuinely wedged device stall the turn.
+            timeout: 10,
           },
         ],
       };
@@ -1351,16 +1419,41 @@ function openclawPluginDir() {
   return joinP(h, ".openclaw", "plugins");
 }
 
-// Load ~/.openclaw/openclaw.json (or {} if missing/unparseable).
+// Parse openclaw.json text. Exported for unit tests.
+//   object -> the config
+//   null   -> present, but not a parseable config object
+// openclaw itself reads this file with JSON5, so user comments and trailing
+// commas are legal; JSONC stripping covers the comment/trailing-comma subset
+// and anything beyond it must be reported, never coerced to an empty object.
+// Arrays and scalars count as "not a config": the caller merges `plugins` into
+// the result and writes it back, which an array would silently drop.
+export function parseOpenclawConfigText(text) {
+  try {
+    const parsed = JSON.parse(stripJsonc(text));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Load ~/.openclaw/openclaw.json. Tri-state on purpose:
+//   {}     -> file absent (a fresh config is safe to create)
+//   object -> parsed config
+//   null   -> file exists but is unparseable
+// `null` must never be treated as "no workled entries": both install and
+// uninstall write the object back WHOLE, so an empty fallback would replace the
+// user's entire config (agents/models/... measured 346 lines on this machine)
+// with a stub. Callers refuse to write instead - see skippedOpenclawConfig().
 function readOpenclawConfig() {
   const p = openclawConfigPath();
   if (!existsSync(p)) return {};
-  try {
-    const parsed = JSON.parse(readFileSync(p, "utf8"));
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
+  return parseOpenclawConfigText(readFileSync(p, "utf8"));
+}
+
+// The single "refused to touch it" message for openclaw.json, so install and
+// uninstall report the same reason (mirrors addMcpServerNested's wording).
+function skippedOpenclawConfig(file = openclawConfigPath()) {
+  return `SKIPPED workled -> openclaw.json (${file}): config file unreadable, not modified`;
 }
 
 // openclaw install, manifest + config portion only. The entry file is written
@@ -1370,6 +1463,13 @@ function readOpenclawConfig() {
 async function installOpenclawManifest() {
   const dest = CLIENT_TARGETS.openclaw.pluginPath();
   const destDir = dirname(dest);
+
+  // Read the config BEFORE writing anything. An unparseable file must be left
+  // untouched (see readOpenclawConfig); bailing here also avoids leaving a
+  // manifest for a plugin the config never references.
+  const cfg = readOpenclawConfig();
+  if (cfg === null) return skippedOpenclawConfig();
+
   // The entry file is already written by the caller; ensure the dir exists for
   // the manifest (idempotent on re-run).
   mkdirSync(destDir, { recursive: true });
@@ -1380,8 +1480,6 @@ async function installOpenclawManifest() {
     JSON.stringify(OPENCLAW_PLUGIN_MANIFEST, null, 2) + "\n",
     "utf8"
   );
-
-  const cfg = readOpenclawConfig();
   const entryPath = dest.replace(/\\/g, "/");
   const plugins = (cfg.plugins && typeof cfg.plugins === "object" ? cfg.plugins : {});
   const load = (plugins.load && typeof plugins.load === "object" ? plugins.load : {});
@@ -1410,7 +1508,9 @@ async function installOpenclawManifest() {
   let verified = false;
   for (let i = 0; i < 6; i++) {
     await sleep(1000);
-    const check = readOpenclawConfig();
+    // `?? {}` only covers a file that turned unreadable mid-verify: it simply
+    // counts as "not verified yet" and the !verified branch below handles it.
+    const check = readOpenclawConfig() ?? {};
     const pathsOk = Array.isArray(check.plugins?.load?.paths) &&
       check.plugins.load.paths.some(p => String(p).includes("workled"));
     const entryOk = !!(check.plugins?.entries?.workled?.enabled);
@@ -1425,11 +1525,12 @@ async function installOpenclawManifest() {
     // Config didn't stabilise — write it one more time directly (no merge)
     // to bypass any rollback edge-case with empty existing plugins.
     const cfg2 = readOpenclawConfig();
+    if (cfg2 === null) return skippedOpenclawConfig(configPath);
     cfg2.plugins = { ...cfg.plugins };
     writeConfig(configPath, cfg2);
     // Verify again
     await sleep(2000);
-    const final = readOpenclawConfig();
+    const final = readOpenclawConfig() ?? {};
     if (!final.plugins?.entries?.workled) {
       return `Installed openclaw manifest -> ${destDir}\n⚠ Config update may have been rolled back by Gateway restart. Run the install again or restart the Gateway manually.`;
     }
@@ -1468,6 +1569,13 @@ function stripWorkledFromOpenclawConfig(cfg) {
 }
 
 async function uninstallOpenclaw() {
+  const configPath = openclawConfigPath();
+  // Refuse up front when the config cannot be parsed. The plugin dir and its
+  // config entry are removed as a pair, and writing a stripped fallback object
+  // would replace the user's whole config with a stub (see readOpenclawConfig).
+  const current = readOpenclawConfig();
+  if (current === null) return skippedOpenclawConfig(configPath);
+
   const destDir = joinP(openclawPluginDir(), "workled");
   let msg = "";
   if (existsSync(destDir)) {
@@ -1481,8 +1589,7 @@ async function uninstallOpenclaw() {
   // Always read the current config and remove workled entries, then write.
   // We must write unconditionally because the Gateway file watcher may have
   // already rolled back the config to .bak between our read and any write.
-  const configPath = openclawConfigPath();
-  let cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
+  let cleaned = stripWorkledFromOpenclawConfig(current);
 
   // Write the cleaned config via the shared helper (no merge round-trip, so
   // stale workled entries from a concurrently-modified file cannot resurface).
@@ -1497,16 +1604,20 @@ async function uninstallOpenclaw() {
   // rewrite the clean config one more time.
   for (let i = 0; i < 8; i++) {
     await sleep(1000);
-    const check = readOpenclawConfig();
+    const check = readOpenclawConfig() ?? {};
     const hasWorkled = check.plugins?.load?.paths?.some(p => String(p).includes("workled"))
       || check.plugins?.entries?.workled;
     if (!hasWorkled) return msg.trimEnd() || `No openclaw workled plugin installed`;
   }
 
-  // Gateway didn't stabilise — force-write clean config one final time.
-  cleaned = stripWorkledFromOpenclawConfig(readOpenclawConfig());
-  writeConfig(configPath, cleaned.cfg);
-  msg += `Force-cleaned openclaw.json (Gateway rollback recovery)\n`;
+  // Gateway didn't stabilise — force-write clean config one final time. Skip the
+  // write (but keep the report) if the file became unparseable in the meantime.
+  const again = readOpenclawConfig();
+  if (again !== null) {
+    cleaned = stripWorkledFromOpenclawConfig(again);
+    writeConfig(configPath, cleaned.cfg);
+    msg += `Force-cleaned openclaw.json (Gateway rollback recovery)\n`;
+  }
   return msg.trimEnd();
 }
 
@@ -1523,32 +1634,36 @@ function entryFile(lines) {
   return [ENTRY_HEADER, ...lines, ""].join("\n");
 }
 
+// Every generator takes the client name and imports that client's own
+// installed copy (entryPathFor), so a generated plugin keeps working after the
+// source checkout is moved or deleted.
+//
 // opencode: the plugins dir auto-loads EVERY exported function as a plugin, so
 // the installed file exposes a single plugin function that adapts the entry's
 // register() into opencode's factory shape.
 // Dest (CLIENT_TARGETS.opencode.pluginPath()): ~/.config/opencode/plugins/workled.js
-function opencodeEntryFile() {
+function opencodeEntryFile(client) {
   return entryFile([
-    `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
+    `import { opencodeEntry as core } from "${fileUrl(entryPathFor(client))}";`,
     `export const workled = async (ctx) => await core.register(ctx);`,
   ]);
 }
 
 // openclaw: Gateway loads via plugins.load.paths; wraps the entry with the SDK.
 // Dest (CLIENT_TARGETS.openclaw.pluginPath()): ~/.openclaw/plugins/workled/index.js
-function openclawEntryFile() {
+function openclawEntryFile(client) {
   return entryFile([
     `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";`,
-    `import { openclawEntry } from "${fileUrl(corePath)}";`,
+    `import { openclawEntry } from "${fileUrl(entryPathFor(client))}";`,
     `export default definePluginEntry(openclawEntry);`,
   ]);
 }
 
 // pi: extensions take the default export as (pi: ExtensionAPI) => void.
 // Dest (CLIENT_TARGETS.pi.pluginPath()): ~/.pi/agent/extensions/workled/index.ts
-function piEntryFile() {
+function piEntryFile(client) {
   return entryFile([
-    `import { piEntry } from "${fileUrl(corePath)}";`,
+    `import { piEntry } from "${fileUrl(entryPathFor(client))}";`,
     `export default (pi) => piEntry.register(pi);`,
   ]);
 }
@@ -1557,9 +1672,9 @@ function piEntryFile() {
 // opencode, so it reuses opencodeEntry. The installed file is a module
 // descriptor (default export { id, server }) in the single `plugin/` dir.
 // Dest (CLIENT_TARGETS.kilo.pluginPath()): ~/.config/kilo/plugin/workled.js
-function kiloEntryFile() {
+function kiloEntryFile(client) {
   return entryFile([
-    `import { opencodeEntry as core } from "${fileUrl(corePath)}";`,
+    `import { opencodeEntry as core } from "${fileUrl(entryPathFor(client))}";`,
     `export default {`,
     `  id: "workled",`,
     `  server: async (ctx) => await core.register(ctx),`,
@@ -1604,9 +1719,9 @@ export function hermesHookEvents() {
   ];
 }
 
-function hermesCommandYaml(ev) {
+function hermesCommandYaml(ev, client = null) {
   // JSON.stringify produces valid YAML double-quoted scalar (backslashes/escaping).
-  return JSON.stringify(hookCommand(ev));
+  return JSON.stringify(hookCommand(ev, client));
 }
 
 // True when <line> is a YAML document boundary:
@@ -1721,7 +1836,9 @@ function detectEventIndent(blockLines) {
 
 // Exported for unit tests (fixes #9). Purely rewrites the hermes hooks block;
 // does not touch the filesystem (the filesystem helpers call into this).
-export function installHermesHooks(yamlText) {
+// `client` selects the entry point the emitted commands reference (defaults to
+// the installer's own copy, which is what the unit tests exercise).
+export function installHermesHooks(yamlText, client = null) {
   const events = hermesHookEvents();
   const split = splitTopLevelBlock(yamlText, "hooks");
   if (!split) {
@@ -1730,7 +1847,7 @@ export function installHermesHooks(yamlText) {
       "hooks:",
       ...events.map((ev) => [
         `  ${ev}:`,
-        `    - command: ${hermesCommandYaml(ev)}`,
+        `    - command: ${hermesCommandYaml(ev, client)}`,
       ]).flat(),
     ].join("\n");
     const trimmed = yamlText.trimEnd();
@@ -1758,7 +1875,7 @@ export function installHermesHooks(yamlText) {
       out.push(line);
       if (events.includes(currentEvent) && !ensured.has(currentEvent)) {
         ensured.add(currentEvent);
-        out.push(`${evIndentMatch[1]}  - command: ${hermesCommandYaml(currentEvent)}`);
+        out.push(`${evIndentMatch[1]}  - command: ${hermesCommandYaml(currentEvent, client)}`);
       }
       continue;
     }
@@ -1781,7 +1898,7 @@ export function installHermesHooks(yamlText) {
   for (const ev of events) {
     if (ensured.has(ev)) continue;
     out.push(`${indent}${ev}:`);
-    out.push(`${indent}  - command: ${hermesCommandYaml(ev)}`);
+    out.push(`${indent}  - command: ${hermesCommandYaml(ev, client)}`);
   }
   const before = lines.slice(0, split.start);
   const after = lines.slice(split.end);
@@ -1873,13 +1990,33 @@ function hermesAllowlistPath() {
   return joinP(hermesHome(), "shell-hooks-allowlist.json");
 }
 
+// Every command this installer has ever written into the hermes allowlist has
+// the shape `node <...>/workled/index.js hook --event <event>`. The entry path
+// changes over time (source checkout before entryPathFor, the client's own
+// installed copy after it), so revoking by exact string match leaves every
+// earlier approval behind — 10 stale rows survived uninstall that way, still
+// pointing at the checkout. Recognise our own rows structurally instead.
+// The match is deliberately narrow: the command must invoke an index.js inside
+// a `workled` directory, through `hook`, with an `--event` argument. Nothing a
+// user hand-writes for another tool looks like that.
+const WORKLED_HOOK_COMMAND_RE =
+  /^\s*node\s+(?:"([^"]+)"|(\S+))\s+hook\s+--event\s+(\w+)(?:\s+--client\s+[\w-]+)?\s*$/;
+
+function isWorkledAllowlistEntry(entry) {
+  if (!entry || typeof entry.command !== "string") return false;
+  const m = entry.command.match(WORKLED_HOOK_COMMAND_RE);
+  if (!m) return false;
+  const entryPath = (m[1] ?? m[2]).replace(/\\/g, "/");
+  return /(^|\/)workled\/index\.js$/i.test(entryPath);
+}
+
 // Pure JSON edit, exported for unit tests. Adds one approval per event using
 // the same command string the config.yaml hook rows carry (hookCommand(ev) is
 // the single source; hermesCommandYaml merely JSON-quotes it, and YAML parsing
 // yields the identical scalar). Idempotent: existing (event, command) pairs are
 // kept untouched, as are all non-workled approvals. script_mtime_at_approval is
 // intentionally omitted — hermes only uses it for `hooks doctor` drift hints.
-export function approveHermesAllowlist(jsonText, events) {
+export function approveHermesAllowlist(jsonText, events, client = null) {
   let data;
   try {
     data = JSON.parse(jsonText);
@@ -1888,10 +2025,19 @@ export function approveHermesAllowlist(jsonText, events) {
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
   if (!Array.isArray(data.approvals)) data.approvals = [];
+  const current = new Set(events.map((ev) => hookCommand(ev, client)));
+  // Migrate: drop our own rows left over from an earlier entry path before
+  // adding the current ones, so a re-install after the path changed replaces
+  // the approvals instead of stacking a second set beside the stale rows.
+  const before = data.approvals.length;
+  data.approvals = data.approvals.filter(
+    (e) => !(isWorkledAllowlistEntry(e) && !current.has(e.command))
+  );
+  const pruned = before - data.approvals.length;
   const approvedAt = new Date().toISOString();
   let added = 0;
   for (const ev of events) {
-    const command = hookCommand(ev);
+    const command = hookCommand(ev, client);
     const exists = data.approvals.some(
       (e) => e && e.event === ev && e.command === command
     );
@@ -1899,24 +2045,25 @@ export function approveHermesAllowlist(jsonText, events) {
     data.approvals.push({ event: ev, command, approved_at: approvedAt });
     added++;
   }
-  return { text: JSON.stringify(data, null, 2) + "\n", added };
+  return { text: JSON.stringify(data, null, 2) + "\n", added, pruned };
 }
 
-// Pure JSON edit, exported for unit tests. Drops exactly workled's own
-// (event, command) approvals; every other entry survives. Returns the new text
+// Pure JSON edit, exported for unit tests. Drops workled's own approvals —
+// both the current commands and any row from a previous entry path (see
+// isWorkledAllowlistEntry); every other entry survives. Returns the new text
 // plus how many entries were removed so the caller can decide whether to
 // persist (and whether the file is now empty enough to delete).
-export function revokeHermesAllowlist(jsonText, events) {
+export function revokeHermesAllowlist(jsonText, events, client = null) {
   let data;
   try {
     data = JSON.parse(jsonText);
   } catch {
     return { text: jsonText, removed: 0 };
   }
-  const commands = new Set(events.map((ev) => hookCommand(ev)));
+  const commands = new Set(events.map((ev) => hookCommand(ev, client)));
   const before = Array.isArray(data?.approvals) ? data.approvals.length : 0;
   const kept = (data.approvals || []).filter(
-    (e) => !(e && commands.has(e.command))
+    (e) => !(e && (commands.has(e.command) || isWorkledAllowlistEntry(e)))
   );
   if (kept.length === before) return { text: jsonText, removed: 0 };
   data.approvals = kept;
@@ -1926,24 +2073,26 @@ export function revokeHermesAllowlist(jsonText, events) {
 // File-level wrapper for install: persist the approvals, reporting only what
 // changed. Never writes when there is nothing to add (preserves file mtime and
 // any concurrent edits hermes may have made).
-function applyHermesAllowlist() {
+function applyHermesAllowlist(client = null) {
   const p = hermesAllowlistPath();
   const current = existsSync(p) ? readFileSync(p, "utf8") : "";
-  const { text, added } = approveHermesAllowlist(current, hermesHookEvents());
-  if (added > 0) {
+  const { text, added, pruned } = approveHermesAllowlist(current, hermesHookEvents(), client);
+  // `pruned` alone still needs a write: migrating stale rows to the current
+  // entry path adds nothing when the current rows are already there.
+  if (added > 0 || pruned > 0) {
     mkdirSync(dirname(p), { recursive: true });
     writeFileSync(p, text, "utf8");
   }
-  return { path: p, added };
+  return { path: p, added, pruned };
 }
 
 // File-level wrapper for uninstall: remove workled's approvals. When nothing
 // of ours remains the file is left as-is; when it becomes empty because of our
 // removal we delete it so an uninstall leaves zero residue.
-function stripHermesAllowlist() {
+function stripHermesAllowlist(client = null) {
   const p = hermesAllowlistPath();
   if (!existsSync(p)) return { path: p, removed: 0 };
-  const { text, removed } = revokeHermesAllowlist(readFileSync(p, "utf8"), hermesHookEvents());
+  const { text, removed } = revokeHermesAllowlist(readFileSync(p, "utf8"), hermesHookEvents(), client);
   if (removed > 0) {
     let remaining = 0;
     try {
@@ -1960,22 +2109,26 @@ function stripHermesAllowlist() {
   return { path: p, removed };
 }
 
-function installHermes() {
+function installHermes(client = null) {
   const cfg = joinP(hermesHome(), "config.yaml");
   mkdirSync(dirname(cfg), { recursive: true });
   const existing = existsSync(cfg) ? readFileSync(cfg, "utf8") : "";
-  const withHooks = installHermesHooks(existing);
+  const withHooks = installHermesHooks(existing, client);
   writeFileSync(cfg, withHooks, "utf8");
-  const allow = applyHermesAllowlist();
+  const allow = applyHermesAllowlist(client);
   return (
     `Installed hermes shell hooks -> ${cfg}\n` +
-    `Allowlisted ${allow.added} workled hook command(s) -> ${allow.path}`
+    `Allowlisted ${allow.added} workled hook command(s) -> ${allow.path}` +
+    // A re-install after the entry path changed replaces stale approvals rather
+    // than adding a second set; surface that so "Allowlisted 0" never looks
+    // like a no-op when the file was in fact rewritten.
+    (allow.pruned > 0 ? ` (replaced ${allow.pruned} entr(y/ies) from an earlier path)` : "")
   );
 }
 
-function uninstallHermes() {
+function uninstallHermes(client = null) {
   const cfg = joinP(hermesHome(), "config.yaml");
-  const allow = stripHermesAllowlist();
+  const allow = stripHermesAllowlist(client);
   if (!existsSync(cfg)) {
     return allow.removed > 0
       ? `No hermes config at ${cfg}; revoked ${allow.removed} allowlist entr(y/ies) -> ${allow.path}`
@@ -2007,18 +2160,53 @@ function uninstallHermes() {
 // uninstall removes only the workled directory (leaf directories with other
 // files are left untouched).
 
+// Install the skill by copying the whole tree into the client's skills/workled
+// directory — no junction, no symlink.
+//
+// Why a copy rather than a link: the skill ships as a self-contained tree, so
+// an installed copy must not depend on a source checkout still being there. A
+// junction into the checkout breaks as soon as the skill is installed from a
+// release artifact (there is no checkout to point at), and it also exposes the
+// whole repo — including .git — to the client. Re-run install after editing the
+// source; that is the price of a self-contained install. (The earlier link
+// install avoided that re-install, but only ever worked on a dev machine.)
+//
+// Replacing an existing entry is deliberate: an install from before this change
+// is a legacy junction, and it has to go before the copy can be written there.
+// It is our own skill directory either way, and removeSkillEntry guarantees a
+// link is never walked through.
 function installSkill(client) {
   const t = CLIENT_TARGETS[client];
   if (!t?.skillPath) return null;
   const destDir = t.skillPath();
   if (!destDir) return null;
-  const srcDir = scriptDir; // project source directory with all skill files
+  // Resolve the true source directory so an installer invoked through a legacy
+  // linked install still copies from the real tree rather than from the link.
+  const srcDir = realpathSync(scriptDir);
   if (!existsSync(srcDir)) return null;
-  // Recursively copy entire skill directory
+
+  // Never copy the skill onto itself. When the installer is itself run from an
+  // installed copy, scriptDir IS this client's skill directory: removing the
+  // destination first would delete the very tree we are about to read from, and
+  // the copy would end up empty. It is already installed there — nothing to do.
+  if (resolve(srcDir).toLowerCase() === resolve(destDir).toLowerCase()) return null;
+
+  // lstat (not existsSync) so a dangling link still counts as present and gets
+  // replaced rather than making the copy trip over it.
+  let destPresent = true;
+  try {
+    lstatSync(destDir);
+  } catch {
+    destPresent = false;
+  }
+  if (destPresent) removeSkillEntry(destDir);
+
+  mkdirSync(dirname(destDir), { recursive: true });
   cpDir(srcDir, destDir);
-  // A copy that silently wrote nothing still used to report success, which
-  // left a dangling entry point: the user then ran `node <dest>/index.js`
-  // against a file that was never created. Verify the one file every entry
+
+  // A copy that landed somewhere wrong would still report success, which
+  // leaves a dangling entry point: the user then runs `node <dest>/index.js`
+  // against a file that is not reachable. Verify the one file every entry
   // point needs before claiming the copy worked.
   if (!existsSync(joinP(destDir, "index.js"))) {
     throw new Error(`skill copy produced no index.js at ${joinP(destDir, "index.js")}`);
@@ -2032,7 +2220,9 @@ function uninstallSkill(client) {
   const destDir = t.skillPath();
   if (!destDir) return null;
   if (!existsSync(destDir)) return null;
-  removePath(destDir);
+  // removeSkillEntry, not removePath: with junction installs the entry is a
+  // link, and a recursive removal fallback must never walk into the source.
+  removeSkillEntry(destDir);
   removeEmptyParent(dirname(destDir));
   return `Removed skill directory -> ${destDir}`;
 }
@@ -2050,7 +2240,9 @@ function removeSkillJunctions(skillsDir) {
   const workledDir = joinP(skillsDir, "workled");
   if (!existsSync(workledDir)) return msgs;
   try {
-    removePath(workledDir);
+    // removeSkillEntry: this entry may be a junction, which must be unlinked
+    // rather than recursed into (see that helper).
+    removeSkillEntry(workledDir);
     msgs.push(`Removed workled skill directory ${workledDir}`);
   } catch {
     // removal failed, skip silently
@@ -2356,11 +2548,10 @@ async function runPostInstallStatus(client, corePath) {
     return;
   }
 
-  // `--client` still leaves the synthetic WORKLED_MCP_URL entry in the report;
-  // it is not an installable client, so it has no install state to show.
-  const entries = (status.clients || []).filter(
-    (e) => e.client !== "env" && e.client.startsWith(client)
-  );
+  // clients[] holds installable clients only — the WORKLED_MCP_URL override is
+  // reported as a top-level field plus a hint sentence, never as an entry, so
+  // this is a plain per-client match.
+  const entries = (status.clients || []).filter((e) => e.client.startsWith(client));
 
   console.log("");
   console.log("Status check:");
@@ -2469,8 +2660,13 @@ async function main() {
         const dest = t.pluginPath();
         const destDir = dirname(dest);
         if (isInstall) {
+          // Install the self-contained copy FIRST: the generated entry file
+          // imports that copy (entryPathFor), so it must exist before the file
+          // referencing it is written.
+          const skillMsg = installSkill(c);
+          if (skillMsg) lines.push(skillMsg);
           mkdirSync(destDir, { recursive: true });
-          writeFileSync(dest, PLUGIN_CLIENTS[c](), "utf8");
+          writeFileSync(dest, PLUGIN_CLIENTS[c](c), "utf8");
           lines.push(`Installed ${c} ${t.label} -> ${dest}`);
           // openclaw additionally writes the plugin manifest + openclaw.json
           // registration; its entry file is generated by the same shared path.
@@ -2478,9 +2674,6 @@ async function main() {
             lines.push(await installOpenclawManifest());
           }
           lines.push(...(await registerWorkledMcp(c, mcpEntry)));
-          // Copy SKILL.md to client's skills directory
-          const skillMsg = installSkill(c);
-          if (skillMsg) lines.push(skillMsg);
           // Create junction for @namespace/workled if present
           const junctionMsgs = createSkillJunctions(dirname(t.skillPath()));
           lines.push(...junctionMsgs);
@@ -2509,17 +2702,24 @@ async function main() {
       }
       case "hermes": {
         const hh = hermesHome();
-        lines.push(isInstall ? installHermes() : uninstallHermes());
         if (isInstall) {
-          lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
+          // Copy first: installHermes() emits hook commands that reference this
+          // client's own installed copy (entryPathFor), and the allowlist must
+          // record the very same command string the config carries.
           const skillMsg = installSkill("hermes");
           if (skillMsg) lines.push(skillMsg);
+          lines.push(installHermes("hermes"));
+          lines.push(...(await registerWorkledMcp("hermes", mcpEntry)));
           const hermesT = CLIENT_TARGETS.hermes;
           if (hermesT?.skillPath) {
             const junctionMsgs = createSkillJunctions(dirname(hermesT.skillPath()));
             lines.push(...junctionMsgs);
           }
         } else {
+          // Mirror image: revoke the allowlist / hooks BEFORE deleting the
+          // copy, because the revoke predicate is byte-exact against the
+          // command that copy produces.
+          lines.push(uninstallHermes("hermes"));
           lines.push(...unregisterWorkledMcp("hermes"));
           const skillMsg = uninstallSkill("hermes");
           if (skillMsg) lines.push(skillMsg);
@@ -2595,9 +2795,10 @@ async function main() {
         // user-level lifecycle hooks (settings.json) rather than by agent
         // discipline; install wires MCP + hooks, uninstall removes both.
         if (isInstall) {
-          lines.push(...(await installWorkbuddy(mcpEntry)));
+          // Copy first: the hook commands written below reference it.
           const skillMsg = installSkill("workbuddy");
           if (skillMsg) lines.push(skillMsg);
+          lines.push(...(await installWorkbuddy(mcpEntry)));
           const wbT = CLIENT_TARGETS.workbuddy;
           if (wbT?.skillPath) {
             const junctionMsgs = createSkillJunctions(dirname(wbT.skillPath()));
@@ -2623,16 +2824,27 @@ async function main() {
         // placeholder the user must still replace it in Settings → MCP, and the
         // Hooks config needs manual enabling in Settings > Hooks to fire.
         if (isInstall) {
-          lines.push(...installTraeCn(mcpEntry));
+          // Copy first: the hook commands written by installTraeCn() reference
+          // this client's own installed copy.
           const skillMsg = installSkill("trae-cn");
           if (skillMsg) lines.push(skillMsg);
+          lines.push(...installTraeCn(mcpEntry));
           const traeT = CLIENT_TARGETS["trae-cn"];
           if (traeT?.skillPath) {
             const junctionMsgs = createSkillJunctions(dirname(traeT.skillPath()));
             lines.push(...junctionMsgs);
           }
+          // The placeholder reminder is conditional: when a real URL was
+          // resolved (WORKLED_MCP_URL, or an existing entry kept in place)
+          // there is no `<device-name>` left to replace, and telling the user
+          // to go look for one is noise.
+          const traePlaceholder = String(mcpEntry?.url || "").includes("<device-name>");
           lines.push(
-            "trae-cn: MCP written to <user-data>/User/mcp.json (reload to pick it up). Replace <device-name> in Settings → MCP if a placeholder was written, and enable the workled hooks in Settings → Hooks for agent-state tracking."
+            "trae-cn: MCP written to <user-data>/User/mcp.json (reload to pick it up)." +
+              (traePlaceholder
+                ? " Replace <device-name> in Settings → MCP with your real device name."
+                : "") +
+              " Enable the workled hooks in Settings → Hooks for agent-state tracking."
           );
         } else {
           lines.push(...uninstallTraeCn());

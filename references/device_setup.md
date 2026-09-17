@@ -150,39 +150,32 @@ node <skill-dir>/index.js status
 
 The command scans the MCP config of every client (opencode,
 trae-cn, openclaw, pi, workbuddy, hermes, dsh) and lists every server named
-`workled` (`WORKLED_MCP_URL`, if set, is reported first as the `env` entry),
-checking each reachability with a **stateless** `tools/call get_agent_state`
-probe. Each URL is probed up to 2 times with backoff (the attempt count is not
-shown in the output). Fields:
+`workled`, checking each reachability with a **stateless** `tools/call get_agent_state`
+probe. Fields:
 
 - `bluetooth` — `{ available, powered, devicePaired, deviceNames, error? }`; BLE pairing
   matters for the touch-pad macros (the LED + macro only need Wi-Fi)
+- `WORKLED_MCP_URL` — present only when the env var is set
 - `clients` — one entry per discovered MCP config. Every functional client
   requires an MCP server (that is how the agent calls the device), so only
-  MCP-configured clients appear here. Fields per entry:
-  - `client` — the client id (or `env` for the `WORKLED_MCP_URL` override)
+  MCP-configured clients appear here; the `WORKLED_MCP_URL` override never
+  appears as an entry. Fields per entry:
+  - `client` — the client id
   - `mcpPath` — path of the MCP config file that declares the server
-    (for `env`, the literal `WORKLED_MCP_URL`)
   - `mcpUrl` — the configured workled server URL
-  - `mcpEnable` — whether the server is enabled (absent `enabled` ⇒ `true`);
-    omitted for the `env` override entry
+  - `mcpEnable` — whether the server is enabled (absent `enabled` ⇒ `true`)
   - `mcpUrlReachable` — whether the URL answered a stateless `get_agent_state` probe
-  - `WORKLED_MCP_URL` — present only on the `env` override entry; holds the
-    override URL. The `env` entry has no config file, so unlike real clients it
-    emits no `mcpPath` / `mcpUrl` / `mcpEnable`
   - `mcpConfig` — `true` whenever this client has a workled row in its MCP
     config; the entry is here precisely because it does, so this is equivalent
     to "is this client MCP-configured". Used to gate the `configured but
-    disabled` / `no url` diagnostics below; omitted for the `env` override
-    entry
+    disabled` / `no url` diagnostics below
   - `plugin` — the actual installed plugin/hooks artifact path for that client
     (generated entry file, or the config/hooks file carrying the workled
-    marker), or `null` when not installed; omitted for the `env` override entry
+    marker), or `null` when not installed
   - `skill` — the per-client skill directory where SKILL.md is installed
     (e.g. `~/.workbuddy/skills/workled`; openclaw uses
     `~/.openclaw/workspace/skills/workled` since its TUI installs there), or
-    `null` when not installed for that client; omitted for the `env` override
-    entry
+    `null` when not installed for that client
 - `hint` — a concrete next step for the current state
 - `ok` / `exitCode` — success flag and process exit code
 

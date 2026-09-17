@@ -21,7 +21,7 @@ import { homedir } from "os";
 import { join, resolve, dirname } from "path";
 import { readFileSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
-import { execFile, spawn } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import {
   WRITE_ERROR_REASONS,
@@ -290,10 +290,21 @@ function fileContains(path, needle) {
   }
 }
 
-const DEFAULT_RPC_TIMEOUT_MS = 10000;
-const DEFAULT_MAX_ATTEMPTS = 2;
-const DEFAULT_RETRY_DELAY_MS = 500;
-const WORKLED_URL_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// Per-attempt RPC ceiling in ms, and the single budget the whole send path is
+// built on: rpc(), probeReachable() and probeBluetooth() all default to it, and
+// the hook's asyncTimeout is derived from it (+2000, see declareAsync).
+//
+// Deliberately NOT env-tunable — and the reason is measured, not aesthetic:
+//   * A hung CONNECT is capped by undici's own connect timeout (~10s), not by
+//     this value. Against a black-holed peer the hook process lives ~12.8s
+//     whether this is 10000, 20000 or 60000, so raising it buys nothing there.
+//   * The one regime it does govern is a peer that accepted the TCP connection
+//     and then went silent, which undici lets hang for 300s by default. For a
+//     best-effort LED state sync, waiting past this is pointless anyway: the
+//     state is already stale and the next hook event supersedes it.
+// One hardcoded value keeps the hook's exit bound honest and removes a config
+// surface whose failure modes users cannot observe.
+const WORKLED_TIMEOUT_MS = 10000;
 
 // Monotonic counter for JSON-RPC request ids. JSON-RPC 2.0 requires a valid
 // id on every request (the server echoes it back and rejects a missing or
@@ -361,13 +372,6 @@ export function traeCnReminderText({ clientPrefix = null, clients = [] } = {}) {
   return "trae-cn: verify the device-name in Settings → MCP (reload to pick up the config) and enable the workled hooks in Settings → Hooks for agent-state tracking.";
 }
 
-function sleepWithJitter(baseMs, attempt) {
-  // Exponential backoff with jitter: base * 2^attempt * (0.5 ~ 1.5)
-  const expDelay = baseMs * Math.pow(2, attempt);
-  const jitter = expDelay * (0.5 + Math.random());
-  return sleep(Math.floor(jitter));
-}
-
 // Run a child command, retrying once on failure (transient errors, sandbox
 // flakiness, or a briefly-blocked powershell). Returns the execFileAsync result
 // and only throws after all attempts are exhausted.
@@ -386,17 +390,10 @@ async function execWithRetry(cmd, args, opts, maxAttempts = 2) {
   throw lastErr;
 }
 
-let workledUrl = null;
-let workledUrlExpiry = 0;
 let hookClientPrefix = null;
 const seenUserMessages = new Set();
 let seenMessagesCleanedAt = Date.now();
 const SEEN_MESSAGES_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-
-// Config candidates cache (parsed server list with name==='workled', enabled, url)
-let cachedCandidates = null;
-let candidatesExpiry = 0;
-const CANDIDATES_TTL_MS = 60 * 1000; // 1 minute
 
 // Minimal YAML reader for the `mcp_servers:` block in hermes config.yaml.
 // Top-level `mcp_servers:` then `  <name>:` then `    key: value` scalars;
@@ -601,22 +598,17 @@ function dshL1Hint() {
   return `dsh: ${state}${perm}. dsh is configured on the L1 standard path only - run: ${cmd}`;
 }
 
+// Read every client's MCP config and keep the `workled` rows. Uncached on
+// purpose: in hook mode every event is a fresh process, so a cache would never
+// be reused, and re-reading is cheap (measured ~40ms across all clients).
 function getWorkledCandidates(clientPrefix) {
-  const now = Date.now();
-  if (cachedCandidates && now < candidatesExpiry) {
-    if (!clientPrefix) return cachedCandidates;
-    return cachedCandidates.filter((c) => c.client.startsWith(clientPrefix));
-  }
-  const servers = loadMcpServers();
   const candidates = [];
-  for (const s of servers) {
+  for (const s of loadMcpServers()) {
     if (s.name !== "workled") continue;
     if (!s.server || typeof s.server !== "object") continue;
     if (s.server.enabled === false) continue;
     if (s.server.url) candidates.push({ url: s.server.url, client: s.client });
   }
-  cachedCandidates = candidates;
-  candidatesExpiry = now + CANDIDATES_TTL_MS;
   if (!clientPrefix) return candidates;
   return candidates.filter((c) => c.client.startsWith(clientPrefix));
 }
@@ -639,7 +631,7 @@ function getWorkledCandidates(clientPrefix) {
 // paired (fixes #1 — Linux fallback path previously promoted the first
 // arbitrary BT device to "paired"). When several workled devices are paired,
 // `deviceNames` lists them all (deduplicated).
-export async function probeBluetooth(timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+export async function probeBluetooth(timeoutMs = WORKLED_TIMEOUT_MS) {
   const result = {
     available: null,
     powered: false,
@@ -941,7 +933,7 @@ async function postJson(url, method, params, controller, extraHeaders = {}) {
 // error in the response is surfaced as an exception for the caller's retry
 // logic. The error message carries the firmware's `data.reason` (e.g.
 // "initialize must be first interaction") so status output is self-explanatory.
-async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+async function rpc(url, method, params, timeoutMs = WORKLED_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -959,51 +951,39 @@ async function rpc(url, method, params, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
   }
 }
 
-async function discoverWorkledUrl(clientPrefix) {
-  const now = Date.now();
-
-  // Single shared cache for the resolved URL. On a cache miss we make the
-  // priority decision ONCE and store the winning URL in workledUrl — so the
-  // env-override reachability check and the final URL share ONE expiry and ONE
-  // code path instead of two parallel caches. WORKLED_MCP_URL wins only when it
-  // actually answers (probed with the same probeReachable every other client
-  // uses); a set-but-unreachable override falls back to the configured URL so
-  // it never breaks the live LED.
-  if (workledUrl === null || now >= workledUrlExpiry) {
-    const envUrl = process.env.WORKLED_MCP_URL;
-    if (envUrl && (await probeReachable(envUrl)).reachable) {
-      workledUrl = envUrl;
-      workledUrlExpiry = now + WORKLED_URL_TTL_MS;
-      return envUrl;
-    }
-    const candidates = getWorkledCandidates(clientPrefix);
-    if (candidates.length === 0) {
-      // Nothing resolved; force a re-eval on the next call instead of caching a
-      // dead null.
-      workledUrl = null;
-      workledUrlExpiry = 0;
-      return null;
-    }
-    // Pick the first configured URL directly, without probing (the server is
-    // stateless); a failed send calls invalidateDiscovery to re-read the config.
-    workledUrl = candidates[0].url;
-    workledUrlExpiry = now + WORKLED_URL_TTL_MS;
+// Resolve the MCP URL to talk to. Deliberately uncached: the answer is a pure
+// function of process.env plus the config files, both read cheaply, and in hook
+// mode each event is a fresh process where a cache could never be reused.
+//
+// The env override is taken at face value — it is explicit user intent, and
+// probing it is pure loss in hook mode: a stale WORKLED_MCP_URL made each event
+// burn a full WORKLED_TIMEOUT_MS before the config fallback even got a chance
+// (measured: 3.2s per event against a reachable device, because the probe
+// doubled the round trips). Reachability probing is `status`'s job; it reports
+// exactly what it finds. The one input still refused is the documented
+// `<device-name>` placeholder, which is a template rather than an address —
+// accepting it would shadow a working config with something unroutable.
+function discoverWorkledUrl(clientPrefix) {
+  const envUrl = process.env.WORKLED_MCP_URL;
+  if (envUrl && !envUrl.includes("<device-name>")) {
+    return envUrl;
   }
-  return workledUrl;
-}
-
-// Forget every cached URL/candidate so the next discovery re-reads the config
-// files from disk. Called when a send fails so a device that went offline (or a
-// config change) is picked up immediately instead of after the full URL TTL.
-function invalidateDiscovery() {
-  workledUrl = null;
-  workledUrlExpiry = 0;
-  cachedCandidates = null;
-  candidatesExpiry = 0;
+  const candidates = getWorkledCandidates(clientPrefix);
+  if (candidates.length === 0) {
+    return null;
+  }
+  // First configured URL wins (the server is stateless, so there is nothing to
+  // probe or rank); the read above happens again on the next call by design.
+  return candidates[0].url;
 }
 
 let pendingState = null;
 let senderRunning = false;
+// Handle on the in-flight sendLoop, so hook mode can await delivery inline.
+// The async declaration releases the HOST immediately, but the device send
+// still has to finish before this process exits — a detached child would be
+// killed by the host's job object the moment the hook parent returns.
+let senderDone = Promise.resolve();
 // Track flush promises for CLI hook mode. Each queued flush is tagged with
 // the state that was pending at enqueue time so sendLoop can settle only the
 // promises whose target state has actually been processed (fixes #6:
@@ -1074,8 +1054,6 @@ async function sendLoop() {
     while (pendingState !== null) {
       const state = pendingState;
       pendingState = null;
-      const maxAttempts = DEFAULT_MAX_ATTEMPTS;
-      const baseDelay = DEFAULT_RETRY_DELAY_MS;
       let lastErr = null;
       let sent = false;
       let superseded = false;
@@ -1090,7 +1068,7 @@ async function sendLoop() {
         continue;
       }
 
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      for (let attempt = 0; attempt < 2; attempt++) { // maxAttempts
         if (pendingState !== null) {
           // a newer state superseded this one; drop it and send the latest next
           superseded = true;
@@ -1106,21 +1084,30 @@ async function sendLoop() {
           break;
         } catch (err) {
           lastErr = err;
-          if (attempt < maxAttempts - 1 && pendingState === null) {
-            await sleepWithJitter(baseDelay, attempt);
+          // Retry only for errors the LOCAL stack can judge instantly (DNS/mDNS
+          // resolution failure, refused/reset socket). Everything else is final:
+          //   timeout/abort   the per-attempt ceiling already elapsed
+          //   HTTP / JSON-RPC the peer answered; a retry is moot
+          //   config errors   deterministic; a retry is identical
+          // Bailing out here keeps the worst case bounded (one attempt) instead
+          // of spending a second full timeout on a doomed send.
+          if (!isRetryableNetworkError(err)) break;
+          // Only the first attempt may retry (attempt 0 is the send, attempt 1
+          // is the retry), and a newer state already queued behind this one
+          // cancels it — that retry would be stale before it left.
+          if (attempt === 0 && pendingState === null) {
+            await sleep(500);
           }
         }
       }
       // Resolve only flush promises waiting for THIS state
       const result = { state, sent, error: lastErr, superseded };
       resolveFlushPromisesForState(state, result);
-      if (lastErr) {
-        // give up on this state; no resend later. A dead device or a changed
-        // config should be re-discovered immediately, so drop the cached URL
-        // and candidate list for the next event.
-        invalidateDiscovery();
-        // console.warn(`[workled] setAgentState(${state}) failed after ${maxAttempts} attempts: ${lastErr.message || lastErr}`);
-      }
+      // Nothing to invalidate here: discovery re-reads the config on every
+      // call, so a device that went offline — or a config that changed — is
+      // picked up on its own. The failed state is still never resent: the next
+      // state supersedes it.
+      // console.warn(`[workled] setAgentState(${state}) failed after attempts: ${lastErr.message || lastErr}`);
     }
     // After the outer while-loop exits (pendingState became null) we know the
     // queue is fully drained. Flush any remaining "wait for drain" entries
@@ -1149,7 +1136,7 @@ function setAgentState(state) {
   pendingState = state;
   if (!senderRunning) {
     senderRunning = true;
-    sendLoop().catch((err) => {
+    senderDone = sendLoop().catch((err) => {
       console.warn(`[workled] sender loop error: ${err && err.message}`);
     });
   }
@@ -1542,7 +1529,45 @@ function resolveHookState(event, payload) {
   return target;
 }
 
+// Hook events that run as blocking hooks instead of async ones.
+//
+// The host recycles the worker around turn teardown (measured: killWorker lands
+// 139-365ms after TURN_COMPLETED), and on Windows every hook is contained in a
+// Job Object that owns its children too — so a hook still sending when the
+// worker goes away is killed mid-flight and the device write dies with it.
+// Stop is the exposed one: it is spawned ~20ms before the turn completes, i.e.
+// right inside that window (measured 161ms of life, while one send needs ~2.1s
+// over mDNS). Declaring no `async` makes the host wait for this process to
+// exit, which is the only way to survive the recycle — a detached child cannot
+// escape the job. Cost: teardown waits for the send, so settings.json needs a
+// wider `timeout` for this event.
+const SYNC_EVENTS = new Set(["Stop"]);
+
 async function runHookMode() {
+  // Set once the declaration line reaches stdout. It both guards the finally
+  // block (never emit a second JSON line once declared) and tells the send path
+  // that the host has already been released.
+  let asyncDeclared = false;
+  const declareAsync = (event) => {
+    if (asyncDeclared) return Promise.resolve();
+    asyncDeclared = true;
+    // Sync event: stay a plain blocking hook. stdout still has to carry one
+    // well-formed object, so emit the same no-op as the historical `{}`.
+    if (SYNC_EVENTS.has(event)) {
+      return new Promise((resolve) => process.stdout.write("{}\n", () => resolve()));
+    }
+    // Everything else declares async: the host reads this first stdout line,
+    // drops its synchronous budget for this hook and resolves immediately, so
+    // the LLM is never blocked on the device link. Clients that do not know the
+    // `async` key still get a well-formed object carrying no decision fields,
+    // i.e. the same no-op as `{}`. asyncTimeout is derived from the send budget
+    // so the host keeps us alive exactly as long as the send can possibly take.
+    // Resolve on the write callback, not on write() returning, so the line has
+    // really left the process before hook mode is allowed to exit explicitly
+    // (hook mode ends in process.exit — see the dispatcher).
+    const line = JSON.stringify({ async: true, asyncTimeout: WORKLED_TIMEOUT_MS + 2000 }) + "\n";
+    return new Promise((resolve) => process.stdout.write(line, () => resolve()));
+  };
   try {
     const argv = process.argv.slice(2);
     const eventIdx = argv.indexOf("--event");
@@ -1577,40 +1602,63 @@ async function runHookMode() {
     }
     const state = resolveHookState(event, payload);
     if (state) {
-      // Non-blocking: delegate the actual device send to a detached background
-      // process (the `send` subcommand). The current hook process returns
-      // immediately, so the host never waits on the device link — an
-      // unreachable/congested device can no longer stall or time out the host's
-      // tool call or prompt. The background send reuses the exact same
-      // plugin-style send loop, bounded by DEFAULT_RPC_TIMEOUT_MS and
-      // DEFAULT_MAX_ATTEMPTS, so hooks and plugin clients now share one logic
-      // path and one timeout budget.
-      spawn(process.execPath, [process.argv[1], "send", state], {
-        detached: true,
-        stdio: "ignore",
-      }).unref();
+      // Declare async FIRST, then await the send inline. The host is released
+      // the moment the declaration line lands, so the LLM is never blocked on
+      // the device link; but this process stays alive until the send settles,
+      // which is the whole point — a detached child is killed by the host's job
+      // object the instant the hook parent returns, so the send would never
+      // complete. Delivery reuses the plugin-style send loop, so hooks and
+      // plugin clients share one logic path and one timeout budget.
+      await declareAsync(event);
+      setAgentState(state);
+      await senderDone;
     }
   } catch (err) {
     // Never propagate: the hook process must always exit cleanly (stdout {}
     // + status 0) so the host's tool call is never denied or delayed.
     console.warn(`[workled] hook error: ${err && err.message}`);
   } finally {
-    // Always print an empty JSON object so the hook never blocks or denies,
-    // then let the process exit naturally.
-    process.stdout.write("{}\n");
+    // Sync path only (no state to send, or an early error): keep the historical
+    // no-op object. Once the async declaration is out, stdout must stay exactly
+    // as it is — a second JSON line would corrupt the host's parse.
+    // Awaited for the same reason as the declaration: hook mode exits with
+    // process.exit, which must not outrun this write.
+    if (!asyncDeclared) {
+      await new Promise((resolve) => process.stdout.write("{}\n", () => resolve()));
+    }
   }
 }
 
 // ---- status mode (diagnostics) ---------------------------------------------
 
-function isFatalNetworkError(err) {
+// Errors worth exactly ONE extra attempt, decided immediately by the local
+// stack rather than by a peer going quiet — so the second attempt costs almost
+// no extra wall-clock and often succeeds (warm mDNS cache, device mid-reboot).
+//
+// Deliberately NOT retryable:
+//   ABORT_ERR / UND_ERR_CONNECT_TIMEOUT  the per-attempt ceiling already
+//                                        elapsed; retrying doubles the wait
+//   EHOSTUNREACH / ENETUNREACH           "instant" in theory, but Windows waits
+//                                        out ARP first (~1-3s) — not instant
+//   ERR_INVALID_URL / ERR_SOCKET_BAD_PORT  deterministic; retry is identical
+//   HTTP non-2xx / JSON-RPC error        the peer answered; retrying is moot
+function isRetryableNetworkError(err) {
   if (!err) return false;
+  const code = String((err.cause && err.cause.code) || err.code || "").toUpperCase();
+  const retryable = [
+    // DNS / mDNS resolution
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "EAI_NONAME",
+    "EAI_NODATA",
+    // TCP refused / reset — device restarting, or a stale pooled socket
+    "ECONNREFUSED",
+    "ECONNRESET",
+  ];
+  if (retryable.includes(code)) return true;
+  // Some platforms surface the resolver failure only in the message text.
   const msg = (err.message || String(err)).toLowerCase();
-  const code = err.code || (err.cause && err.cause.code) || "";
-  const hardCodes = ["ENOTFOUND", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ERR_INVALID_URL"];
-  if (hardCodes.includes(code)) return true;
-  if (msg.includes("enotfound") || msg.includes("econnrefused") || msg.includes("ehostunreach") || msg.includes("invalid url") || msg.includes("fetch failed")) return true;
-  return false;
+  return /\beai_again\b|\beai_noname\b|enotfound|econnrefused|econnreset/.test(msg);
 }
 
 // Reachability probe: a bare stateless tools/call to get_agent_state. No
@@ -1618,27 +1666,32 @@ function isFatalNetworkError(err) {
 // requests), and it also verifies the endpoint is really a workled server:
 // only workled knows the get_agent_state tool. Reuses rpc() so error handling
 // stays in one place; any throw (HTTP/JSON-RPC/network) means unreachable.
-// Retries DEFAULT_MAX_ATTEMPTS times with backoff and reports which attempt
-// succeeded so `status` can distinguish a flaky-but-working link from a dead
-// one.
-async function probeReachable(url, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) {
+// Retries under the same rule as sendLoop:
+// only an instantly-judgable network error (see
+// isRetryableNetworkError) earns the second one, so a dead host does not double
+// the wait. Reports which attempt succeeded so `status` can distinguish a
+// flaky-but-working link from a dead one.
+async function probeReachable(url, timeoutMs = WORKLED_TIMEOUT_MS) {
   if (!url || typeof url !== "string" || url.includes("<device-name>")) {
     return { reachable: false, error: "placeholder URL", attempt: 0 };
   }
   let lastErr = null;
   let attemptsMade = 0;
-  for (let attempt = 1; attempt <= DEFAULT_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) { // maxAttempts
     attemptsMade = attempt;
     try {
       await rpc(url, "tools/call", { name: "get_agent_state", arguments: {} }, timeoutMs);
       return { reachable: true, error: null, attempt };
     } catch (err) {
       lastErr = err;
-      if (isFatalNetworkError(err)) {
+      // Same rule as sendLoop: retry only when the local stack can decide
+      // instantly that the failure is transient. A timeout/abort or a peer
+      // that answered with an error is final — retrying only wastes time.
+      if (!isRetryableNetworkError(err)) {
         break;
       }
-      if (attempt < DEFAULT_MAX_ATTEMPTS) {
-        await sleepWithJitter(DEFAULT_RETRY_DELAY_MS, attempt - 1);
+      if (attempt < 2) { // maxAttempts
+        await sleep(500);
       }
     }
   }
@@ -1684,13 +1737,6 @@ async function runStatusMode() {
 
   const entries = [];
   const envUrl = process.env.WORKLED_MCP_URL;
-  if (envUrl) {
-    // WORKLED_MCP_URL override wins and is reported first. It is a synthetic
-    // override entry (not an installable client), so it carries only the
-    // fields that matter for diagnostics: url + reachable. Skip enabled /
-    // mcp / plugin / skill — those only make sense for real clients.
-    entries.push({ client: "env", path: "WORKLED_MCP_URL", url: envUrl });
-  }
   for (const s of loadMcpServers()) {
     if (s.name !== "workled") continue;
     if (clientPrefix && !s.client.startsWith(clientPrefix)) continue;
@@ -1710,8 +1756,9 @@ async function runStatusMode() {
   }
   log(`found ${entries.length} workled entry(ies)`);
 
-
-  if (entries.length === 0) {
+  // A lone WORKLED_MCP_URL still gets the full probe (its verdict lands in the
+  // hint) — only "nothing configured anywhere" is a dead end.
+  if (entries.length === 0 && !envUrl) {
     if (dshTargeted) {
       out.hint = dshL1Hint();
     } else {
@@ -1749,7 +1796,12 @@ async function runStatusMode() {
   // concurrently; per-URL retries (up to 3 with backoff) stay inside
   // probeReachable. Keeps `status` fast when many clients share configs.
   const urls = [
-    ...new Set(entries.filter((e) => e.url && e.enabled !== false).map((e) => e.url)),
+    ...new Set([
+      // The override is probed too: it wins over config URLs, so a broken
+      // override is exactly the thing worth reporting.
+      ...(envUrl ? [envUrl] : []),
+      ...entries.filter((e) => e.url && e.enabled !== false).map((e) => e.url),
+    ]),
   ];
   log(`probing ${urls.length} unique URL(s)...`);
   const results = new Map(
@@ -1757,24 +1809,24 @@ async function runStatusMode() {
   );
   log("URL probes finished");
 
+  // WORKLED_MCP_URL override: hoisted to a top-level field, with its probe
+  // verdict folded into the hint (there is no clients[] entry left to carry
+  // `mcpUrlReachable`). `envReachable` keeps the override equivalent to a
+  // configured client for the ok / exitCode decision below.
+  const envProbe = envUrl ? results.get(envUrl) : null;
+  const envReachable = !!(envProbe && envProbe.reachable);
+  if (envUrl) out.WORKLED_MCP_URL = envUrl;
+
   out.clients = entries.map((e) => {
-    // env override entries carry no `enabled`; treat absent as enabled (true).
     const enabled = e.enabled !== false;
     const probe = e.url && enabled ? results.get(e.url) : null;
     const entry = {
       client: e.client,
       mcpUrlReachable: !!(probe && probe.reachable),
+      mcpPath: toPosix(e.path),
+      mcpUrl: e.url,
     };
-    if (e.client === "env") {
-      // Synthetic WORKLED_MCP_URL override: report the URL under the variable
-      // name itself, since there is no config file (and thus no mcpPath /
-      // mcpEnable) behind it — only the URL and its reachability matter.
-      entry.WORKLED_MCP_URL = e.url;
-    } else {
-      entry.mcpPath = toPosix(e.path);
-      entry.mcpUrl = e.url;
-      if (e.enabled !== undefined) entry.mcpEnable = e.enabled;
-    }
+    if (e.enabled !== undefined) entry.mcpEnable = e.enabled;
     if (probe && probe.error) entry.error = probe.error;
     // dsh-only install metadata: plugin vendored / patch file exists / workled
     // row is present. Plain entries (JSON/YAML) omit these.
@@ -1792,10 +1844,6 @@ async function runStatusMode() {
   // actual installed artifact paths: its plugin/hooks (plugin) and the workled
   // skill dir (skill). Pure filesystem probe — does not touch the device.
   for (const entry of out.clients) {
-    // The synthetic "env" entry (WORKLED_MCP_URL) is not an installable
-    // client — it carries no config-file-backed mcpEnable, and plugin/skill
-    // are meaningless for it, so leave it to just the MCP url fields above.
-    if (entry.client === "env") continue;
     entry.mcpEnable = entry.mcpEnable !== false;
     // An entry reaches out.clients only because loadMcpServers found a workled
     // server declared in that client's config, so "configured" is simply
@@ -1813,9 +1861,27 @@ async function runStatusMode() {
     entry.skill = sPath && t.existSkill(sPath) ? toPosix(sPath) : null;
   }
 
-  if (out.clients.some((c) => c.mcpUrlReachable)) {
+  // `hint` reports failures only — a healthy link leaves it empty, so the
+  // report does not carry a paragraph nobody acts on. Sentences are joined
+  // through this helper: the first failure starts the string, and a later one
+  // is separated from a hint that does not already end in punctuation (not
+  // every sentence does — the wiring advice ends with a command).
+  const appendHint = (sentence) => {
+    if (!out.hint) {
+      out.hint = sentence;
+      return;
+    }
+    out.hint += /[.!?]$/.test(out.hint) ? ` ${sentence}` : `. ${sentence}`;
+  };
+
+  // A reachable WORKLED_MCP_URL override counts exactly like a reachable
+  // client: it is the URL the hook actually uses.
+  if (envReachable || out.clients.some((c) => c.mcpUrlReachable)) {
     out.ok = true;
     out.exitCode = 0;
+    // Healthy state: The one exception is Bluetooth, whose
+    // missing BLE pairing breaks the touch-pad macros even though the MCP link
+    // itself is fine.
     if (bluetooth && bluetooth.available === true && !bluetooth.devicePaired) {
       let hint = "Macro requires Bluetooth. Pair the device as a BLE HID keyboard.";
       if (btDeviceNames.length > 0) {
@@ -1827,16 +1893,16 @@ async function runStatusMode() {
       out.hint = hint;
     } else {
       out.hint =
-        "workled server reachable. If something looks off, check in this order: " +
+        "If something looks off, check in this order: " +
         "LED — if the light stays off, set_brightness(128) or use the device switch; " +
         "MCP — if it was just configured, restart the agent/session so the new config loads; " +
         "trust — some agents require manually trusting the MCP connection before they use it; " +
         "hooks — some agents need to manually enable hooks (e.g. Settings -> Hooks); " +
         "DNS — on Windows mDNS is unstable, so in the MCP config prefer a static IP over the .local hostname to avoid intermittent -32001 timeouts.";
     }
-  } else if (out.clients.some((c) => c.client !== "env" && c.mcpConfig && c.mcpEnable === false)) {
+  } else if (out.clients.some((c) => c.mcpConfig && c.mcpEnable === false)) {
     out.hint = "workled is configured but disabled. Set enabled=true or set WORKLED_MCP_URL.";
-  } else if (out.clients.some((c) => c.client !== "env" && c.mcpConfig && !c.mcpUrl)) {
+  } else if (out.clients.some((c) => c.mcpConfig && !c.mcpUrl)) {
     out.hint = "workled server has no `url`. Add `url` in your agent config or set WORKLED_MCP_URL.";
   } else {
     if (bluetooth && bluetooth.available === false) {
@@ -1860,8 +1926,8 @@ async function runStatusMode() {
   // Clients that should be wired but aren't: configured clients missing their
   // plugin, plus the running client if it has no MCP config at all (it can't
   // call the device until a full install runs).
-  // Only real, installable clients count — the synthetic "env" pseudo-entry
-  // (from WORKLED_MCP_URL) is not something `install --client` can target.
+  // Only installable clients reach out.clients at all (the WORKLED_MCP_URL
+  // override is a top-level field), so a plain "has no plugin" test suffices.
   const unwired = out.clients.filter((e) => !e.plugin && CLIENTS.includes(e.client));
   // Skip dsh here when its L1 hint already replaced the hint above — that
   // message names the missing path and the install command, so a second
@@ -1876,9 +1942,9 @@ async function runStatusMode() {
     const scriptDir = dirname(fileURLToPath(import.meta.url));
     const cmd = `node ${JSON.stringify(toPosix(join(scriptDir, "skill-install.mjs")))} install --client ${target}`;
     const list = unwired.map((e) => e.client).join(", ");
-    // Appended to a hint that already ends in ".", so start capitalised and
-    // space-separated — a lowercase " wiring —" read as one run-on sentence.
-    out.hint += ` Wiring not installed for: ${list}; run: ${cmd}`;
+    // Its own sentence: follows an existing hint, or becomes the whole hint
+    // when everything else is healthy.
+    appendHint(`Wiring not installed for: ${list}; run: ${cmd}`);
   }
 
   out.duration_ms = Date.now() - startedAt;
@@ -1901,30 +1967,27 @@ if (process.argv[1]) {
   if (isMain) {
     const sub = process.argv[2];
     if (sub === "hook") {
-      // runHookMode never rejects (internal try/catch/finally guarantees a
-      // single "{}" on stdout + status 0); this catch is only a safety net.
-      runHookMode().catch((err) => {
-        console.warn(`[workled] hook error: ${err && err.message}`);
-      });
+      // Exit explicitly the moment the hook work is done. An aborted CONNECT
+      // leaves undici holding a half-open socket that keeps the event loop alive
+      // for another ~8s even though every byte of work has finished (measured:
+      // work 3.0s, process 11.4s). Without this, hook lifetime is governed by
+      // undici rather than by WORKLED_TIMEOUT_MS, and the host's asyncTimeout
+      // ends up cutting the process off mid-exit.
+      // Both stdout writes in runHookMode are awaited, so exiting here cannot
+      // truncate the output the host reads. runHookMode never rejects (internal
+      // try/catch/finally); the catch below is a safety net that still exits 0
+      // so the host never denies the tool call.
+      runHookMode()
+        .then(() => process.exit(0))
+        .catch((err) => {
+          console.warn(`[workled] hook error: ${err && err.message}`);
+          process.exit(0);
+        });
     } else if (sub === "status") {
       runStatusMode().catch((err) => {
         console.warn(`[workled] status error: ${err && err.message}`);
         process.exitCode = 1;
       });
-    } else if (sub === "send") {
-      // Background send mode (invoked as a detached child of runHookMode):
-      // enqueue the state via the plugin-style sender loop and let the event
-      // loop drain naturally. No hard exit — process.exit would abort the
-      // in-flight HTTP request before the device receives it. The rpc() timeout
-      // (DEFAULT_RPC_TIMEOUT_MS) plus DEFAULT_MAX_ATTEMPTS guarantee this
-      // process eventually terminates even against an unreachable device.
-      const state = process.argv[3];
-      if (!state) {
-        console.error(`[workled] send requires a state argument.`);
-        process.exitCode = 2;
-      } else {
-        setAgentState(state);
-      }
     } else {
       console.error(`[workled] unknown subcommand: "${sub}".`);
       process.exitCode = 2;

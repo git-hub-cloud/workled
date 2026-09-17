@@ -3,6 +3,9 @@
 // Run: node --test test/install.test.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stripJsonc } from "../utils.js";
 import {
   isValidJsonc,
@@ -17,6 +20,7 @@ import {
   approveHermesAllowlist,
   revokeHermesAllowlist,
   hermesHookEvents,
+  parseOpenclawConfigText,
 } from "../skill-install.mjs";
 
 const ENTRY = { url: "http://HomeAnt-A919.local:18791/mcp", enabled: true, type: "remote" };
@@ -475,4 +479,236 @@ test("revokeHermesAllowlist tolerates corrupt JSON without writing", () => {
   const { text, removed } = revokeHermesAllowlist("not json", hermesHookEvents());
   assert.equal(removed, 0);
   assert.equal(text, "not json", "input returned unchanged");
+});
+
+// --- hermes allowlist residue -------------------------------------------------
+//
+// Regression: the generated commands used to point at the source checkout and
+// later at each client's own installed copy. Revoking matched the CURRENT
+// command strings byte-exactly, so after that path change an uninstall removed
+// nothing and all 10 approvals survived, still invoking the checkout. Our own
+// rows are recognised structurally now — and only ours: the shape is narrow
+// enough that no other tool's hook can be mistaken for one.
+
+const STALE_ENTRY = "C:/repo/.agents/skills/workled/index.js";
+
+test("revokeHermesAllowlist drops approvals from an earlier entry path", () => {
+  const stale = hermesHookEvents().map((ev) => ({
+    event: ev,
+    command: `node ${STALE_ENTRY} hook --event ${ev}`,
+    approved_at: "2026-09-16T05:01:17.747Z",
+  }));
+  const foreign = { event: "pre_tool_call", command: "user-own-tool --run" };
+  const { text, removed } = revokeHermesAllowlist(
+    JSON.stringify({ approvals: [...stale, foreign] }),
+    hermesHookEvents()
+  );
+  assert.equal(removed, EVENTS_COUNT, "every stale row is workled's own");
+  assert.deepEqual(JSON.parse(text).approvals, [foreign], "foreign row survives");
+});
+
+test("revokeHermesAllowlist keeps lookalike commands that are not ours", () => {
+  const lookalikes = [
+    { event: "pre_tool_call", command: "node /opt/other/index.js hook --event pre_tool_call" },
+    { event: "pre_tool_call", command: `node ${STALE_ENTRY} --status` },
+    { event: "pre_tool_call", command: "npx workled hook --event pre_tool_call" },
+    { event: "pre_tool_call", command: `node ${STALE_ENTRY} hook` },
+  ];
+  const { text, removed } = revokeHermesAllowlist(
+    JSON.stringify({ approvals: lookalikes }),
+    hermesHookEvents()
+  );
+  assert.equal(removed, 0, "only real workled hook rows may be dropped");
+  assert.deepEqual(JSON.parse(text).approvals, lookalikes);
+});
+
+test("approveHermesAllowlist migrates stale rows instead of stacking a second set", () => {
+  const stale = hermesHookEvents().map((ev) => ({
+    event: ev,
+    command: `node ${STALE_ENTRY} hook --event ${ev}`,
+    approved_at: "2026-09-16T05:01:17.747Z",
+  }));
+  const { text, added, pruned } = approveHermesAllowlist(
+    JSON.stringify({ approvals: stale }),
+    hermesHookEvents()
+  );
+  assert.equal(pruned, EVENTS_COUNT, "stale rows reported for the caller to persist");
+  assert.equal(added, EVENTS_COUNT, "current rows written");
+  assert.equal(
+    JSON.parse(text).approvals.length,
+    EVENTS_COUNT,
+    "one row per event, not two per event"
+  );
+});
+
+// --- install/uninstall JSON layout -------------------------------------------
+//
+// Regression: appending a top-level key to a config that had none emitted the
+// comma on a line of its own and put the key flush at column 0, and every
+// install/uninstall cycle stranded one more blank line (observed: 5 blank lines
+// in opencode.json after 5 cycles). Both are layout-only bugs, so the file has
+// to stay byte-identical to what the user wrote once a cycle completes.
+
+test("upsertJsoncEntry appends a top-level key on its own line with correct indent", () => {
+  const bare = '{\n  "$schema": "https://opencode.ai/config.json"\n}\n';
+  const out = upsertJsoncEntry(bare, "mcp", "workled", ENTRY);
+  // The comma belongs at the end of the previous member, and the new key sits
+  // one level inside the root object.
+  assert.match(out, /\n {2}"mcp": \{\n {4}"workled": \{/);
+  assert.doesNotMatch(out, /^\s*,\s*$/m, "no comma-only line");
+  assert.doesNotMatch(out, /\n[ \t]*\n/, "no blank line introduced");
+  assert.equal(isValidJsonc(out), true);
+  assert.deepEqual(JSON.parse(stripJsonc(out)).mcp.workled, ENTRY);
+});
+
+test("upsertJsoncEntry appends into an empty root object as a formatted block", () => {
+  const out = upsertJsoncEntry("{}", "mcp", "workled", ENTRY);
+  assert.equal(out, `{\n  "mcp": {\n    "workled": {\n      "url": "http://HomeAnt-A919.local:18791/mcp",\n      "enabled": true,\n      "type": "remote"\n    }\n  }\n}`);
+  assert.equal(JSON.parse(stripJsonc(out)).mcp.workled.url, ENTRY.url);
+});
+
+test("removeJsoncEntry reclaims the removed member's line", () => {
+  const middle = `{
+  "mcp": {
+    "workled": { "url": "u", "enabled": true },
+    "b": 2
+  }
+}
+`;
+  const out = removeJsoncEntry(middle, "mcp", "workled");
+  assert.equal(out, `{
+  "mcp": {
+    "b": 2
+  }
+}
+`);
+});
+
+test("a full install/uninstall cycle is whitespace-neutral", () => {
+  const seed = '{\n  "$schema": "https://opencode.ai/config.json"\n}\n';
+  let text = seed;
+  for (let i = 0; i < 5; i++) {
+    text = upsertJsoncEntry(text, "mcp", "workled", ENTRY);
+    const removed = removeJsoncEntry(text, "mcp", "workled");
+    assert.ok(removed, `cycle ${i}: entry removed`);
+    text = removeJsoncKey(removed, "mcp") ?? removed;
+  }
+  assert.equal(text, seed, "5 cycles must return the file to its original bytes");
+});
+
+test("a cycle seeded from a populated map is whitespace-neutral too", () => {
+  const seed = `{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "other": { "type": "local", "command": ["echo"] }
+  }
+}
+`;
+  let text = seed;
+  for (let i = 0; i < 3; i++) {
+    text = upsertJsoncEntry(text, "mcp", "workled", ENTRY);
+    const removed = removeJsoncEntry(text, "mcp", "workled");
+    text = removeJsoncKey(removed, "mcp") ?? removed;
+  }
+  assert.equal(text, seed);
+});
+
+// A file that already carries blank lines stranded by an older version must be
+// cleaned up rather than preserved: the append path trims the whitespace the
+// root's last member was followed by, so the very next install normalises it.
+test("a cycle repairs a file carrying stranded blank lines", () => {
+  const seed = '{\n  "$schema": "https://opencode.ai/config.json"\n}\n';
+  const stranded = '{\n  "$schema": "https://opencode.ai/config.json"\n' + "\n".repeat(9) + "}\n";
+  assert.notEqual(stranded, seed);
+  let text = upsertJsoncEntry(stranded, "mcp", "workled", ENTRY);
+  assert.doesNotMatch(text, /\n[ \t]*\n/, "install collapses the stranded lines");
+  const removed = removeJsoncEntry(text, "mcp", "workled");
+  text = removeJsoncKey(removed, "mcp") ?? removed;
+  assert.equal(text, seed, "and the cycle lands back on the original bytes");
+});
+
+// --- generated entry points ---------------------------------------------------
+//
+// Regression: generated plugins/hooks imported the SOURCE CHECKOUT, so moving or
+// deleting the repo broke every client even though installSkill had written a
+// working copy into that client's own skills dir. The command/config pair must
+// reference that copy — and for hermes the allowlist has to record the exact
+// same byte string, or hermes' byte-exact consent check never matches.
+
+test("hook commands reference the client's own installed copy", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "workled-entry-"));
+  const prev = process.env.HERMES_HOME;
+  const posix = (p) => p.replace(/\\/g, "/");
+  try {
+    process.env.HERMES_HOME = tmp;
+    const copyDir = join(tmp, "skills", "workled");
+    mkdirSync(copyDir, { recursive: true });
+    writeFileSync(join(copyDir, "index.js"), "", "utf8");
+    const expected = `${posix(copyDir)}/index.js`;
+
+    const yaml = installHermesHooks("", "hermes");
+    const cmds = yaml.split("\n").filter((l) => l.includes("- command:"));
+    assert.equal(cmds.length, hermesHookEvents().length);
+    for (const line of cmds) {
+      assert.ok(line.includes(expected), `command must use the installed copy: ${line}`);
+    }
+
+    const { text } = approveHermesAllowlist("", hermesHookEvents(), "hermes");
+    const approvals = JSON.parse(text).approvals;
+    assert.equal(approvals.length, hermesHookEvents().length);
+    for (const a of approvals) {
+      assert.ok(a.command.includes(expected), `allowlist must record the same command: ${a.command}`);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prev;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("hook commands fall back to the installer's own copy when no copy is on disk", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "workled-entry-"));
+  const prev = process.env.HERMES_HOME;
+  try {
+    process.env.HERMES_HOME = tmp; // exists, but holds no skills/workled copy
+    const yaml = installHermesHooks("", "hermes");
+    for (const line of yaml.split("\n").filter((l) => l.includes("- command:"))) {
+      assert.ok(line.includes("/index.js hook --event"), `unexpected command: ${line}`);
+      assert.ok(!line.includes(tmp.replace(/\\/g, "/")), "no copy -> must not point into the empty home");
+    }
+  } finally {
+    if (prev === undefined) delete process.env.HERMES_HOME;
+    else process.env.HERMES_HOME = prev;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// openclaw reads openclaw.json with JSON5, so comments and trailing commas are
+// legal user content. install/uninstall rewrite that file WHOLE, so a parse
+// failure must report "unparseable" (null) rather than degrade to {} — the {}
+// fallback replaced the user's entire config with a workled stub.
+test("parseOpenclawConfigText accepts comments and trailing commas", () => {
+  const text = `{
+  // hand-written note
+  "agents": { "defaults": { "workspace": "C:\\\\ws" } },
+  "plugins": { "load": { "paths": [] }, },
+}`;
+  const cfg = parseOpenclawConfigText(text);
+  assert.ok(cfg, "expected an object");
+  assert.equal(cfg.agents.defaults.workspace, "C:\\ws");
+  assert.deepEqual(cfg.plugins.load.paths, []);
+});
+
+test("parseOpenclawConfigText returns null for content it cannot parse", () => {
+  // Must NOT be {} — every caller treats {} as "safe to write".
+  assert.equal(parseOpenclawConfigText("{ \"a\": , }"), null);
+  assert.equal(parseOpenclawConfigText(""), null);
+  assert.equal(parseOpenclawConfigText("null"), null);
+  assert.equal(parseOpenclawConfigText('"just a string"'), null);
+  assert.equal(parseOpenclawConfigText("[1, 2]"), null);
+});
+
+test("parseOpenclawConfigText still returns an object for an empty config", () => {
+  assert.deepEqual(parseOpenclawConfigText("{}"), {});
+  assert.deepEqual(parseOpenclawConfigText("{}\n"), {});
 });
