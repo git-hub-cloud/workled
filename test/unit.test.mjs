@@ -15,8 +15,8 @@ import {
 } from "../index.js";
 import { mergeClientHooks, stripClientHooks, workledHookCommand } from "../skill-install.mjs";
 
-const PLACEHOLDER = "http://<device-name>.local:18791/mcp";
-const REAL = "http://HomeAnt-A919.local:18791/mcp";
+const PLACEHOLDER = "http://<device-name>.local/mcp";
+const REAL = "http://HomeAnt-A919.local/mcp";
 
 test("getInputTools covers common interactive-tool naming patterns", () => {
   // Coverage for AskUserQuestion / AskUserConfirm / choose_option /
@@ -42,7 +42,7 @@ test("resolveMergedUrl never downgrades a real URL to the placeholder", () => {
   // Existing real URL + incoming placeholder -> keep the real URL.
   assert.equal(resolveMergedUrl(REAL, PLACEHOLDER), REAL);
   // Existing real URL + incoming real URL -> use the incoming one.
-  const newer = "http://HomeAnt-B999.local:18791/mcp";
+  const newer = "http://HomeAnt-B999.local/mcp";
   assert.equal(resolveMergedUrl(REAL, newer), newer);
   // No existing URL + incoming placeholder -> placeholder (first install).
   assert.equal(resolveMergedUrl(undefined, PLACEHOLDER), PLACEHOLDER);
@@ -247,10 +247,10 @@ test("workledHookCommand never inlines the MCP URL (config discovery at runtime)
   // WORKLED_MCP_URL) at runtime, so --url must never be baked into the command.
   // Keeping the command URL-free also avoids any shell/sandbox mangling of a
   // raw or base64-encoded URL argument.
-  const real = "http://HomeAnt-2831.local:18791/mcp";
+  const real = "http://HomeAnt-2831.local/mcp";
   assert.ok(!workledHookCommand("Stop", "trae-cn", real).includes("--url"), "real URL must not be inlined");
   assert.ok(!workledHookCommand("Stop", "trae-cn", real).includes("b64:"), "no base64 encoding");
-  assert.ok(!workledHookCommand("Stop", "trae-cn", "http://<device-name>.local:18791/mcp").includes("--url"), "placeholder must not be inlined");
+  assert.ok(!workledHookCommand("Stop", "trae-cn", "http://<device-name>.local/mcp").includes("--url"), "placeholder must not be inlined");
   assert.ok(!workledHookCommand("Stop", "trae-cn").includes("--url"), "bare command stays bare");
 });
 

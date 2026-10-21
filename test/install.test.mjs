@@ -23,7 +23,7 @@ import {
   parseOpenclawConfigText,
 } from "../skill-install.mjs";
 
-const ENTRY = { url: "http://HomeAnt-A919.local:18791/mcp", enabled: true, type: "remote" };
+const ENTRY = { url: "http://HomeAnt-A919.local/mcp", enabled: true, type: "remote" };
 
 test("stripJsonc drops comments and trailing commas without touching strings", () => {
   const src = `{
@@ -69,7 +69,7 @@ test("upsertJsoncEntry replaces an existing workled entry in place", () => {
   const withWorkled = `{
   "mcp": {
     "workled": {
-      "url": "http://old.local:18791/mcp",
+      "url": "http://old.local/mcp",
       "enabled": true
     }
   }
@@ -563,7 +563,7 @@ test("upsertJsoncEntry appends a top-level key on its own line with correct inde
 
 test("upsertJsoncEntry appends into an empty root object as a formatted block", () => {
   const out = upsertJsoncEntry("{}", "mcp", "workled", ENTRY);
-  assert.equal(out, `{\n  "mcp": {\n    "workled": {\n      "url": "http://HomeAnt-A919.local:18791/mcp",\n      "enabled": true,\n      "type": "remote"\n    }\n  }\n}`);
+  assert.equal(out, `{\n  "mcp": {\n    "workled": {\n      "url": "http://HomeAnt-A919.local/mcp",\n      "enabled": true,\n      "type": "remote"\n    }\n  }\n}`);
   assert.equal(JSON.parse(stripJsonc(out)).mcp.workled.url, ENTRY.url);
 });
 

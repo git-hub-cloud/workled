@@ -36,7 +36,7 @@ http://<device-name>.local
 Once the device is on the same network, its MCP endpoint is:
 
 ```
-http://<device-name>.local:18791/mcp
+http://<device-name>.local/mcp
 ```
 
 Add the server to your agent config. For opencode, edit `~/.config/opencode/opencode.json`:
@@ -46,7 +46,7 @@ Add the server to your agent config. For opencode, edit `~/.config/opencode/open
   "mcp": {
     "workled": {
       "type": "remote",
-      "url": "http://<device-name>.local:18791/mcp",
+      "url": "http://<device-name>.local/mcp",
       "enabled": true
     }
   }
@@ -118,12 +118,12 @@ client's MCP is not set up — guide the user through the MCP endpoint
 above.
 
 > **Prevent / detect a placeholder URL.** `install` resolves the MCP URL once:
-> `WORKLED_MCP_URL` → placeholder `http://<device-name>.local:18791/mcp`. If no
+> `WORKLED_MCP_URL` → placeholder `http://<device-name>.local/mcp`. If no
 > real URL is known and the
 > target config has **no existing `workled` entry** (e.g. after an earlier
 > uninstall), the placeholder is written. Fix it by editing the config URL to
 > the real device name/IP, or re-run install with
-> `WORKLED_MCP_URL=http://<device-name>.local:18791/mcp` set. A config that
+> `WORKLED_MCP_URL=http://<device-name>.local/mcp` set. A config that
 > already holds a real URL is never downgraded to the placeholder.
 
 ## Verify

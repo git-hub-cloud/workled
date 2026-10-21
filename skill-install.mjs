@@ -939,7 +939,7 @@ function unregisterWorkledMcp(client) {
 
 // Resolve the workled MCP server URL, in priority order:
 //   1. WORKLED_MCP_URL        (explicit configuration wins)
-//   2. placeholder            (http://<device-name>.local:18791/mcp, user must replace)
+//   2. placeholder            (http://<device-name>.local/mcp, user must replace)
 // There is intentionally no Bluetooth scan and no hard-coded specific host
 // (e.g. HomeAnt-2831.local): the user supplies the real device name either via
 // WORKLED_MCP_URL or by replacing the placeholder before connecting.
@@ -947,7 +947,7 @@ async function resolveWorkledMcpUrl() {
   if (process.env.WORKLED_MCP_URL) return process.env.WORKLED_MCP_URL;
   // No explicit URL: emit a placeholder the user must replace with their real
   // workled device name before connecting.
-  return "http://<device-name>.local:18791/mcp";
+  return "http://<device-name>.local/mcp";
 }
 
 // ---- WorkBuddy user-level hooks (settings.json) ----------------------------
@@ -2394,7 +2394,7 @@ function installDsh(mcpEntry, customHome = null) {
   // meant dsh was the only client that never saw discovery and always fell back
   // to the <device-name> placeholder, silently installing a broken endpoint.
   const url =
-    mcpEntry?.url || process.env.WORKLED_MCP_URL || "http://<device-name>.local:18791/mcp";
+    mcpEntry?.url || process.env.WORKLED_MCP_URL || "http://<device-name>.local/mcp";
   mkdirSync(home, { recursive: true });
   // A) Install as a proper dsh bundle under the web profile's node_modules.
   const srcPlugin = joinP(scriptDir, "dsh-plugin");
@@ -2636,7 +2636,7 @@ async function main() {
     if (url.includes("<device-name>")) {
       console.warn(
         "Warning: no WORKLED_MCP_URL set. A placeholder URL " +
-          "(http://<device-name>.local:18791/mcp) will be " +
+          "(http://<device-name>.local/mcp) will be " +
           "written into configs that have no existing workled entry (e.g. after an " +
           "earlier uninstall) — existing real URLs are kept. Replace <device-name> with " +
           "your real workled device name (e.g. HomeAnt-XXXX), or re-run install with " +

@@ -24,7 +24,7 @@ mkdirSync(profilesWeb, { recursive: true });
 const patchFile = join(profilesWeb, "cordis.patch.yml");
 const pluginDir = join(home, "plugins", "workled").replace(/\\/g, "/");
 const pluginFile = join(home, "plugins", "workled", "src", "index.js").replace(/\\/g, "/");
-const url = process.env.WORKLED_MCP_URL || "http://192.168.31.146:18791/mcp";
+const url = process.env.WORKLED_MCP_URL || "http://192.168.31.146/mcp";
 
 const candidates = [
   {

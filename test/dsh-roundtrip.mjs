@@ -28,7 +28,7 @@ const PLUGIN_DIR = join(HOME, "profiles", "web", "node_modules", "workled");
 const BUNDLE_PATCH = join(PLUGIN_DIR, "patch.yml");
 // User-owned profile file: snapshot it, never assert content into it.
 const PROFILE_PATCH = join(HOME, "profiles", "web", "cordis.patch.yml");
-const TEST_URL = "http://192.168.31.146:18791/mcp";
+const TEST_URL = "http://192.168.31.146/mcp";
 
 let pass = 0;
 let fail = 0;
